@@ -1,0 +1,22 @@
+# _headers — Netlify 静态站响应头（拖拽上传也会读这个文件，放在发布根目录即可生效）
+# 作用：给线上站点加一层真正的安全边界。浏览器拿到响应头后按 CSP 拒绝执行
+# 任何非本域脚本 —— 即使某天有人往商品名/买家名里塞了 <script>，也不会执行。
+
+/*
+  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self' https: http://127.0.0.1:* http://localhost:*; media-src 'self' blob:; manifest-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer
+  Permissions-Policy: geolocation=(), microphone=(), camera=(), usb=(), payment=()
+  X-Frame-Options: DENY
+  Cross-Origin-Opener-Policy: same-origin
+
+# 带 ?v= 的静态资源可以长期缓存；index.html 与 sw.js 必须每次回源，
+# 否则用户拿到旧页面 + 新脚本，或者 Service Worker 一直喂旧缓存。
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
+
+/index.html
+  Cache-Control: no-cache
+
+/sw.js
+  Cache-Control: no-cache

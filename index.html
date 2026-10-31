@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>询盘副驾驶 · 搬砖代发报价工作台</title>
+<meta name="robots" content="noindex,nofollow">
+<meta name="referrer" content="no-referrer">
+<!-- CSP 第二道锁：即使被拖到 U 盘/本地打开（没有 Netlify 响应头），也不执行任何外来脚本。
+     script-src 只留 'self' —— 页面里没有一行内联 JS，全部走 assets/*.js。 -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self' https: http://127.0.0.1:* http://localhost:*; media-src 'self' blob:; manifest-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<link rel="stylesheet" href="assets/styles.css?v=v10225000">
+</head>
+<body>
+
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">询</div>
+      <div class="brand-text">
+        <div class="brand-name">询盘副驾驶</div>
+        <div class="brand-sub">查成本 · 算价 · 回客户</div>
+      </div>
+    </div>
+
+    <nav class="nav" id="nav"></nav>
+
+    <div class="sidebar-foot">
+      <div class="sf-label">平台扣费</div>
+      <div class="sf-value" id="sidebar-rate">—</div>
+      <div class="sf-note" id="sidebar-health">—</div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="crumb" id="crumb">工作台</div>
+<span id="bridge-state" style="margin-left:14px;font-size:11.5px;color:#8a919e;display:inline-flex;align-items:center;gap:6px">
+<span id="bridge-dot" style="width:7px;height:7px;border-radius:50%;background:#c9ced6;display:inline-block"></span>
+<span id="bridge-text">阿里：未连接</span></span>
+      <div class="topbar-actions">
+        <a class="btn ghost" href="#/settings" title="备份、导入导出、清空演示数据都在这里">数据与安全</a>
+      </div>
+    </header>
+
+    <div class="view" id="view"></div>
+  </main>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+<div id="modal-root"></div>
+<div class="boot-error" id="boot-error" hidden></div>
+
+<input type="file" id="file-input" accept=".json,application/json" hidden>
+
+<!-- 先装错误捕获，再加载脚本：任何一个 assets 文件语法错都能在页面上看见。
+     这段原来是内联脚本，为了让 CSP 的 script-src 保持 'self'（不含 unsafe-inline）
+     已搬到 assets/boot-error.js。 -->
+<script src="assets/boot-error.js?v=v10225000"></script>
+
+<script src="assets/seed-state.js?v=v10225000"></script>
+<script src="assets/core.js?v=v10225000"></script>
+<script src="assets/pricing.js?v=v10225000"></script>
+<script src="assets/workflow.js?v=v10225000"></script>
+<script src="assets/tr-endpoint.js?v=1"></script>
+<script src="assets/translate.js?v=v10225000"></script>
+<script src="assets/judge.js?v=v10225000"></script>
+<script src="assets/matching.js?v=v10225000"></script>
+<script src="assets/reply.js?v=v10225000"></script>
+<script src="assets/importer.js?v=v10225000"></script>
+<script src="assets/market-ref.js?v=v10225000"></script>
+<script src="assets/price-candidates.js?v=v10225000"></script>
+<script src="assets/p0-parse.js?v=v10225000"></script>
+<script src="assets/p0-match.js?v=v10225000"></script>
+<script src="assets/p0-quote.js?v=v10225000"></script>
+<script src="assets/p0-cost.js?v=v10225000"></script>
+<script src="assets/p0-cockpit.js?v=v10225000"></script>
+<script src="assets/p0-api.js?v=v10225000"></script>
+<script src="assets/app.js?v=v10225000"></script>
+<script src="assets/p0-ui.js?v=v10225000"></script>
+
+<!-- 随时翻译：右下角悬浮按钮 + 面板 -->
+<button id="tr-fab" type="button" title="随时翻译（Ctrl+Shift+T）">译</button>
+<div id="tr-panel" hidden>
+  <div class="tr-panel-head">
+    <strong>随时翻译</strong>
+    <span id="tr-panel-state">粘贴外文，自动译成中文</span>
+    <button id="tr-panel-close" type="button" aria-label="关闭">×</button>
+  </div>
+  <textarea id="tr-input" placeholder="把买家发来的原文粘到这里，自动翻译…"></textarea>
+  <div id="tr-output"></div>
+  <div class="tr-panel-foot">
+    <button class="btn sm" id="tr-copy" type="button">复制译文</button>
+    <button class="btn sm ghost" id="tr-clear" type="button">清空</button>
+    <span id="tr-engine"></span>
+  </div>
+</div>
+<script src="assets/tr-panel.js?v=1"></script>
+</body>
+</html>

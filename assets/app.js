@@ -1,0 +1,3924 @@
+/* ===========================================================
+   app.js — 界面与流程
+   =========================================================== */
+(function () {
+  'use strict';
+
+  var C = window.Core;
+  var P = window.Pricing;
+  var M = window.Matching;
+  var R = window.Reply;
+  var W = window.Workflow;
+
+  var esc = C.esc;
+
+  var NAV = [
+    { key: 'dashboard', label: '工作台', icon: '◱' },
+    { key: 'opps', label: '商机', icon: '✉' },
+    { key: 'catalog', label: '商品库', icon: '▤' },
+    { key: 'review', label: '补成本', icon: '¥' },
+    { key: 'analytics', label: '复盘', icon: '◔' },
+    { key: 'settings', label: '设置', icon: '⚙' }
+  ];
+
+  var STATUS = {
+    new: { label: '待处理', cls: 'new' },
+    matched: { label: '已匹配', cls: 'matched' },
+    quoted: { label: '已报价', cls: 'quoted' },
+    won: { label: '已成交', cls: 'won' },
+    lost: { label: '已丢单', cls: 'lost' }
+  };
+
+  /* 搜索防抖：打字时不要每次都重画 238 行 */
+  var searchTimer = null;
+  function debounceSearch(fn) {
+    if (searchTimer) clearTimeout(searchTimer);
+    searchTimer = setTimeout(fn, 120);
+  }
+
+  var S = { tab: 'en', cache: {}, catQ: '', catOnlyEmpty: false, revQ: '', revOnlyPending: true,
+    bulkFactor: 1, bulkUndo: [],
+    catType: '',
+    oppQ: '', oppCountry: '', oppType: '', oppTier: '', oppStatus: '',
+    oppLang: 'zh', oppTextZh: null, oppId: '' };
+  var toastTimer = null;
+
+  /* =========================================================
+     基础工具
+     ========================================================= */
+
+  function st() { return C.get(); }
+
+  function productById(id) {
+    return st().products.find(function (p) { return p.id === id; }) || null;
+  }
+
+  function oppById(id) {
+    return st().opportunities.find(function (o) { return o.id === id; }) || null;
+  }
+
+  function toast(msg) {
+    var el = document.getElementById('toast');
+    el.textContent = msg;
+    el.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { el.hidden = true; }, 2600);
+  }
+
+  function openModal(html, wide) {
+    document.getElementById('modal-root').innerHTML =
+      '<div class="modal-mask" data-mask="1"><div class="modal' + (wide ? ' wide' : '') + '">' + html + '</div></div>';
+  }
+
+  function closeModal() {
+    document.getElementById('modal-root').innerHTML = '';
+  }
+
+  function modalHead(title) {
+    return '<div class="modal-hd"><div class="modal-title">' + esc(title) +
+      '</div><button class="icon-btn" data-action="close-modal">×</button></div>';
+  }
+
+  function badge(status) {
+    var s = STATUS[status] || STATUS.new;
+    return '<span class="badge ' + s.cls + '">' + s.label + '</span>';
+  }
+
+  function copyText(text) {
+    if (!text) return;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () {
+        toast('已复制到剪贴板');
+      }, function () { fallbackCopy(text); });
+    } else {
+      fallbackCopy(text);
+    }
+  }
+
+  function fallbackCopy(text) {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); toast('已复制到剪贴板'); }
+    catch (e) { toast('复制失败，请手动选中'); }
+    document.body.removeChild(ta);
+  }
+
+  function invalidate() { S.cache = {}; }
+
+  /* =========================================================
+     商机分析
+     ========================================================= */
+
+  function cacheKey(opp) {
+    return opp.id + '|' + (opp.rawText || '').length + '|' + st().products.length +
+      '|' + st().products.map(function (p) { return p.id; }).join(',');
+  }
+
+  function analyzeOpp(opp) {
+    var k = cacheKey(opp);
+    if (S.cache[k]) return S.cache[k];
+    var res = M.rank(opp, st().products);
+    res.ordered = res.matches.map(function (m) {
+      return { match: m, product: productById(m.productId) };
+    }).filter(function (x) { return !!x.product; });
+    S.cache[k] = res;
+    return res;
+  }
+
+  /* 补齐默认值：选品、数量、成本、单价 */
+  function prepareOpp(opp) {
+    var a = analyzeOpp(opp);
+    var changed = false;
+
+    if (!opp.selectedProductId && a.ordered.length) {
+      opp.selectedProductId = a.ordered[0].product.id;
+      changed = true;
+    }
+
+    if (!opp.quote.qty) {
+      opp.quote.qty = a.parsed.qty || 100;
+      changed = true;
+    }
+
+    if (!opp.quote.incoterm) {
+      opp.quote.incoterm = st().settings.defaultIncoterm;
+    }
+    if (!opp.quote.leadTimeDays) {
+      var p0 = productById(opp.selectedProductId);
+      /* 商品没配交期就保持 0（待确认），不要编一个数字去承诺客户 */
+      opp.quote.leadTimeDays = (p0 && Number(p0.leadTimeDays) > 0) ? Number(p0.leadTimeDays) : 0;
+    }
+
+    var p1 = productById(opp.selectedProductId);
+
+    /* 采购成本：商品上填过就带出来；商品也没填就保持 null（待确认），
+       不要写 0——0 会被定价模块当成「没有成本」，保本价和建议价全变 0 */
+    if ((opp.quote.costRmb === undefined || opp.quote.costRmb === null) && p1 && C.num(p1.costRmb) > 0) {
+      opp.quote.costRmb = C.num(p1.costRmb);
+      changed = true;
+    }
+    if (opp.quote.shippingRmb === undefined || opp.quote.shippingRmb === null) {
+      opp.quote.shippingRmb = p1 && C.num(p1.shippingRmb) > 0
+        ? C.num(p1.shippingRmb)
+        : C.num(st().settings.domesticShippingRmb);
+      changed = true;
+    }
+
+    if (!opp.quote.unitPriceUsd || opp.quote.autoPrice === undefined) {
+      var rec = P.evaluate({
+        product: p1,
+        qty: opp.quote.qty,
+        settings: st().settings,
+        unitPriceUsd: null,
+        buyerTargetUsd: a.parsed.targetPriceUsd
+      }).recommendUsd;
+      if (rec > 0) {
+        opp.quote.unitPriceUsd = rec;
+        opp.quote.autoPrice = true;
+        changed = true;
+      }
+    }
+
+    if (changed) C.persist();
+    return opp;
+  }
+
+  function ctxFor(opp) {
+    var p = productById(opp.selectedProductId);
+    var s = st().settings;
+    var a = analyzeOpp(opp);
+
+    var pricing = P.evaluate({
+      product: p,
+      qty: opp.quote.qty,
+      settings: s,
+      unitCostRmb: opp.quote.costRmb,
+      shippingRmb: opp.quote.shippingRmb,
+      unitPriceUsd: opp.quote.unitPriceUsd
+    });
+
+    return {
+      opp: opp,
+      product: p,
+      settings: s,
+      parsed: a.parsed,
+      matches: a.ordered,
+      pricing: pricing,
+
+      sellerName: s.sellerName
+    };
+  }
+
+
+  /* =========================================================
+     通用 HTML 片段
+     ========================================================= */
+
+  function card(title, sub, body, actions) {
+    return '<section class="card">' +
+      '<div class="card-hd"><div class="card-title">' + title +
+      (sub ? '<span class="card-sub">' + sub + '</span>' : '') + '</div>' +
+      (actions || '') + '</div>' +
+      '<div class="card-bd">' + body + '</div></section>';
+  }
+
+  function metric(label, value, foot, cls) {
+    return '<div class="metric"><div class="metric-label">' + label + '</div>' +
+      '<div class="metric-val ' + (cls || '') + '">' + value + '</div>' +
+      (foot ? '<div class="metric-foot">' + foot + '</div>' : '') + '</div>';
+  }
+
+  /* 售价构成条：成本 / 平台扣费 / 你赚的 */
+  /* 一条钱怎么分的：成本 / 平台扣 / 你赚 */
+  function rangeBarHtml(ctx) {
+    var r = ctx.pricing;
+    if (r.flags.noCost || !r.gmvRmb) return '';
+
+    var total = r.gmvRmb || 1;
+    var costW = Math.max(0, Math.min(100, r.costTotalRmb / total * 100));
+    var feeW = Math.max(0, Math.min(100, r.feeRmb / total * 100));
+    var profitW = Math.max(0, 100 - costW - feeW);
+
+    return '<div class="ratebar">' +
+      '<div class="rb-cost" style="flex:0 0 ' + costW.toFixed(1) + '%;background:#94a3b8">' +
+      (costW > 16 ? '成本 ' + C.pct(costW / 100) : '') + '</div>' +
+      '<div class="rb-fee" style="flex:0 0 ' + feeW.toFixed(1) + '%;background:#d97706">' +
+      (feeW > 12 ? '平台 ' + C.pct(feeW / 100) : '') + '</div>' +
+      (profitW > 0.5
+        ? '<div class="rb-commission" style="flex:0 0 ' + profitW.toFixed(1) + '%;background:' +
+        (r.netRmb < 0 ? '#d92d20' : '#0f9d58') + '">' +
+        (profitW > 14 ? (r.netRmb < 0 ? '亏 ' : '赚 ') + C.pct(profitW / 100) : '') + '</div>'
+        : '') +
+      '</div>' +
+      '<div class="legend">' +
+      '<span><span class="sw" style="background:#94a3b8"></span>成本 ' + C.money(r.costTotalRmb) + '</span>' +
+      '<span><span class="sw" style="background:#d97706"></span>平台扣 ' + C.money(r.feeRmb) + '</span>' +
+      '<span><span class="sw" style="background:' + (r.netRmb < 0 ? '#d92d20' : '#0f9d58') + '"></span>' +
+      (r.netRmb < 0 ? '亏 ' : '赚 ') + C.money(Math.abs(r.netRmb)) + '</span>' +
+      '</div>';
+  }
+  function feeBarHtml(s, exampleRmb) {
+    var fee = C.num(s.platformFeeRate);
+    var cost = exampleRmb || 100;
+    var price = cost / (1 - fee);
+    var feeRmb = price - cost;
+
+    var feeW = price > 0 ? (feeRmb / price) * 100 : 0;
+    var costW = 100 - feeW;
+
+    return '<div class="ratebar">' +
+      '<div class="rb-cost" style="flex:0 0 ' + costW.toFixed(1) + '%;background:#94a3b8">成本 ' + C.money(cost) + '</div>' +
+      '<div class="rb-fee" style="flex:0 0 ' + feeW.toFixed(1) + '%;background:#d97706">' +
+      (feeW > 10 ? '平台 ' + C.money(feeRmb) : '') + '</div>' +
+      '</div>' +
+      '<div class="legend">' +
+      '<span>成本 ' + C.money(cost) + '</span>' +
+      '<span>平台扣 ' + C.pct(fee) + ' → ' + C.money(feeRmb) + '</span>' +
+      '<span>保本售价 ' + C.money(price) + '</span>' +
+      '</div>';
+  }
+
+  function flagsHtml(ctx) {
+    var r = ctx.pricing;
+    var s = ctx.settings;
+    var out = '';
+
+    if (r.flags.noCost) {
+      out += '<div class="alert info"><span class="ic">i</span><div>' +
+        '<strong>先填采购成本。</strong>去 1688 / 淘宝查一下这个货多少钱一件，填到上面，' +
+        '系统立刻算出「卖多少钱才不亏」。' +
+        '<div class="row" style="margin-top:8px">' + searchLinks(ctx) + '</div>' +
+        '</div></div>';
+      return out;
+    }
+
+    if (r.flags.belowCost) {
+      out += '<div class="alert danger"><span class="ic">✕</span><div><strong>这个价要亏：</strong>' +
+        '成本 ' + C.money(r.costUnitRmb) + '/件，平台扣 ' + C.pct(r.feeRate) +
+        '，保本价是 ' + C.usd(r.floorUsd) + '。你报 ' + C.usd(r.unitPriceUsd) +
+        '，一件亏 ' + C.money(Math.abs((r.unitPriceUsd - r.floorUsd) * r.fx * (1 - r.feeRate))) + '。' +
+        '<br>想不亏，至少报到 ' + C.usd(r.floorUsd) + '。' +
+        '</div></div>';
+    } else {
+      out += '<div class="alert ok"><span class="ic">✓</span><div><strong>可以报：</strong>' +
+        '保本价 ' + C.usd(r.floorUsd) + '，你报 ' + C.usd(r.unitPriceUsd) +
+        '，这一单赚 ' + C.money(r.netRmb) + '。' +
+        '</div></div>';
+    }
+
+    if (r.flags.aboveMarket) {
+      out += '<div class="alert warn"><span class="ic">!</span><div><strong>比市场价贵：</strong>' +
+        '别家卖 ' + C.usd(r.marketUsd) + '（' + C.money(r.marketPriceRmb) + '/件），' +
+        '你建议卖 ' + C.usd(r.recommendUsd) + '，贵了 ' + Math.abs(r.marketGapPct * 100).toFixed(1) + '%。' +
+        '客户比价就会发现，要么压利润，要么找到更便宜的货源。' +
+        '</div></div>';
+    }
+
+    if (r.flags.listTooLow) {
+      out += '<div class="alert danger"><span class="ic">✕</span><div><strong>你的挂牌价本身就亏：</strong>' +
+        '阿里上挂的 ' + C.usd(r.listUsd) + ' 低于保本价 ' + C.usd(r.floorUsd) +
+        '，这个商品挂上去就是亏本卖。要么调价，要么换货源。' +
+        '</div></div>';
+    } else if (r.listUsd > 0 && r.recommendUsd > 0 && r.recommendUsd >= r.listUsd - 1e-9) {
+      out += '<div class="alert warn"><span class="ic">!</span><div><strong>挂牌价压住了利润：</strong>' +
+        '想赚 ' + C.money(r.profitPerUnitRmb) + '/件 得卖 ' + C.usd(C.round((r.costUnitRmb + r.profitPerUnitRmb) / (1 - r.feeRate) / r.fx, 2)) +
+        '，但你挂牌价只有 ' + C.usd(r.listUsd) + '。只能赚到 ' +
+        C.money(Math.max(0, r.listUsd * r.fx * (1 - r.feeRate) - r.costUnitRmb)) + '/件。' +
+        '</div></div>';
+    }
+
+    return out;
+  }
+  /* 一键去 1688 / 淘宝 搜这个商品 */
+  function searchLinks(ctx) {
+    var p = ctx.product;
+    var kw = p ? (p.titleEn || p.title) : '';
+    var q = encodeURIComponent(String(kw).slice(0, 60));
+    return '<a class="btn sm" target="_blank" rel="noopener" href="https://s.1688.com/selloffer/offer_search.htm?keywords=' + q + '">去 1688 查</a>' +
+      '<a class="btn sm" target="_blank" rel="noopener" href="https://s.taobao.com/search?q=' + q + '">去淘宝查</a>' +
+      '<a class="btn sm" target="_blank" rel="noopener" href="https://www.goofish.com/search?q=' + q + '">去闲鱼查</a>';
+  }
+
+
+  /* =========================================================
+     路由
+     ========================================================= */
+
+  function render() {
+    var hash = (location.hash || '#/dashboard').replace(/^#\/?/, '');
+    var seg = hash.split('/').filter(Boolean);
+    var page = seg[0] || 'dashboard';
+    var id = seg[1] || null;
+
+    var VIEWS = ['dashboard', 'opps', 'catalog', 'analytics', 'settings', 'opp', 'review'];
+    if (VIEWS.indexOf(page) < 0) page = 'dashboard';
+
+    var html = '';
+    var crumb = '';
+
+    if (page === 'dashboard') { html = viewDashboard(); crumb = '工作台'; }
+    else if (page === 'opps') { html = viewOpps(); crumb = '商机'; }
+    else if (page === 'catalog') { html = viewCatalog(); crumb = '商品库'; }
+    else if (page === 'review') { html = viewReview(); crumb = '补成本'; }
+    else if (page === 'analytics') {
+      html = viewAnalytics();
+      crumb = '复盘';
+      setTimeout(function () {
+        var o = document.getElementById('fx-shock-out');
+        var i = document.getElementById('fx-shock');
+        if (o && i && !o.innerHTML) o.innerHTML = fxShockResult(C.num(i.value, 7.1));
+      }, 60);
+    }
+    else if (page === 'settings') { html = viewSettings(); crumb = '设置'; }
+    else if (page === 'opp') {
+      html = viewOppDetail(id);
+      crumb = '商机详情';
+      setTimeout(function () { ensureTranslation(oppById(id)); initSandbox(id); }, 80);
+    }
+
+    renderNav(page === 'opp' ? 'opps' : page);
+    document.getElementById('crumb').textContent = crumb;
+    document.getElementById('view').innerHTML = html;
+
+    var key = page + '/' + (id || '');
+    if (S.lastKey !== key) {
+      S.lastKey = key;
+      window.scrollTo(0, 0);
+    }
+    syncSidebar();
+  }
+
+  function renderNav(page) {
+    var openCount = st().opportunities.filter(function (o) {
+      return o.status === 'new' || o.status === 'matched';
+    }).length;
+
+    document.getElementById('nav').innerHTML = NAV.map(function (n) {
+      var count = '';
+      if (n.key === 'opps' && openCount) count = '<span class="nav-count">' + openCount + '</span>';
+      return '<a class="nav-item' + (n.key === page ? ' active' : '') + '" href="#/' + n.key + '">' +
+        '<span class="nav-icon">' + n.icon + '</span>' + n.label + count + '</a>';
+    }).join('');
+  }
+
+  /* ---------------- 实时汇率 ---------------- */
+  var fxBusy = false;
+
+  function refreshFx(manual) {
+    if (fxBusy) return;
+    if (typeof fetch !== 'function' || typeof location === 'undefined' || !location.href) return;
+    fxBusy = true;
+    fetch('https://open.er-api.com/v6/latest/USD', { cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        var rate = j && j.rates && j.rates.CNY;
+        if (!(rate > 0)) throw new Error('no rate');
+        var s = st().settings;
+        var old = C.num(s.fxRate);
+        var next = Math.round(rate * 100) / 100;
+
+        /* 跳变超过 20% 先不覆盖，避免拿到异常数据把报价全算错 */
+        if (old > 0 && Math.abs(next / old - 1) > 0.2) {
+          if (manual) toast('汇率跳变太大（' + old + ' → ' + next + '），已保留原值，请手动确认');
+          return;
+        }
+
+        s.fxRate = next;
+        s.fxUpdatedAt = C.nowIso();
+        invalidate(); C.persist(); render();
+        if (manual) toast('汇率已更新：1 USD = ' + s.fxRate + ' CNY');
+      })
+      .catch(function () {
+        if (manual) toast('联网失败，继续用 ' + st().settings.fxRate);
+      })
+      .then(function () { fxBusy = false; });
+  }
+
+  function fxAgeText() {
+    var at = st().settings.fxUpdatedAt;
+    if (!at) return '还没更新过';
+    return '更新于 ' + C.relTime(at);
+  }
+
+  /* ---------------- 本地桥：阿里登录状态 ---------------- */
+  var BRIDGE = 'http://127.0.0.1:7788';
+  var bridgeTimer = null;
+
+  function paintBridge(st) {
+    var dot = document.getElementById('bridge-dot');
+    var txt = document.getElementById('bridge-text');
+    if (!dot || !txt) return;
+    if (!st) {
+      dot.style.background = '#c9ced6';
+      txt.textContent = '阿里：未连接（同步没开）';
+      return;
+    }
+    if (st.login) {
+      dot.style.background = '#0f9d58';
+      txt.textContent = '阿里：已登录';
+    } else {
+      dot.style.background = '#f0b429';
+      txt.textContent = '阿里：登录已失效';
+    }
+  }
+
+  function pollBridge() {
+    if (typeof fetch !== 'function' || typeof location === 'undefined' || !location.href) return;
+    fetch(BRIDGE + '/api/status', { cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (st) { paintBridge(st); })
+      .catch(function () { paintBridge(null); });
+  }
+
+  /* 本机如果跑着 LibreTranslate，就自动用它（不限量） */
+  function detectLocalTranslate() {
+    if (typeof fetch !== 'function' || typeof location === 'undefined' || !location.href) return;
+    var s = st().settings;
+    if (s.translateEndpoint) return;
+    fetch('http://127.0.0.1:5000/languages', { cache: 'no-store' })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (list) {
+        if (!Array.isArray(list) || !list.length) return;
+        st().settings.translateEndpoint = 'http://127.0.0.1:5000';
+        C.persist();
+      })
+      .catch(function () { });
+  }
+
+  function startBridge() {
+    pollBridge();
+    if (!bridgeTimer && typeof setInterval === 'function') bridgeTimer = setInterval(pollBridge, 30000);
+  }
+
+  function syncSidebar() {
+    var s = st().settings;
+    document.getElementById('sidebar-rate').textContent = C.pct(s.platformFeeRate);
+    var note = document.getElementById('sidebar-health');
+    note.className = 'sf-note good';
+    note.textContent = '平台扣费 · 保本价 = 成本 ÷ ' + (1 - C.num(s.platformFeeRate)).toFixed(2);
+  }
+
+  /* =========================================================
+     视图：工作台
+     ========================================================= */
+
+  function viewDashboard() {
+    var s = st();
+    var kpi = C.stats();
+    var demo = !!s.demoMode;
+    var productCount = s.products.length;
+
+    var open = s.opportunities.filter(function (o) {
+      return o.status === 'new' || o.status === 'matched';
+    }).sort(function (a, b) { return new Date(b.createdAt) - new Date(a.createdAt); });
+
+    /* ---- 最顶上：进阿里卖家后台 ---- */
+    var sellerBar = '<section class="card" style="border-left:3px solid var(--brand)">' +
+      '<div class="card-bd row" style="gap:10px">' +
+      '<span style="font-size:13px;font-weight:650">阿里卖家</span>' +
+      '<span style="font-size:12px;color:var(--ink-3)">回询盘、看订单、核成本，都在这</span>' +
+      '<span class="spacer"></span>' +
+      '<button class="btn sm primary" data-action="open-seller-app">打开电脑版</button>' +
+      '<button class="btn sm" data-action="open-seller-web">网页版</button>' +
+      '</div></section>';
+
+    /* ---- 顶部横幅：还在用演示数据时提醒 ---- */
+    var demoBanner = demo
+      ? '<div class="alert warn"><span class="ic">!</span><div>' +
+      '<strong>现在用的是演示商品，不是你的。</strong>先把自己的橱窗导进来，算出来的价才是真能用的。' +
+      '<button class="btn sm primary" style="margin-left:10px" data-action="import-products">导入我的商品</button>' +
+      '</div></div>'
+      : '';
+
+    /* ---- Hero ---- */
+    var hero = '<section class="card"><div style="padding:26px 26px 22px">' +
+      '<div style="font-size:12px;color:var(--ink-3);margin-bottom:4px">现在有</div>' +
+      '<div style="font-size:30px;font-weight:750;letter-spacing:-.6px">' +
+      (open.length ? open.length + ' 条商机等你回' : '还没有待处理的商机') + '</div>' +
+      '<div style="color:var(--ink-2);margin-top:6px;font-size:13px">' +
+      '把买家发来的原文整段粘进来，30 秒给你：报多少、能不能接、回什么话。</div>' +
+      '<div class="row" style="margin-top:18px">' +
+      '<button class="btn primary" style="height:42px;padding:0 22px;font-size:14px" data-action="new-opp">粘贴一条新询盘</button>' +
+      '<button class="btn" style="height:42px" data-action="quick-demo">先看一个例子</button>' +
+      '</div></div></section>';
+
+    /* ---- 三步 ---- */
+    function stepCard(n, title, desc, btnLabel, action, state) {
+      var badgeHtml = state === 'ok'
+        ? '<span class="badge green">已完成</span>'
+        : state === 'warn'
+          ? '<span class="badge amber">待完成</span>'
+          : '<span class="badge gray">随时可做</span>';
+      return '<section class="card"><div class="card-bd">' +
+        '<div class="row" style="justify-content:space-between;margin-bottom:8px">' +
+        '<span style="font-family:var(--mono);font-weight:700;color:var(--brand);font-size:13px">第 ' + n + ' 步</span>' +
+        badgeHtml + '</div>' +
+        '<div style="font-weight:650;font-size:14px">' + title + '</div>' +
+        '<div style="color:var(--ink-3);font-size:12px;margin:5px 0 14px;min-height:34px">' + desc + '</div>' +
+        '<button class="btn sm" data-action="' + action + '">' + btnLabel + '</button>' +
+        '</div></section>';
+    }
+
+    var steps = '<div class="grid grid-3">' +
+      stepCard(1, '把你的橱窗导进来',
+        demo ? '现在还是演示商品，换成你自己的商品，算出来的价才有意义。'
+          : '已导入 ' + productCount + ' 个商品，可以随时补充。',
+        demo ? '导入商品' : '管理商品',
+        'import-products',
+        demo ? 'warn' : 'ok') +
+      stepCard(2, '粘一条询盘进来',
+        open.length ? '有 ' + open.length + ' 条待处理，点开任意一条就能看结论。'
+          : '把买家原文粘进来，自动识别数量、目标价、认证、市场。',
+        '新建商机',
+        'new-opp',
+        'todo') +
+      stepCard(3, '看结论，复制回复',
+        '详情页第一眼就告诉你：能不能报、报多少、你赚多少。',
+        '打开商机列表',
+        'goto-opps',
+        'todo') +
+      '</div>';
+
+    /* ---- 待处理列表 ---- */
+    var rows = open.slice(0, 8).map(function (o) {
+      prepareOpp(o);
+      var a = analyzeOpp(o);
+      var top = a.ordered[0];
+      var p = top ? top.product : null;
+      var pr = P.evaluate({
+        product: p, qty: o.quote.qty, settings: s.settings,
+        unitPriceUsd: o.quote.unitPriceUsd,
+        buyerTargetUsd: a.parsed.targetPriceUsd
+      });
+      return '<tr class="clickable" data-action="open-opp" data-id="' + o.id + '">' +
+        '<td><strong>' + esc(o.buyer.name) + '</strong><br><span style="color:#8a919e;font-size:11px">' +
+        esc(o.buyer.country) + ' · ' + esc(o.buyer.channel) + '</span></td>' +
+        '<td>' + (p ? esc(p.title) : '<span style="color:#d92d20">没匹配到商品</span>') + '</td>' +
+        '<td class="num">' + (o.quote.qty ? o.quote.qty.toLocaleString() : '—') + '</td>' +
+        '<td class="num">' + (pr.unitPriceUsd ? C.usd(pr.unitPriceUsd) : '—') + '</td>' +
+        '<td class="num">' + (pr.flags.noPrice ? '<span style="color:#d97706">无挂牌价</span>' : C.money(pr.netRmb)) + '</td>' +
+        '<td>' + (pr.flags.canQuote ? '<span class="badge green">可报</span>' : '<span class="badge red">不能报</span>') + '</td>' +
+        '<td class="actions"><button class="btn sm" data-action="open-opp" data-id="' + o.id + '">打开</button></td>' +
+        '</tr>';
+    }).join('');
+
+    var queue = '<section class="card">' +
+      '<div class="card-hd"><div class="card-title">待处理商机' +
+      '<span class="card-sub">点任意一行打开</span></div>' +
+      '<button class="btn sm primary" data-action="new-opp">+ 新建商机</button></div>' +
+      '<div class="card-bd tight"><div class="table-wrap">' +
+      (rows
+        ? '<table class="table"><thead><tr><th>买家</th><th>匹配商品</th><th class="num">数量</th>' +
+        '<th class="num">建议价</th><th class="num">净赚</th><th>结论</th><th></th></tr></thead><tbody>' + rows + '</tbody></table>'
+        : '<div class="empty"><strong>还没有商机</strong>点「粘贴一条新询盘」，或者先点「先看一个例子」。</div>') +
+      '</div></div></section>';
+
+    /* ---- 底部一句话：费率 ---- */
+    var cs = s.settings;
+    var feeP = C.num(cs.platformFeeRate);
+    var moneyLine = '<section class="card"><div class="card-bd row" style="gap:14px">' +
+      '<span style="font-size:12.5px;color:var(--ink-2)">平台扣 <b>' + C.pct(feeP) +
+      '</b> · 成本 100 元的货，<b style="color:var(--ok);font-family:var(--mono)">' +
+      C.money(100 / (1 - feeP)) + '</b> 才不亏；想赚 ' + C.money(cs.profitRmb) +
+      ' 就卖 <b style="font-family:var(--mono)">' + C.money((100 + C.num(cs.profitRmb)) / (1 - feeP)) + '</b></span>' +
+      '<span class="spacer"></span>' +
+      '<a href="#/settings" style="font-size:12px;color:var(--ink-3)">改汇率 / 利润 →</a>' +
+      '</div></section>';
+
+    return '<div class="stack">' + sellerBar + demoBanner + hero + todoCard() + bossStrip() + steps + queue + moneyLine + '</div>';
+  }
+
+
+  /* =========================================================
+     视图：商机列表
+     ========================================================= */
+
+  /* ---------------- 商机自动分类 ---------------- */
+
+  var TYPE_CN = {
+    rx: '接收机', camera: '摄像头', fc: '飞控', esc: '电调', vtx: '图传',
+    gps: 'GPS', ant: '天线', goggle: '眼镜', batt: '电池', motor: '电机',
+    frame: '机架', charger: '充电器', servo: '舵机', tx: '遥控器'
+  };
+
+  function tierOf(qty) {
+    if (!qty) return '未填数量';
+    if (qty <= 10) return '样品单';
+    if (qty <= 100) return '小批量';
+    if (qty <= 1000) return '批量单';
+    return '大单';
+  }
+
+  function oppClass(o) {
+    var raw = o.rawText || '';
+    var qty = (o.quote && o.quote.qty) || 0;
+
+    var a = analyzeOpp(o);
+    var top = a.ordered[0];
+    var pid = o.selectedProductId || (top && top.product.id);
+    var p = pid ? productById(pid) : null;
+
+    var src = p ? (p.title + ' ' + (p.titleEn || '') + ' ' + (p.category || '') + ' ' + (p.keywords || []).join(' ')) : raw;
+    var types = window.Matching.typesOf(src);
+    if (!types.length) types = window.Matching.typesOf(raw);
+
+    return {
+      country: o.buyer.country || '未知',
+      type: types.length ? (TYPE_CN[types[0]] || types[0]) : '未分类',
+      tier: tierOf(qty),
+      status: o.status,
+      qty: qty
+    };
+  }
+
+  function oppFiltered() {
+    var s = st();
+    return s.opportunities.filter(function (o) {
+      var c = oppClass(o);
+      if (S.oppCountry && c.country !== S.oppCountry) return false;
+      if (S.oppType && c.type !== S.oppType) return false;
+      if (S.oppTier && c.tier !== S.oppTier) return false;
+      if (S.oppStatus && c.status !== S.oppStatus) return false;
+      if (S.oppQ) {
+        var hay = [o.buyer.name, o.buyer.company, o.buyer.country, o.rawText].join(' ').toLowerCase();
+        var words = S.oppQ.toLowerCase().split(/\s+/).filter(Boolean);
+        for (var i = 0; i < words.length; i++) if (hay.indexOf(words[i]) < 0) return false;
+      }
+      return true;
+    });
+  }
+
+  function oppRows() {
+    var list = oppFiltered().slice().sort(function (a, b) {
+      var order = { new: 0, matched: 1, quoted: 2, won: 3, lost: 4 };
+      var d = (order[a.status] || 9) - (order[b.status] || 9);
+      if (d !== 0) return d;
+      return new Date(b.createdAt) - new Date(a.createdAt);
+    });
+
+    if (!list.length) {
+      return '<tr><td colspan="7"><div class="empty">没有符合条件的商机</div></td></tr>';
+    }
+
+    return list.map(function (o) {
+      var a = analyzeOpp(o);
+      var top = a.ordered[0];
+      var c = oppClass(o);
+      var tierCls = c.tier === '大单' ? 'green' : c.tier === '批量单' ? 'green' :
+        c.tier === '小批量' ? 'amber' : 'gray';
+
+      return '<tr>' +
+        '<td>' + badge(o.status) + followChip(o) + '</td>' +
+        '<td><strong>' + esc(o.buyer.name) + '</strong><br>' +
+        '<span style="color:#8a919e;font-size:11px">' + esc(o.buyer.company || '—') + '</span></td>' +
+        '<td>' + esc(c.country) + '<br><span style="color:#8a919e;font-size:11px">' + esc(o.buyer.channel || '') + '</span></td>' +
+        '<td><span class="badge gray">' + esc(c.type) + '</span> ' +
+        '<span class="badge ' + tierCls + '">' + esc(c.tier) + '</span></td>' +
+        '<td>' + (top
+          ? esc(top.product.title.slice(0, 42)) + ' <span class="badge ' +
+          (top.match.modelHit ? 'green' : top.match.score > 55 ? 'amber' : 'gray') + '">' +
+          (top.match.modelHit ? '型号 ' + top.match.score : top.match.score) + '</span>'
+          : '<span style="color:#d92d20">无匹配</span>') + '</td>' +
+        '<td class="num">' + (c.qty ? c.qty.toLocaleString() : '—') + '</td>' +
+        '<td class="num">' + (o.deal && o.deal.netRmb ? C.money(o.deal.netRmb) : '—') + '</td>' +
+        '<td class="actions"><button class="btn sm" data-action="open-opp" data-id="' + o.id + '">打开</button></td>' +
+        '</tr>';
+    }).join('');
+  }
+
+  function oppSummary() {
+    var s = st();
+    var all = s.opportunities;
+    if (!all.length) {
+      return '<div class="card-bd" style="border-bottom:1px solid #f0f1f4">' +
+        '<div class="grid grid-3" style="gap:16px">' +
+        '<div><div style="font-size:11.5px;color:#8a919e;margin-bottom:6px">按国家</div><div class="chips">' +
+        '<span class="chip" style="color:#b0b6c0">还没有数据</span></div></div>' +
+        '<div><div style="font-size:11.5px;color:#8a919e;margin-bottom:6px">按品类</div><div class="chips">' +
+        '<span class="chip" style="color:#b0b6c0">还没有数据</span></div></div>' +
+        '<div><div style="font-size:11.5px;color:#8a919e;margin-bottom:6px">按订单量级</div><div class="chips">' +
+        '<span class="chip" style="color:#b0b6c0">还没有数据</span></div></div>' +
+        '</div>' +
+        '<div class="alert info" style="margin-top:12px"><span class="ic">i</span><div>' +
+        '新建一条商机后，系统会自动识别 <strong>国家</strong>、按匹配商品判断 <strong>品类</strong>、' +
+        '按数量分出 <strong>样品单 / 小批量 / 批量单 / 大单</strong>。' +
+        '</div></div></div>';
+    }
+
+    var byCountry = {}, byType = {}, byTier = {};
+    all.forEach(function (o) {
+      var c = oppClass(o);
+      byCountry[c.country] = (byCountry[c.country] || 0) + 1;
+      byType[c.type] = (byType[c.type] || 0) + 1;
+      byTier[c.tier] = (byTier[c.tier] || 0) + 1;
+    });
+
+    function chips(map, sep) {
+      return Object.keys(map).sort(function (a, b) { return map[b] - map[a]; }).slice(0, 8).map(function (k) {
+        return '<span class="chip">' + esc(k) + ' <b>' + map[k] + '</b></span>';
+      }).join(sep || ' ');
+    }
+
+    function block(title, map) {
+      return '<div style="margin-bottom:10px"><div style="font-size:11.5px;color:#8a919e;margin-bottom:6px">' + title + '</div>' +
+        '<div class="chips" style="gap:6px">' + chips(map) + '</div></div>';
+    }
+
+    return '<div class="card-bd" style="border-bottom:1px solid #f0f1f4">' +
+      '<div class="grid grid-3" style="gap:16px">' +
+      block('按国家', byCountry) + block('按品类', byType) + block('按订单量级', byTier) +
+      '</div></div>';
+  }
+
+  function oppSelect(id, label, value, options) {
+    return '<select id="' + id + '" style="height:32px;width:auto;min-width:120px;max-width:180px;flex:none">' +
+      '<option value="">' + label + '</option>' +
+      options.map(function (v) {
+        return '<option value="' + esc(v) + '"' + (v === value ? ' selected' : '') + '>' + esc(v) + '</option>';
+      }).join('') + '</select>';
+  }
+
+  function viewOpps() {
+    var s = st();
+    var countries = [], types = [], tiers = [];
+    s.opportunities.forEach(function (o) {
+      var c = oppClass(o);
+      if (countries.indexOf(c.country) < 0) countries.push(c.country);
+      if (types.indexOf(c.type) < 0) types.push(c.type);
+      if (tiers.indexOf(c.tier) < 0) tiers.push(c.tier);
+    });
+
+    var filters = '<div class="card-bd" style="padding:12px 18px">' +
+      '<div class="row" style="gap:8px;flex-wrap:wrap">' +
+      '<input type="text" id="opp-search" value="' + esc(S.oppQ) + '" placeholder="搜买家 / 公司 / 原文" style="width:240px;flex:none;height:32px">' +
+      oppSelect('opp-f-country', '全部国家', S.oppCountry, countries.sort()) +
+      oppSelect('opp-f-type', '全部品类', S.oppType, types.sort()) +
+      oppSelect('opp-f-tier', '全部量级', S.oppTier, ['样品单', '小批量', '批量单', '大单', '未填数量']) +
+      oppSelect('opp-f-status', '全部状态', S.oppStatus, ['new', 'matched', 'quoted', 'won', 'lost']) +
+      '<span id="opp-count" style="color:#8a919e;font-size:12px">显示 ' + oppFiltered().length + ' / ' + s.opportunities.length + ' 条</span>' +
+      '</div></div>';
+
+    return '<section class="card"><div class="card-hd">' +
+      '<div class="card-title">商机<span class="card-sub">自动分类：国家 / 品类 / 订单量级</span></div>' +
+      '<button class="btn sm primary" data-action="new-opp">+ 新建商机</button></div>' +
+      oppSummary() + filters +
+      '<div class="card-bd tight"><div class="table-wrap">' +
+      '<table class="table"><thead><tr><th>状态</th><th>买家</th><th>市场</th><th>分类</th>' +
+      '<th>匹配商品</th><th class="num">数量</th><th class="num">利润</th><th></th></tr></thead>' +
+      '<tbody id="opp-body">' + (s.opportunities.length ? oppRows() : '<tr><td colspan="8"><div class="empty"><strong>还没有商机</strong>从右上角新建。</div></td></tr>') +
+      '</tbody></table></div></div></section>';
+  }
+  /* =========================================================
+     视图：商机详情
+     ========================================================= */
+
+  var tr = { status: 'idle', msg: '', done: 0, total: 0 };
+
+  function paintTr() {
+    var el = document.getElementById('tr-state');
+    if (!el) return;
+    if (tr.status === 'loading') {
+      el.innerHTML = '<span style="color:#b7791f">翻译中' +
+        (tr.total > 1 ? ' ' + tr.done + '/' + tr.total : '') + '…</span>';
+    } else if (tr.status === 'ok') {
+      el.innerHTML = '<span style="color:#0f9d58">已译成中文</span>';
+    } else if (tr.status === 'error') {
+      el.innerHTML = '<span style="color:#d92d20">翻译失败：' + esc(tr.msg) + '</span> ' +
+        '<button class="btn sm ghost" data-action="tr-zh">重试</button>';
+    } else {
+      el.textContent = '';
+    }
+  }
+
+  function paintRawText() {
+    var el = document.getElementById('raw-block');
+    if (!el) return;
+    var opp = oppById(S.oppId);
+    if (!opp) return;
+    el.textContent = (S.oppLang === 'zh' && S.oppTextZh) ? S.oppTextZh : opp.rawText;
+  }
+
+  function runTranslation(opp) {
+    tr = { status: 'loading', msg: '', done: 0, total: 0 };
+    paintTr();
+
+    window.Translate.text(opp.rawText, 'zh-CN', function (err, res) {
+      if (S.oppId !== opp.id) return;
+      if (err) {
+        tr = { status: 'error', msg: err.message || '未知错误', done: 0, total: 0 };
+        S.oppTextZh = null;
+        S.oppLang = 'raw';
+        paintTr();
+        paintRawText();
+        return;
+      }
+      S.oppTextZh = res.text;
+      tr = { status: 'ok', msg: '', done: 0, total: 0 };
+      paintTr();
+      paintRawText();
+    }, function (done, total) {
+      if (S.oppId !== opp.id) return;
+      tr = { status: 'loading', msg: '', done: done, total: total };
+      paintTr();
+    });
+  }
+
+  function ensureTranslation(opp) {
+    if (!window.Translate || !opp) return;
+    if (S.oppId === opp.id && (S.oppTextZh || tr.status === 'loading')) return;
+    S.oppId = opp.id;
+    S.oppTextZh = null;
+    if (!window.Translate.needsTranslation(opp.rawText, 'zh-CN')) {
+      tr = { status: 'idle', msg: '', done: 0, total: 0 };
+      paintTr();
+      return;
+    }
+    runTranslation(opp);
+  }
+
+  /* ---------------- 报价沙盘 ---------------- */
+
+  function sandboxCard(ctx) {
+    var r = ctx.pricing;
+    if (!r || (r.flags && r.flags.noCost) || !(r.qty > 0)) return '';
+    var fx = C.num(r.fx, 7.1);
+    var fee = C.num(r.feeRate);
+    var cost = C.num(ctx.product && ctx.product.costRmb) + C.num(ctx.opp.quote.shippingRmb);
+    var qty = C.num(r.qty);
+    var floor = C.num(r.floorUsd);
+    var rec = C.num(r.recommendUsd) || floor * 1.1;
+
+    var minP = Math.max(0.01, Math.round(floor * 0.85 * 100) / 100);
+    var maxP = Math.round(Math.max(rec * 1.4, floor * 1.6) * 100) / 100;
+    var curP = C.num(r.unitPriceUsd) || rec;
+
+    return '<section class="card" data-pf="sandbox"><div class="card-hd">' +
+      '<div class="card-title">报价沙盘<span class="card-sub">拖一下，看这一单赚多少、最多能让到哪</span></div>' +
+      '</div><div class="card-bd">' +
+      '<div class="grid grid-2" style="gap:18px">' +
+      '<div><label style="font-size:11.5px;color:#8a919e">单价 USD <b id="sb-price-out" style="color:#111">' +
+      C.usd(curP) + '</b></label>' +
+      '<input type="range" id="sb-price" min="' + minP + '" max="' + maxP + '" step="0.01" value="' + curP +
+      '" style="width:100%" data-opp="' + ctx.opp.id + '"></div>' +
+      '<div><label style="font-size:11.5px;color:#8a919e">数量 <b id="sb-qty-out" style="color:#111">' +
+      qty.toLocaleString() + '</b></label>' +
+      '<input type="range" id="sb-qty" min="1" max="' + Math.max(qty * 3, 100) + '" step="1" value="' + qty +
+      '" style="width:100%" data-opp="' + ctx.opp.id + '"></div>' +
+      '</div>' +
+      '<div id="sb-result" style="margin-top:16px"></div>' +
+      '<div style="font-size:11px;color:#8a919e;margin-top:10px">保本价 ' + C.usd(floor) +
+      ' · 平台扣费 ' + C.pct(fee) + ' · 成本 ' + C.money(cost) + '/件</div>' +
+      '</div></section>';
+  }
+
+  function sandboxResult(ctx, price, qty) {
+    var fx = C.num(ctx.pricing.fx, 7.1);
+    var fee = C.num(ctx.pricing.feeRate);
+    var cost = C.num(ctx.product && ctx.product.costRmb) + C.num(ctx.opp.quote.shippingRmb);
+    var floor = C.num(ctx.pricing.floorUsd);
+
+    var revenue = price * qty * fx * (1 - fee);
+    var costTotal = cost * qty;
+    var net = C.round2(revenue - costTotal);
+    var perUnit = qty > 0 ? C.round2(net / qty) : 0;
+    var margin = costTotal > 0 ? net / costTotal : 0;
+
+    /* 每件至少赚 20 元时的最高让价 */
+    var keep20 = C.round2((cost + 20) / (fx * (1 - fee)));
+
+    var bad = net < 0;
+    return '<div class="grid grid-3" style="gap:14px">' +
+      '<div><div style="font-size:11px;color:#8a919e">这一单净利</div>' +
+      '<div style="font-size:24px;font-weight:700;color:' + (bad ? '#d92d20' : '#0f9d58') + '">' +
+      C.money(net) + '</div></div>' +
+      '<div><div style="font-size:11px;color:#8a919e">每件赚</div>' +
+      '<div style="font-size:24px;font-weight:700;color:' + (perUnit < 0 ? '#d92d20' : '#111') + '">' +
+      C.money(perUnit) + '</div></div>' +
+      '<div><div style="font-size:11px;color:#8a919e">毛利率</div>' +
+      '<div style="font-size:24px;font-weight:700">' + C.pct(margin) + '</div></div>' +
+      '</div>' +
+      '<div class="alert ' + (bad ? 'warn' : 'info') + '" style="margin-top:14px"><span class="ic">i</span><div>' +
+      (bad
+        ? '低于保本价，这一单要亏 <b>' + C.money(Math.abs(net)) + '</b>。<br>'
+        : '') +
+      '这个数量下，<b>最低不能低于 ' + C.usd(floor) + '</b>（保本）。' +
+      '想每件至少赚 ¥20，最多只能让到 <b>' + C.usd(keep20) + '</b>。' +
+      '</div></div>';
+  }
+
+  /* ---------------- 客户档案 ---------------- */
+
+  function buyerKey(o) {
+    var b = (o && o.buyer) || {};
+    return String(b.company || b.name || '').trim().toLowerCase();
+  }
+
+  function buyerProfile(opp) {
+    var key = buyerKey(opp);
+    var s = st();
+    var mine = (s.opportunities || []).filter(function (o) { return buyerKey(o) === key; });
+    var names = [buyerKey(opp), String((opp.buyer && opp.buyer.name) || '').trim().toLowerCase()]
+      .filter(Boolean);
+    var orders = (s.orders || []).filter(function (o) {
+      var ob = String(o.buyer || '').trim().toLowerCase();
+      return ob && names.indexOf(ob) >= 0;
+    });
+
+    var won = mine.filter(function (o) { return o.status === 'won'; });
+    var lost = mine.filter(function (o) { return o.status === 'lost'; });
+    var gmv = orders.reduce(function (a, o) { return a + C.num(o.amountUsd) - Math.min(C.num(o.refundUsd), C.num(o.amountUsd)); }, 0);
+    var profit = orders.reduce(function (a, o) { return a + C.num(o.netRmb); }, 0);
+
+    return {
+      key: key,
+      inquiries: mine.length,
+      won: won.length,
+      lost: lost.length,
+      orders: orders.length,
+      gmv: C.round2(gmv),
+      profit: C.round2(profit),
+      list: mine.slice().sort(function (a, b) { return String(b.createdAt).localeCompare(String(a.createdAt)); }).slice(0, 5)
+    };
+  }
+
+  function buyerCard(opp) {
+    var p = buyerProfile(opp);
+    if (p.inquiries <= 1 && p.orders === 0) {
+      return '<section class="card"><div class="card-hd">' +
+        '<div class="card-title">这个买家<span class="card-sub">第一次来</span></div></div>' +
+        '<div class="card-bd"><div style="font-size:12.5px;color:#6b7280">' +
+        '之前没有记录。先把需求问清楚：用途、数量、目标市场、要不要认证。' +
+        '</div></div></section>';
+    }
+
+    var rows = p.list.map(function (o) {
+      var qty = (o.quote && o.quote.qty) || 0;
+      var price = (o.quote && o.quote.unitPriceUsd) || 0;
+      return '<tr><td style="color:#8a919e;font-size:11px">' + esc(C.fmtDate(o.createdAt)) + '</td>' +
+        '<td>' + esc((o.quote && o.quote.incoterm) || '') + ' ' +
+        (price ? C.usd(price) : '—') + '</td>' +
+        '<td class="num">' + (qty ? qty.toLocaleString() : '—') + '</td>' +
+        '<td>' + badge(o.status) + '</td></tr>';
+    }).join('');
+
+    return '<section class="card"><div class="card-hd">' +
+      '<div class="card-title">这个买家<span class="card-sub">' + esc(opp.buyer.company || opp.buyer.name) + '</span></div>' +
+      '</div><div class="card-bd">' +
+      '<div class="grid grid-4" style="gap:12px">' +
+      '<div><div style="font-size:11px;color:#8a919e">询盘</div><div style="font-size:20px;font-weight:700">' + p.inquiries + ' 次</div></div>' +
+      '<div><div style="font-size:11px;color:#8a919e">成交</div><div style="font-size:20px;font-weight:700">' + p.won + ' 次</div></div>' +
+      '<div><div style="font-size:11px;color:#8a919e">累计成交额</div><div style="font-size:20px;font-weight:700">' + C.usd(p.gmv) + '</div></div>' +
+      '<div><div style="font-size:11px;color:#8a919e">累计利润</div>' +
+      '<div style="font-size:20px;font-weight:700;color:' + (p.profit < 0 ? '#d92d20' : '#0f9d58') + '">' +
+      C.money(p.profit) + '</div></div>' +
+      '</div>' +
+      (rows ? '<div class="table-wrap" style="margin-top:14px"><table class="table">' +
+        '<thead><tr><th>时间</th><th>报价</th><th class="num">数量</th><th>状态</th></tr></thead>' +
+        '<tbody>' + rows + '</tbody></table></div>' : '') +
+      '</div></section>';
+  }
+
+  function ctxWithQty(opp, qty) {
+    var clone = JSON.parse(JSON.stringify(opp));
+    clone.quote.qty = qty;
+    return ctxFor(clone);
+  }
+
+  function initSandbox(oppId) {
+    var box = document.getElementById('sb-result');
+    if (!box) return;
+    var opp = oppById(oppId);
+    if (!opp) return;
+    var price = C.num((document.getElementById('sb-price') || {}).value);
+    var qty = C.num((document.getElementById('sb-qty') || {}).value);
+    if (!(price > 0)) return;
+    box.innerHTML = sandboxResult(ctxWithQty(opp, qty), price, qty);
+  }
+
+  function marketLine(p, r) {
+    var m = marketRefOf(p);
+    var fx = C.num(st().settings.fxRate, 7.1);
+    if (!m) return '';
+
+    var marketUsd = m.median / fx;
+    var quote = C.num(r && r.unitPriceUsd);
+    var cmp = '';
+    if (quote > 0 && marketUsd > 0) {
+      var d = (quote / marketUsd - 1) * 100;
+      if (d > 12) cmp = '<span style="color:#d92d20">你的报价比市场高 ' + d.toFixed(0) + '%</span>';
+      else if (d < -12) cmp = '<span style="color:#0f9d58">比市场低 ' + Math.abs(d).toFixed(0) + '%</span>';
+      else cmp = '<span style="color:#8a919e">和市场差不多</span>';
+    }
+
+    return '<div class="alert info" style="padding:10px 12px"><span class="ic">¥</span><div>' +
+      '<strong>市场参考价 ' + C.money(m.median) + '</strong>（' +
+      C.money(m.low) + '–' + C.money(m.high) + '，' + m.source + ' ' + m.n + ' 条）' +
+      ' ≈ <b>' + C.usd(marketUsd) + '</b>/pc' +
+      (cmp ? '<br>' + cmp : '') +
+      '<br><span style="font-size:11px;color:#8a919e">淘宝/闲鱼同款零售价中位数，不是你的成本，也不是阿里挂牌价</span>' +
+      '</div></div>';
+  }
+
+  function viewOppDetail(id) {
+    var opp = oppById(id);
+    if (!opp) return '<div class="empty">商机不存在。<a href="#/opps">返回列表</a></div>';
+
+    prepareOpp(opp);
+    var ctx = ctxFor(opp);
+    var r = ctx.pricing;
+    var p = ctx.product;
+    var a = analyzeOpp(opp);
+
+    /* ---- 头部 ---- */
+    var head = '<section class="card"><div class="card-bd">' +
+      '<div class="opp-head">' +
+      '<div><div class="opp-title">' + esc(opp.buyer.name) +
+      (opp.buyer.company ? ' <span style="color:#8a919e;font-weight:400;font-size:13px">· ' + esc(opp.buyer.company) + '</span>' : '') +
+      '</div><div class="opp-meta">' +
+      '<span>' + badge(opp.status) + '</span>' +
+      '<span>' + esc(opp.buyer.country || '未知市场') + '</span>' +
+      '<span>' + esc(opp.buyer.channel) + '</span>' +
+      '<span>创建于 ' + C.fmtDate(opp.createdAt, true) + '</span>' +
+      '</div></div>' +
+      '<div class="row">' +
+      '<button class="btn" data-action="gen-reply" data-lang="zh">生成中文回复</button>' +
+      '<button class="btn" data-action="gen-reply" data-lang="en">生成英文回复</button>' +
+      '<button class="btn" data-action="print-quote" data-id="' + opp.id + '">报价单</button>' +
+      '<button class="btn" data-action="open-follow" data-id="' + opp.id + '">记录跟进</button>' +
+      (opp.status !== 'quoted' && opp.status !== 'won'
+        ? '<button class="btn primary" data-action="mark-quoted" data-id="' + opp.id + '">标记已报价</button>' : '') +
+      '<button class="btn" data-action="open-settle" data-id="' + opp.id + '">成交</button>' +
+      '<button class="btn danger" data-action="open-lose" data-id="' + opp.id + '">丢单</button>' +
+      '<button class="icon-btn" data-action="delete-opp" data-id="' + opp.id + '" title="删除">×</button>' +
+      '</div></div></div></section>';
+
+    /* ---- 左：原文 + 解析 ---- */
+    var parsedChips = [];
+    parsedChips.push(chip('数量', a.parsed.qty ? a.parsed.qty.toLocaleString() : '未识别',
+      a.parsed.qty ? '' : 'bad'));
+    parsedChips.push(chip('目标价', a.parsed.targetPriceUsd ? C.usd(a.parsed.targetPriceUsd) : '未识别',
+      a.parsed.targetPriceUsd ? '' : ''));
+    parsedChips.push(chip('交期', a.parsed.leadTimeDays ? a.parsed.leadTimeDays + ' 天' : '未识别', ''));
+    parsedChips.push(chip('认证', a.parsed.certs.length ? a.parsed.certs.join(' / ') : '未要求', ''));
+    parsedChips.push(chip('术语', a.parsed.incoterm || '未指定', ''));
+    parsedChips.push(chip('市场', a.parsed.country || '未识别', ''));
+
+    var left = card('买家原始需求', '从询盘 / RFQ 原文自动解析',
+      '<div class="row" style="gap:6px;margin-bottom:8px">' +
+      '<button class="btn sm ' + (S.oppLang === 'zh' ? 'primary' : 'ghost') + '" data-action="tr-zh">中文</button>' +
+      '<button class="btn sm ' + (S.oppLang !== 'zh' ? 'primary' : 'ghost') + '" data-action="tr-raw">原文</button>' +
+      '<span id="tr-state" style="font-size:11.5px;color:#8a919e;align-self:center"></span>' +
+      '</div>' +
+      '<div class="rawtext" id="raw-block">' +
+      esc(S.oppLang === 'zh' && S.oppTextZh ? S.oppTextZh : opp.rawText) + '</div>' +
+      '<div class="chips" style="margin-top:12px">' + parsedChips.join('') + '</div>',
+      '<button class="btn sm ghost" data-action="edit-opp" data-id="' + opp.id + '">编辑原文</button>');
+
+    /* ---- 右：定价面板 ---- */
+    var right = '<section class="card" id="pricing-card">' +
+      '<div class="card-hd"><div class="card-title">定价测算' +
+      '<span class="card-sub">' + (p ? esc(p.sku) : '未选品') + '</span></div>' +
+      '<button class="btn sm ghost" data-action="apply-recommend" data-id="' + opp.id + '">用建议价</button></div>' +
+      '<div class="card-bd stack">' +
+      '<div class="row" style="gap:8px;flex-wrap:wrap">' +
+      '<span style="font-size:12px;color:var(--ink-3)">去别的平台比价：</span>' + searchLinks(ctx) + '</div>' +
+      marketLine(p, r) +
+      '<div class="form-grid">' +
+      '<div class="field"><label>数量 (pcs)</label>' +
+      '<input type="number" min="1" step="1" value="' + opp.quote.qty + '" data-opp="' + opp.id + '" data-field="qty"></div>' +
+      '<div class="field"><label>你的报价 (USD)</label>' +
+      '<input type="number" min="0" step="0.01" value="' + C.round(r.unitPriceUsd, 2) + '" data-opp="' + opp.id + '" data-field="unitPriceUsd"></div>' +
+      '<div class="field"><label>采购成本（元/件，1688 查的）</label>' +
+      '<input type="number" min="0" step="0.01" value="' + (C.num(opp.quote.costRmb) || '') + '" data-opp="' + opp.id + '" data-field="costRmb"></div>' +
+      '<div class="field"><label>别家卖多少（元/件）</label>' +
+      '<input type="number" min="0" step="0.01" value="' + (C.num(p && p.marketPriceRmb) || '') + '" data-opp="' + opp.id + '" data-field="marketPriceRmb"></div>' +
+      '<div class="field"><label>国内运费（元/件）</label>' +
+      '<input type="number" min="0" step="0.01" value="' + (C.num(opp.quote.shippingRmb) || 0) + '" data-opp="' + opp.id + '" data-field="shippingRmb"></div>' +
+      '<div class="field"><label>贸易术语</label>' +
+      '<input type="text" value="' + esc(opp.quote.incoterm || '') + '" data-opp="' + opp.id + '" data-field="incoterm"></div>' +
+      '<div class="field"><label>交期（天，0 = 待确认）</label>' +
+      '<input type="number" min="1" value="' + (opp.quote.leadTimeDays || 0) + '" data-opp="' + opp.id + '" data-field="leadTimeDays"></div>' +
+      '</div>' +
+      '<div data-pf="split">' + rangeBarHtml(ctx) + '</div>' +
+      '<div data-pf="floors">' + floorsHtml(ctx) + '</div>' +
+      '<div data-pf="profit">' + profitHtml(ctx) + '</div>' +
+      '<div data-pf="flags">' + flagsHtml(ctx) + '</div>' +
+      '<div data-pf="versions">' + versionsHtml(opp) + '</div>' +
+      '<div data-pf="nego">' + negBlock(ctx) + '</div>' +
+      '</div></section>';
+
+    /* ---- 匹配列表：只显示相关度够高的，避免一堆 0 分占地方 ---- */
+    var visibleMatches = a.ordered.filter(function (x) { return x.match.score >= 8 || x.match.modelHit; }).slice(0, 5);
+    if (!visibleMatches.length && a.ordered.length) visibleMatches = a.ordered.slice(0, 1);
+    var hiddenMatches = a.ordered.length - visibleMatches.length;
+
+    var matchHtml = visibleMatches.length
+      ? visibleMatches.map(function (x) {
+        var sel = x.product.id === opp.selectedProductId;
+        var cls = x.match.score >= 80 ? 'hi' : x.match.score >= 55 ? 'mid' : 'lo';
+        var tags = [];
+        if (x.match.modelHit) tags.push('<span class="chip good">型号 ' + esc(x.match.model || '') + '</span>');
+        else if (x.match.hardFail) tags.push('<span class="chip bad">型号不符</span>');
+        if (x.match.quotable) tags.push('<span class="chip good">可报价</span>');
+        else tags.push('<span class="chip bad">待补成本</span>');
+        x.match.gaps.forEach(function (g) { tags.push('<span class="chip bad">' + esc(g) + '</span>'); });
+
+        return '<div class="match-item' + (sel ? ' selected' : '') + '" data-action="select-product" data-id="' +
+          x.product.id + '" data-opp="' + opp.id + '">' +
+          '<div class="match-score ' + cls + '">' + x.match.score + '</div>' +
+          '<div class="match-body">' +
+          '<div class="match-name">' + esc(x.product.title) + '</div>' +
+          '<div class="match-sku">' + esc(x.product.sku) + ' · ' + esc(x.product.category) +
+          ' · ' + (x.product.priceFloorUsd > 0 ? C.usd(x.product.priceFloorUsd) + '–' + C.usd(x.product.priceUsd) : '橱窗价 ' + C.usd(x.product.priceUsd)) + ' · MOQ ' + x.product.moq + '</div>' +
+          '<div class="chips" style="margin-top:6px">' + tags.join('') + '</div>' +
+          '<div class="match-reasons">命中：' + (x.match.reasons.length ? esc(x.match.reasons.join('、')) : '—') + '</div>' +
+          '</div></div>';
+      }).join('') +
+      (hiddenMatches > 0
+        ? '<div style="padding:10px 14px;font-size:11.5px;color:var(--ink-3);border-top:1px solid #f0f1f4">' +
+        '另外 ' + hiddenMatches + ' 个商品相关度太低，已隐藏</div>'
+        : '')
+      : '<div class="empty"><strong>没有匹配到商品</strong>可能是品类不在你的橱窗里，先到「商品库」补充。</div>';
+
+    var matchCard = '<section class="card"><div class="card-hd">' +
+      '<div class="card-title">橱窗匹配<span class="card-sub">先看型号命中，再看匹配度</span></div>' +
+      '<span class="badge gray">' + visibleMatches.length + ' 个候选</span></div>' +
+      '<div class="card-bd tight">' + matchHtml + '</div></section>';
+
+    /* ---- 数量阶梯 ---- */
+    var extra = '<section class="card">' +
+      '<div class="card-hd"><div class="card-title">数量阶梯<span class="card-sub">' +
+      '同样的价，客户要多你多赚</span></div></div>' +
+      '<div class="card-bd tight" data-pf="ladder">' + ladderHtml(ctx) + '</div></section>';
+
+    /* ---- 下方：草稿 / 报价单 / 话术 ---- */
+    var tabs = '<section class="card">' +
+      '<div class="tabs">' +
+      tabBtn('en', '英文回复', opp) + tabBtn('zh', '中文回复', opp) +
+      tabBtn('nego', '议价话术', opp) + tabBtn('quote', '报价单预览', opp) +
+      tabBtn('log', '操作记录', opp) +
+      '</div><div class="card-bd" id="tab-body">' + tabBody(ctx) + '</div></section>';
+
+    return '<div class="stack">' + head + '<div data-pf="verdict">' + verdictHtml(ctx) + '</div>' +
+      '<div data-pf="judge">' + (window.Judge ? window.Judge.render(ctx) : '') + '</div>' +
+      '<div class="grid grid-2 top">' + left + right + '</div>' +
+      buyerCard(opp) + followCard(opp) + sandboxCard(ctx) + matchCard + extra + tabs + '</div>';
+  }
+
+  /* 详情页第一眼：能不能报、报多少、赚多少 */
+  function verdictHtml(ctx) {
+    var r = ctx.pricing;
+    var s = ctx.settings;
+    var incoterm = (ctx.opp.quote && ctx.opp.quote.incoterm) || s.defaultIncoterm;
+
+    if (r.flags.noCost) {
+      return '<div class="verdict">' +
+        '<div><div class="v-kicker">第 1 步</div>' +
+        '<div class="v-price" style="font-size:22px;color:var(--ink-2)">先去查成本</div>' +
+        '<div class="v-sub">1688 / 淘宝 / 闲鱼搜这个货，看多少钱一件</div></div>' +
+        '<div><div class="v-kicker">要查什么</div>' +
+        '<div class="v-net" style="font-size:15px">单价 + 起订量 + 有没有货</div>' +
+        '<div class="v-sub">填进来立刻算保本价</div></div>' +
+        '<div><div class="v-kicker">平台扣费</div>' +
+        '<div class="v-net" style="font-size:17px">' + C.pct(r.feeRate) + '</div>' +
+        '<div class="v-sub">保本价 = 成本 ÷ ' + (1 - r.feeRate).toFixed(2) + '</div></div>' +
+        '</div>';
+    }
+
+    if (!r.qty || !r.unitPriceUsd) {
+      return '<div class="verdict"><div><div class="v-kicker">结论</div>' +
+        '<div class="v-price" style="font-size:22px;color:var(--ink-2)">先填数量和报价</div>' +
+        '<div class="v-sub">下面的测算会实时更新</div></div><div></div><div></div></div>';
+    }
+
+    if (!r.flags.canQuote) {
+      return '<div class="verdict bad">' +
+        '<div><div class="v-kicker">这个价要亏</div>' +
+        '<div class="v-price">' + C.usd(r.unitPriceUsd) + '</div>' +
+        '<div class="v-sub">比保本价低 ' + Math.abs((r.unitPriceUsd / r.floorUsd - 1) * 100).toFixed(1) + '%</div></div>' +
+        '<div><div class="v-kicker">保本价（成本 ÷ ' + (1 - r.feeRate).toFixed(2) + '）</div>' +
+        '<div class="v-net">' + C.usd(r.floorUsd) + '</div>' +
+        '<div class="v-sub">低于这个数就亏</div></div>' +
+        '<div><div class="v-kicker">按建议价 ' + C.usd(r.recommendUsd) + ' 报，你赚</div>' +
+        '<div class="v-net" style="font-size:20px;color:var(--ok)">' +
+        C.money(Math.max(0, r.recommendUsd * r.qty * r.fx * (1 - r.feeRate) - r.costTotalRmb)) + '</div>' +
+        '<div class="v-sub">这一单总利润</div></div></div>';
+    }
+
+    var isAuto = ctx.opp.quote && ctx.opp.quote.autoPrice !== false;
+    return '<div class="verdict ok">' +
+      '<div><div class="v-kicker">' + (isAuto ? '建议报价' : '当前报价') + '</div>' +
+      '<div class="v-price">' + C.usd(r.unitPriceUsd) + '<span>/pc</span></div>' +
+      '<div class="v-sub">' + r.qty.toLocaleString() + ' pcs · ' + esc(incoterm) +
+      ' · 成交额 ' + C.usd(r.gmvUsd) + '</div></div>' +
+      '<div><div class="v-kicker">这一单你赚</div>' +
+      '<div class="v-net">' + C.money(r.netRmb) + '</div>' +
+      '<div class="v-sub">成本 ' + C.money(r.costTotalRmb) + ' · 平台扣 ' + C.money(r.feeRmb) + '</div></div>' +
+      '<div><div class="v-kicker">保本价</div>' +
+      '<div class="v-floor">' + C.usd(r.floorUsd) + '</div>' +
+      '<div class="v-sub">低于这个数就亏</div></div>' +
+      '</div>';
+  }
+  function chip(label, value, cls) {
+    return '<span class="chip ' + (cls || '') + '">' + esc(label) + ' <b>' + esc(value) + '</b></span>';
+  }
+
+  function floorsHtml(ctx) {
+    var r = ctx.pricing;
+    if (r.flags.noCost) {
+      return '<div class="priceline ceiling"><div class="pl-label">还没法算' +
+        '<small>填上采购成本，这里会显示保本价和建议价</small></div>' +
+        '<div class="pl-val">—</div></div>';
+    }
+
+    return '<div class="stack" style="gap:8px">' +
+      '<div class="priceline floor"><div class="pl-label">保本价（低于此价必亏）' +
+      '<small>成本 ' + C.money(r.costUnitRmb) + '/件 ÷ ' + (1 - r.feeRate).toFixed(2) + ' ÷ ' + r.fx.toFixed(2) + '</small></div>' +
+      '<div class="pl-val">' + C.usd(r.floorUsd) + '</div></div>' +
+      '<div class="priceline suggest"><div class="pl-label">建议报价' +
+      '<small>（成本 ' + C.money(r.costUnitRmb) + ' + 想赚 ' + C.money(r.profitPerUnitRmb) + '/件）÷ ' + (1 - r.feeRate).toFixed(2) + '</small></div>' +
+      '<div class="pl-val">' + C.usd(r.recommendUsd) + '</div></div>' +
+      (r.listUsd > 0
+        ? '<div class="priceline ceiling"><div class="pl-label">你的挂牌价' +
+        '<small>客户在阿里上看到的价格' + (r.marketUsd > 0 ? ' · 比市场' + (r.listUsd >= r.marketUsd ? '高 ' : '低 ') + Math.abs((r.listUsd / r.marketUsd - 1) * 100).toFixed(1) + '%' : '') + '</small></div>' +
+        '<div class="pl-val">' + C.usd(r.listUsd) + '</div></div>'
+        : '') +
+      (r.marketUsd > 0
+        ? '<div class="priceline' + (r.flags.aboveMarket ? ' floor' : ' suggest') + '"><div class="pl-label">别家卖多少' +
+        '<small>' + C.money(r.marketPriceRmb) + '/件 · 换算成美元' +
+        (r.marketGapPct !== null ? ' · 建议价比市场' + (r.marketGapPct >= 0 ? '高 ' : '低 ') + Math.abs(r.marketGapPct * 100).toFixed(1) + '%' : '') +
+        '</small></div>' +
+        '<div class="pl-val">' + C.usd(r.marketUsd) + '</div></div>'
+        : '') +
+      '</div>';
+  }
+
+  function profitHtml(ctx) {
+    var r = ctx.pricing;
+    if (r.flags.noCost) return '';
+
+    var bad = r.netRmb < 0;
+    return '<div class="profit-box' + (bad ? ' bad' : '') + '">' +
+      '<div><div class="pb-label">这一单' + (bad ? '亏' : '赚') + '（扣完成本和平台费）</div>' +
+      '<div class="pb-val">' + C.money(Math.abs(r.netRmb)) + '</div>' +
+      '<div class="pb-sub">收款 ' + C.money(r.gmvRmb) + ' − 平台扣 ' + C.money(r.feeRmb) +
+      ' − 成本 ' + C.money(r.costTotalRmb) + '</div></div>' +
+      '<div style="text-align:right"><div class="pb-label">每件' + (bad ? '亏' : '赚') + '</div>' +
+      '<div class="pb-val" style="font-size:16px">' + C.money(Math.abs(r.netRmb) / Math.max(1, r.qty)) + '</div>' +
+      '<div class="pb-sub">对成本 ' + C.pct(r.marginOnCost) + '</div></div>' +
+      '</div>';
+  }
+
+  /* 报价版本：只显示最近 4 版，能看清改价轨迹又不占地方。
+     数据来自 core.pushQuoteVersion，缺字段的老商机就自然不显示。 */
+  function versionsHtml(opp) {
+    var list = (opp && opp.quoteVersions) || [];
+    if (list.length < 2) return '';
+    var rows = list.slice(-4).reverse().map(function (v) {
+      return '<div style="display:flex;gap:8px;font-size:11.5px;color:#4a5260;padding:2px 0">' +
+        '<span style="color:#8a919e;min-width:86px">' + esc(v.at ? C.fmtDate(v.at) : '') + '</span>' +
+        '<span style="font-weight:600">' + C.usd(v.unitPriceUsd) + '</span>' +
+        '<span style="color:#8a919e">× ' + (v.qty || 0).toLocaleString() + ' pcs</span>' +
+        (v.note ? '<span style="color:#8a919e">' + esc(v.note) + '</span>' : '') +
+        '</div>';
+    }).join('');
+    return '<div style="margin-top:8px"><div style="font-size:11.5px;color:#8a919e;margin-bottom:2px">' +
+      '改价记录（共 ' + list.length + ' 版）</div>' + rows + '</div>';
+  }
+
+  /* 数量阶梯 */
+  function ladderHtml(ctx) {
+    var r = ctx.pricing;
+    if (r.flags.noCost) return '<div class="empty">填上成本后显示</div>';
+
+    var rows = P.ladder({
+      product: ctx.product, qty: ctx.opp.quote.qty, settings: ctx.settings,
+      unitCostRmb: r.unitCostRmb, shippingRmb: r.unitShipRmb
+    });
+
+    return '<table class="table"><thead><tr><th>数量</th><th class="num">建议单价</th>' +
+      '<th class="num">成本合计</th><th class="num">这一单赚</th></tr></thead><tbody>' +
+      rows.map(function (x) {
+        return '<tr><td>' + x.qty.toLocaleString() + ' pcs</td>' +
+          '<td class="num">' + C.usd(x.unitPriceUsd) + '</td>' +
+          '<td class="num" style="color:#8a919e">' + C.money(x.costTotalRmb) + '</td>' +
+          '<td class="num" style="color:' + (x.netRmb < 0 ? '#d92d20' : '#0f9d58') + '">' + C.money(x.netRmb) + '</td></tr>';
+      }).join('') + '</tbody></table>';
+  }
+
+  function sensHtml(ctx) {
+    var r = ctx.pricing;
+    if (r.flags.noCost) return '<div class="empty">填上成本后显示</div>';
+
+    var rows = P.sensitivity({
+      product: ctx.product, qty: ctx.opp.quote.qty, settings: ctx.settings,
+      unitCostRmb: r.unitCostRmb, shippingRmb: r.unitShipRmb,
+      unitPriceUsd: ctx.opp.quote.unitPriceUsd
+    });
+    return '<table class="table"><thead><tr><th>报价变动</th><th class="num">单价</th><th class="num">这一单赚</th></tr></thead><tbody>' +
+      rows.map(function (x) {
+        return '<tr><td>' + (x.delta > 0 ? '+' : '') + (x.delta * 100).toFixed(0) + '%</td>' +
+          '<td class="num">' + C.usd(x.unitPriceUsd) + '</td>' +
+          '<td class="num" style="color:' + (x.belowCost ? '#d92d20' : '#0f9d58') + '">' + C.money(x.netRmb) + '</td></tr>';
+      }).join('') + '</tbody></table>';
+  }
+  function tabBtn(key, label, opp) {
+    return '<button class="tab' + (S.tab === key ? ' active' : '') + '" data-action="tab" data-tab="' + key +
+      '" data-id="' + opp.id + '">' + label + '</button>';
+  }
+
+  function tabBody(ctx) {
+    var opp = ctx.opp;
+
+    if (S.tab === 'en' || S.tab === 'zh') {
+      var text = opp.drafts[S.tab] || '';
+      if (!text) {
+        return '<div class="empty"><strong>还没有草稿</strong>点上方「生成' +
+          (S.tab === 'en' ? '英文' : '中文') + '回复」，系统会按当前报价和买家需求自动起草。</div>';
+      }
+      return '<div class="field"><label>可直接编辑后再复制到阿里后台 / 邮箱</label>' +
+        '<textarea class="draft" data-draft="' + S.tab + '" data-id="' + opp.id + '">' + esc(text) + '</textarea></div>' +
+        '<div class="row" style="margin-top:10px">' +
+        '<button class="btn sm primary" data-action="copy-draft" data-lang="' + S.tab + '" data-id="' + opp.id + '">复制全文</button>' +
+        '<button class="btn sm ghost" data-action="gen-reply" data-lang="' + S.tab + '" data-id="' + opp.id + '">重新生成</button>' +
+        '<span class="card-sub">提示：生成后改价不会自动同步，重新生成即可</span>' +
+        '</div>';
+    }
+
+    if (S.tab === 'nego') {
+      var items = R.negotiation(ctx);
+      return items.map(function (it) {
+        return '<div class="stack" style="gap:6px;margin-bottom:14px">' +
+          '<div style="font-weight:650;font-size:12.5px">' + esc(it.title) + '</div>' +
+          '<div class="rawtext" style="max-height:none">' + esc(it.text) + '</div></div>';
+      }).join('');
+    }
+
+    if (S.tab === 'quote') {
+      return '<div class="alert info" style="margin-bottom:12px"><span class="ic">i</span>' +
+        '<div>下面是报价单预览。<strong>打印 / 存 PDF</strong> 会打开新窗口，选「另存为 PDF」即可发给客户。</div></div>' +
+        '<div class="row" style="margin-bottom:12px">' +
+        '<button class="btn sm primary" data-action="print-quote" data-id="' + opp.id + '">打印 / 存 PDF</button>' +
+        '</div>' +
+        '<div style="border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;height:460px;background:#fff">' +
+        '<iframe id="quote-frame" style="width:100%;height:100%;border:0" sandbox="" srcdoc="' +
+        esc(R.quoteDocument(ctx)) + '"></iframe></div>';
+    }
+
+    if (S.tab === 'log') {
+      if (!opp.log || !opp.log.length) return '<div class="empty">暂无记录</div>';
+      return '<table class="table"><tbody>' + opp.log.map(function (l) {
+        return '<tr><td style="width:150px;color:#8a919e">' + C.fmtDate(l.ts, true) + '</td><td>' + esc(l.text) + '</td></tr>';
+      }).join('') + '</tbody></table>';
+    }
+
+    return '';
+  }
+
+  /* =========================================================
+     视图：商品库
+     ========================================================= */
+
+  /* 关键词匹配：多个词用空格分开，全部命中才算 */
+  function matchQuery(text, q) {
+    if (!q) return true;
+    var hay = String(text || '').toLowerCase();
+    var words = String(q).toLowerCase().split(/\s+/).filter(Boolean);
+    for (var i = 0; i < words.length; i++) {
+      if (hay.indexOf(words[i]) < 0) return false;
+    }
+    return true;
+  }
+
+  function catalogRows(q, onlyEmpty) {
+    var s = st();
+    var fx = C.num(s.settings.fxRate, 7.1);
+
+    var list = s.products.filter(function (p) {
+      if (onlyEmpty && C.num(p.costRmb) > 0) return false;
+      if (S.catType && (C.typeOfProduct(p) || '其他') !== S.catType) return false;
+      return matchQuery([p.title, p.titleEn, p.sku, p.category, (p.keywords || []).join(' ')].join(' '), q);
+    });
+
+    if (!list.length) {
+      return '<tr><td colspan="10"><div class="empty">没有匹配的商品</div></td></tr>';
+    }
+
+    return list.map(function (p) {
+      var be = P.breakEvenOf(p, s.settings);
+      var listUsd = C.num(p.priceUsd);
+      var listLoss = be.hasCost && listUsd > 0 && listUsd < be.breakEvenUsd - 1e-9;
+      var mref = marketRefOf(p);
+      var marketRmb = C.num(p.marketPriceRmb) > 0 ? C.num(p.marketPriceRmb) : (mref ? mref.median : 0);
+      var marketUsd = marketRmb > 0 ? marketRmb / fx : 0;
+      var aboveMarket = marketUsd > 0 && be.hasCost && be.recommendUsd > marketUsd * 1.02;
+
+      var verdict;
+      if (!be.hasCost) verdict = '<span class="badge gray">待填成本</span>';
+      else if (listLoss) verdict = '<span class="badge red">挂牌价亏</span>';
+      else if (aboveMarket) verdict = '<span class="badge amber">比市场贵</span>';
+      else if (marketUsd > 0) verdict = '<span class="badge green">有优势</span>';
+      else verdict = '<span class="badge gray">待填市场价</span>';
+
+      function cell(field, val, ph) {
+        return '<td class="num"><input type="number" min="0" step="0.01" ' +
+          'value="' + (C.num(val) > 0 ? C.num(val) : '') + '" placeholder="' + ph + '" ' +
+          'data-prod="' + p.id + '" data-pfield="' + field + '" ' +
+          'style="width:82px;height:28px;text-align:right;font-family:var(--mono)' +
+          (C.num(val) > 0 ? '' : ';border-color:#f0b429') + '"></td>';
+      }
+
+      return '<tr>' +
+        '<td><span class="badge gray">' + esc(C.typeOfProduct(p) || '其他') + '</span></td>' +
+        '<td style="max-width:320px"><strong style="font-size:12px">' + esc(p.title) + '</strong>' +
+        (p.costSource === 'auto'
+          ? ' <span class="badge amber" title="' + esc(p.costNote || '') + '">自动</span>'
+          : '') +
+        '<br><span style="color:#8a919e;font-size:10.5px">' + esc(p.sku) + '</span></td>' +
+        '<td class="num">' + (p.priceFloorUsd > 0
+          ? C.usd(p.priceFloorUsd) + ' – ' + C.usd(p.priceUsd)
+          : C.usd(p.priceUsd)) +
+        ((p.priceTiers && p.priceTiers.length)
+          ? '<br><span style="color:#8a919e;font-size:10px">' +
+          p.priceTiers.slice(0, 3).map(function (tt) {
+            return tt.min + (tt.max && tt.max !== tt.min ? '-' + tt.max : '') + '件 ' + C.usd(tt.price);
+          }).join(' · ') + '</span>'
+          : '') + '</td>' +
+        '<td class="num">' + (mref
+          ? '<b>' + C.money(mref.median) + '</b><br><span style="color:#8a919e;font-size:10px">' +
+          mref.low + '–' + mref.high + ' · ' + mref.source + mref.n + '条</span>'
+          : '<span style="color:#c9ced6" title="淘宝/闲鱼没抓到同款，可点上方按钮手动查">—</span>') + '</td>' +
+        cell('costRmb', p.costRmb, '1688价') +
+        cell('marketPriceRmb', p.marketPriceRmb, '别家价') +
+        '<td class="num" style="color:' + (be.hasCost ? (listLoss ? '#d92d20' : '#0f9d58') : '#8a919e') + ';font-weight:600">' +
+        (be.hasCost ? C.usd(be.breakEvenUsd) : '—') + '</td>' +
+        '<td class="num" style="font-weight:600">' + (be.hasCost ? C.usd(be.recommendUsd) : '—') + '</td>' +
+        '<td>' + verdict +
+        '<br><span style="color:#a0a6b0;font-size:10px">费率 ' + C.pct(C.feeRateFor(p, s.settings)) + '</span></td>' +
+        '<td class="actions"><button class="btn sm ghost" data-action="edit-product" data-id="' + p.id + '">编辑</button></td>' +
+        '</tr>';
+    }).join('');
+  }
+
+  function marketRefOf(p) {
+    var m = window.MARKET_REF;
+    if (!m || !p) return null;
+    return m[String(p.sku)] || null;
+  }
+
+  function catalogTree() {
+    var s = st();
+    var map = {};
+    s.products.forEach(function (p) {
+      var t = C.typeOfProduct(p) || '其他';
+      if (!map[t]) map[t] = { n: 0, withCost: 0 };
+      map[t].n++;
+      if (C.num(p.costRmb) > 0) map[t].withCost++;
+    });
+
+    var keys = Object.keys(map).sort(function (a, b) {
+      if (a === '其他') return 1;
+      if (b === '其他') return -1;
+      return map[b].n - map[a].n;
+    });
+
+    function chip(label, n, withCost, active, value) {
+      return '<button class="btn sm ' + (active ? 'primary' : 'ghost') + '" data-action="cat-type" data-type="' + esc(value) + '" ' +
+        'style="margin:0 6px 6px 0">' + esc(label) + ' <b style="font-family:var(--mono)">' + n + '</b>' +
+        (withCost !== undefined && withCost < n
+          ? '<span style="color:' + (active ? '#fff' : '#a0a6b0') + ';font-size:10.5px"> · 有成本 ' + withCost + '</span>'
+          : '') + '</button>';
+    }
+
+    var all = s.products.length;
+    var allCost = s.products.filter(function (p) { return C.num(p.costRmb) > 0; }).length;
+
+    return '<div style="font-size:11.5px;color:#8a919e;margin-bottom:8px">目录 · 按品类</div>' +
+      '<div style="display:flex;flex-wrap:wrap;gap:0">' +
+      chip('全部', all, allCost, !S.catType, '') +
+      keys.map(function (k) {
+        return chip(k, map[k].n, map[k].withCost, S.catType === k, k);
+      }).join('') + '</div>';
+  }
+
+  function catalogCount() {
+    var s = st();
+    var filled = s.products.filter(function (p) { return C.num(p.costRmb) > 0; }).length;
+    var shown = s.products.filter(function (p) {
+      if (S.catOnlyEmpty && C.num(p.costRmb) > 0) return false;
+      if (S.catType && (C.typeOfProduct(p) || '其他') !== S.catType) return false;
+      return matchQuery([p.title, p.titleEn, p.sku, p.category, (p.keywords || []).join(' ')].join(' '), S.catQ);
+    }).length;
+    return '已填成本 ' + filled + ' / ' + s.products.length + ' · 显示 ' + shown + ' 条';
+  }
+
+  function viewCatalog() {
+    var s = st();
+    var fee = C.num(s.settings.platformFeeRate);
+    var fx = C.num(s.settings.fxRate, 7.1);
+
+    return '<section class="card"><div class="card-hd">' +
+      '<div class="card-title">商品库 · 该卖多少钱<span class="card-sub" id="cat-count">' + catalogCount() +
+      '</span></div>' +
+      '<div class="row">' +
+      '<button class="btn sm ghost" data-action="export-catalog">导出 CSV</button>' +
+      '<button class="btn sm" data-action="bulk-cost">批量填成本</button>' +
+      '<button class="btn sm" data-action="import-products">粘贴导入</button>' +
+      '<button class="btn sm primary" data-action="new-product">+ 新增商品</button>' +
+      '</div></div>' +
+      '<div class="card-bd" style="padding:12px 18px 0">' + catalogTree() + '</div>' +
+      '<div class="card-bd" style="padding:12px 18px 0"><div class="row" style="gap:10px">' +
+      '<input type="text" id="cat-search" value="' + esc(S.catQ) + '" placeholder="搜商品名 / 型号 / SKU，多个词用空格" ' +
+      'style="width:420px;flex:none;height:34px">' +
+      '<label class="row" style="gap:6px;font-size:12.5px;cursor:pointer">' +
+      '<input type="checkbox" id="cat-only-empty" ' + (S.catOnlyEmpty ? 'checked' : '') + ' style="width:auto;height:auto"> 只看没填成本的</label>' +
+      '</div></div>' +
+      '<div class="card-bd tight" style="margin-top:10px"><div class="table-wrap">' +
+      '<table class="table"><thead><tr><th>品类</th><th>商品</th><th class="num">阿里挂牌价</th><th class="num">市场价 ¥</th>' +
+      '<th class="num">1688价 ¥</th><th class="num">别家价 ¥</th>' +
+      '<th class="num">保本价 $</th><th class="num">建议售价 $</th><th>判断</th><th></th></tr></thead>' +
+      '<tbody id="cat-body">' + catalogRows(S.catQ, S.catOnlyEmpty) + '</tbody></table>' +
+      '</div></div></section>';
+  }
+  /* =========================================================
+     视图：查价确认
+     ========================================================= */
+
+  function reviewFiltered(data) {
+    var s = st();
+    return s.products.filter(function (p) {
+      var c = data[p.sku];
+      var has = c && c.candidates && c.candidates.length;
+      var done = C.num(p.costRmb) > 0;
+      if (S.revOnlyPending && done) return false;
+      if (!matchQuery([p.title, p.titleEn, p.sku].join(' '), S.revQ)) return false;
+      return true;
+    });
+  }
+
+  /* 候选价中位数：同名不同款、配件当整机卖，均价会被极端值带偏，中位数更稳 */
+  function medianOf(c) {
+    var arr = ((c && c.candidates) || []).map(function (x) { return C.num(x.price); })
+      .filter(function (v) { return v > 0; }).sort(function (a, b) { return a - b; });
+    if (!arr.length) return 0;
+    var m = Math.floor(arr.length / 2);
+    return arr.length % 2 ? arr[m] : (arr[m - 1] + arr[m]) / 2;
+  }
+
+  function bulkFactor() {
+    var f = C.num(S.bulkFactor, 1);
+    if (!(f > 0)) f = 1;
+    return Math.min(2, Math.max(0.1, f));
+  }
+
+  function suggestedCost(p, data) {
+    var mid = medianOf(data[p.sku]);
+    return mid > 0 ? C.round2(mid * bulkFactor()) : 0;
+  }
+
+  /* 当前筛选里「能补」的商品：还没成本 + 有候选价。批量只碰这些 */
+  function bulkTargets(data) {
+    return reviewFiltered(data).filter(function (p) {
+      return !(C.num(p.costRmb) > 0) && medianOf(data[p.sku]) > 0;
+    });
+  }
+
+  function costlessCount() {
+    var n = 0;
+    st().products.forEach(function (p) { if (!(C.num(p.costRmb) > 0)) n++; });
+    return n;
+  }
+
+  /* 局部重画：搜索框有焦点，整页 render 会丢焦点，所以只刷表格和计数 */
+  function paintReview() {
+    var data = window.PRICE_CANDIDATES || {};
+    var tb = document.getElementById('rev-body');
+    if (tb) tb.innerHTML = reviewRows(data);
+    var cnt = document.getElementById('rev-count');
+    if (cnt) cnt.textContent = reviewCount(data);
+    var bn = document.getElementById('bulk-fill-btn');
+    if (bn) {
+      var n = bulkTargets(data).length;
+      bn.disabled = !n;
+      bn.textContent = '批量填成本' + (n ? '（' + n + '）' : '');
+    }
+  }
+
+  function reviewRows(data) {
+    var s = st();
+    var list = reviewFiltered(data);
+
+    if (!list.length) {
+      var left = costlessCount();
+      return '<tr><td colspan="6"><div class="empty">' +
+        (left ? '当前筛选下没有匹配的商品' : '全部 ' + s.products.length + ' 个商品都有成本价了') +
+        '</div></td></tr>';
+    }
+
+    return list.map(function (p) {
+      var c = data[p.sku];
+      var crawled = !!c;
+      var has = c && c.candidates && c.candidates.length;
+      var done = C.num(p.costRmb) > 0;
+
+      var cells = '<td style="max-width:300px"><strong style="font-size:12px">' + esc(p.title) + '</strong>' +
+        '<br><span style="color:#8a919e;font-size:10.5px">' + esc(p.sku) + ' · 挂牌 ' + C.usd(p.priceUsd) + '</span></td>';
+
+      var candHtml;
+      var good = has ? c.candidates.filter(function (x) { return C.num(x.price) > 0; }) : [];
+      if (!good.length) {
+        candHtml = (crawled
+          ? '<span style="color:#8a919e;font-size:11.5px">淘宝闲鱼都没搜到</span> '
+          : '<span style="color:#8a919e;font-size:11.5px">还没抓到</span> ') + searchLinks({ product: p });
+      } else {
+        candHtml = '<div class="row" style="gap:6px">' + good.map(function (x) {
+          var tt = String(x.title || '');
+          var pr = C.num(x.price);
+          return '<button class="btn sm" data-action="use-price" data-id="' + p.id + '" data-price="' + pr + '" ' +
+            'data-src="' + esc(x.source || '') + '" ' +
+            'title="' + esc(tt || String(pr)) + '" style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
+            (x.source ? '<span style="color:#8a919e">' + esc(x.source) + '</span> ' : '') +
+            '<b>¥' + pr + '</b>' + (tt ? ' · ' + esc(tt.slice(0, 16)) : '') + '</button>';
+        }).join('') + '</div>';
+      }
+
+      var be = done ? P.breakEvenOf(p, s.settings) : null;
+      var sug = done ? 0 : suggestedCost(p, data);
+
+      return '<tr>' + cells +
+        '<td>' + candHtml + '</td>' +
+        '<td class="num">' + (done ? '<b>' + C.money(p.costRmb) + '</b>' : '—') + '</td>' +
+        '<td class="num">' + (sug ? '<span style="color:#0f9d58">' + C.money(sug) + '</span>' : '—') + '</td>' +
+        '<td class="num">' + (be && be.hasCost ? C.usd(be.breakEvenUsd) : '—') + '</td>' +
+        '<td>' + (done
+          ? '<span class="badge green" title="' + esc(p.costSource || '') + '">已填</span>'
+          : '<span class="badge gray">待确认</span>') + '</td>' +
+        '</tr>';
+    }).join('');
+  }
+
+  function reviewCount(data) {
+    var s = st();
+    var withCand = 0, confirmed = 0;
+    s.products.forEach(function (p) {
+      var c = data[p.sku];
+      if (c && c.candidates && c.candidates.length) withCand++;
+      if (C.num(p.costRmb) > 0) confirmed++;
+    });
+    return '共 ' + s.products.length + ' 个 · 有成本 ' + confirmed + ' · 还缺 ' + (s.products.length - confirmed) +
+      ' · 有候选 ' + withCand + ' · 显示 ' + reviewFiltered(data).length + ' 条';
+  }
+
+  function viewReview() {
+    var s = st();
+    var data = window.PRICE_CANDIDATES || null;
+
+    if (!data) {
+      return '<section class="card"><div class="card-bd"><div class="empty">' +
+        '<strong>还没有查价数据</strong>抓取还没完成，或者数据文件没加载。</div></div></section>';
+    }
+
+    var canBulk = bulkTargets(data).length;
+
+    return '<section class="card"><div class="card-hd">' +
+      '<div class="card-title">补成本<span class="card-sub" id="rev-count">' + reviewCount(data) + '</span></div>' +
+      '</div>' +
+      '<div class="card-bd" style="padding:12px 18px 0"><div class="row" style="gap:10px;flex-wrap:wrap;align-items:center">' +
+      '<input type="text" id="rev-search" value="' + esc(S.revQ) + '" placeholder="搜商品名 / 型号 / SKU，多个词用空格" ' +
+      'style="max-width:330px;height:34px">' +
+      '<label class="row" style="gap:6px;font-size:12.5px;cursor:pointer">' +
+      '<input type="checkbox" id="rev-only-pending" ' + (S.revOnlyPending ? 'checked' : '') + ' style="width:auto;height:auto"> 只看还没成本的</label>' +
+      '<span style="flex:1"></span>' +
+      '<label class="row" style="gap:6px;font-size:12.5px" title="淘宝是零售价，采购价一般更低；1 = 直接用中位价">中位价 ×' +
+      '<input type="number" id="bulk-factor" value="' + S.bulkFactor + '" min="0.1" max="2" step="0.05" style="width:74px;height:32px"></label>' +
+      '<button class="btn sm" id="bulk-fill-btn" data-action="bulk-fill-cost" ' + (canBulk ? '' : 'disabled ') + '>' +
+      '批量填成本' + (canBulk ? '（' + canBulk + '）' : '') + '</button>' +
+      (S.bulkUndo.length ? '<button class="btn sm" data-action="undo-bulk-cost">撤销上次批量（' + S.bulkUndo.length + '）</button>' : '') +
+      '</div></div>' +
+      '<div class="card-bd"><div class="alert info"><span class="ic">i</span><div>' +
+      '候选价是淘宝 / 闲鱼搜到的<strong>零售价，不等于你的采购价</strong>。「批量填成本」按候选价中位数 × 上面的系数估算，' +
+      '填进去会标成「淘宝参考价」，报价页会当估算值提醒你。<br>' +
+      '要准就逐行点候选价，或点旁边的搜索链接自己核。<strong>已有成本的商品任何批量都不会覆盖</strong>。' +
+      '</div></div></div>' +
+      '<div class="card-bd tight"><div class="table-wrap">' +
+      '<table class="table"><thead><tr><th>商品</th><th>淘宝 / 闲鱼 候选（点一个填进去）</th>' +
+      '<th class="num">成本 ¥</th><th class="num">建议 ¥</th><th class="num">保本价 $</th><th>状态</th></tr></thead>' +
+      '<tbody id="rev-body">' + reviewRows(data) + '</tbody></table></div></div></section>';
+  }
+  /* =========================================================
+     视图：复盘
+     ========================================================= */
+
+  /* ---------------- 月度统计 + 图 ---------------- */
+
+  function monthKey(d) {
+    var s = String(d || '');
+    return /^\d{4}-\d{2}/.test(s) ? s.slice(0, 7) : '未知';
+  }
+
+  function monthlyStats(orders, months) {
+    var map = {};
+    (orders || []).forEach(function (o) {
+      var k = monthKey(o.date);
+      if (!map[k]) map[k] = { month: k, count: 0, gmv: 0, profit: 0 };
+      map[k].count++;
+      map[k].gmv += C.num(o.amountUsd) - Math.min(C.num(o.refundUsd), C.num(o.amountUsd));
+      map[k].profit += C.num(o.netRmb);
+    });
+    var keys = Object.keys(map).filter(function (k) { return k !== '未知'; }).sort();
+    if (map['未知']) keys.push('未知');
+    var list = keys.map(function (k) {
+      var m = map[k];
+      return { month: k, count: m.count, gmv: C.round2(m.gmv), profit: C.round2(m.profit) };
+    });
+    return months ? list.slice(-months) : list;
+  }
+
+  function barChart(list) {
+    if (!list.length) return '<div class="empty">还没有订单，先记一笔</div>';
+    var W = 560, H = 170, padL = 46, padB = 26, padT = 14;
+    var innerW = W - padL - 12, innerH = H - padB - padT;
+    var max = Math.max.apply(null, list.map(function (x) { return Math.max(x.profit, 0); }).concat([1]));
+    var bw = Math.min(46, innerW / list.length * 0.6);
+
+    var bars = list.map(function (x, i) {
+      var cx = padL + innerW * (i + 0.5) / list.length;
+      var h2 = Math.max(2, innerH * Math.max(x.profit, 0) / max);
+      var y = padT + innerH - h2;
+      var color = x.profit < 0 ? '#d92d20' : '#0f9d58';
+      return '<rect x="' + (cx - bw / 2).toFixed(1) + '" y="' + y.toFixed(1) + '" width="' + bw.toFixed(1) +
+        '" height="' + h2.toFixed(1) + '" rx="3" fill="' + color + '" opacity="0.85"></rect>' +
+        '<text x="' + cx.toFixed(1) + '" y="' + (y - 5).toFixed(1) + '" text-anchor="middle" font-size="9.5" fill="#6b7280">' +
+        Math.round(x.profit) + '</text>' +
+        '<text x="' + cx.toFixed(1) + '" y="' + (H - 8) + '" text-anchor="middle" font-size="10" fill="#9aa1ac">' +
+        x.month.slice(5) + '月</text>';
+    }).join('');
+
+    return '<svg viewBox="0 0 ' + W + ' ' + H + '" style="width:100%;height:auto;max-height:200px">' +
+      '<line x1="' + padL + '" y1="' + (padT + innerH) + '" x2="' + (W - 12) + '" y2="' + (padT + innerH) +
+      '" stroke="#eef0f3"></line>' + bars + '</svg>';
+  }
+
+  /* ---------------- 汇率冲击 ---------------- */
+
+  function fxShock(fx) {
+    var s = st();
+    var r = C.fxShock(s.products, s.settings, fx);
+    return {
+      risk: r.risk,
+      total: r.total,
+      rows: r.rows.slice(0, 6).map(function (x) {
+        return { title: x.title, be: x.be, list: x.list, loss: x.lossPct };
+      })
+    };
+  }
+
+  function fxShockCard() {
+    var s = st().settings;
+    var cur = C.num(s.fxRate, 7.1);
+    return '<section class="card"><div class="card-hd">' +
+      '<div class="card-title">汇率冲击<span class="card-sub">汇率跌了，你的哪些货会变成亏本卖</span></div>' +
+      '<div class="row" style="gap:8px;align-items:center">' +
+      '<span style="font-size:12px;color:#8a919e">假设汇率</span>' +
+      '<input type="number" id="fx-shock" value="' + cur + '" step="0.05" min="3" max="12" style="width:90px;height:30px">' +
+      '</div></div>' +
+      '<div class="card-bd"><div id="fx-shock-out"></div></div></section>';
+  }
+
+  function fxShockResult(fx) {
+    var r = fxShock(fx);
+    var cur = C.num(st().settings.fxRate, 7.1);
+    var d = ((fx / cur - 1) * 100).toFixed(1);
+
+    var head = '<div class="grid grid-3" style="gap:14px;margin-bottom:12px">' +
+      '<div><div style="font-size:11px;color:#8a919e">有成本商品</div>' +
+      '<div style="font-size:22px;font-weight:700">' + r.total + '</div></div>' +
+      '<div><div style="font-size:11px;color:#8a919e">会亏的</div>' +
+      '<div style="font-size:22px;font-weight:700;color:' + (r.risk ? '#d92d20' : '#0f9d58') + '">' +
+      r.risk + ' 个</div></div>' +
+      '<div><div style="font-size:11px;color:#8a919e">相对现在</div>' +
+      '<div style="font-size:22px;font-weight:700">' + (d >= 0 ? '+' : '') + d + '%</div></div>' +
+      '</div>';
+
+    if (!r.rows.length) {
+      return head + '<div class="alert info"><span class="ic">✓</span><div>' +
+        '汇率 ' + fx.toFixed(2) + ' 时，所有商品按当前挂牌价都还有得赚。</div></div>';
+    }
+
+    var rows = r.rows.map(function (x) {
+      return '<tr><td style="max-width:280px">' + esc(x.title.slice(0, 40)) + '</td>' +
+        '<td class="num">' + C.usd(x.list) + '</td>' +
+        '<td class="num" style="color:#d92d20">' + C.usd(x.be) + '</td>' +
+        '<td class="num" style="color:#d92d20">-' + x.loss.toFixed(1) + '%</td></tr>';
+    }).join('');
+
+    return head + '<div class="table-wrap"><table class="table">' +
+      '<thead><tr><th>商品</th><th class="num">挂牌价</th><th class="num">新保本价</th><th class="num">差</th></tr></thead>' +
+      '<tbody>' + rows + '</tbody></table></div>' +
+      '<div style="font-size:11px;color:#8a919e;margin-top:8px">只列最严重的 6 个。要么涨价，要么汇率回稳前别接这些单。</div>';
+  }
+
+  function monthCard(orders) {
+    var list = monthlyStats(orders, 6);
+    if (!list.length) return '';
+
+    var cur = list[list.length - 1];
+    var prev = list.length > 1 ? list[list.length - 2] : null;
+    function delta(a, b) {
+      if (!b || !b.profit) return '';
+      var d = (a.profit - b.profit) / Math.abs(b.profit);
+      var up = d >= 0;
+      return '<span style="color:' + (up ? '#0f9d58' : '#d92d20') + ';font-size:11px">' +
+        (up ? '▲' : '▼') + Math.abs(d * 100).toFixed(0) + '% 环比</span>';
+    }
+
+    var rows = list.slice().reverse().map(function (m) {
+      return '<tr><td>' + esc(m.month) + '</td><td class="num">' + m.count + '</td>' +
+        '<td class="num">' + C.usd(m.gmv) + '</td>' +
+        '<td class="num" style="color:' + (m.profit < 0 ? '#d92d20' : '#0f9d58') + '">' + C.money(m.profit) + '</td></tr>';
+    }).join('');
+
+    return '<section class="card"><div class="card-hd">' +
+      '<div class="card-title">月度对比' + (prev ? delta(cur, prev) : '') +
+      '<span class="card-sub">最近 6 个月，柱高是利润</span></div></div>' +
+      '<div class="card-bd">' + barChart(list) + '</div>' +
+      '<div class="card-bd tight"><div class="table-wrap"><table class="table">' +
+      '<thead><tr><th>月份</th><th class="num">单数</th><th class="num">成交额</th><th class="num">利润</th></tr></thead>' +
+      '<tbody>' + rows + '</tbody></table></div></div></section>';
+  }
+
+  function viewAnalytics() {
+    var s = st();
+    var kpi = C.stats();
+    var allOrders = (s.orders || []).slice().sort(function (a, b) {
+      return String(b.date).localeCompare(String(a.date));
+    });
+    /* 订单多了以后只渲染最近 200 条，避免表格拖慢页面 */
+    var orders = allOrders.slice(0, 200);
+
+    var metrics = '<div class="grid grid-4">' +
+      metric('累计成交额', C.usd(kpi.gmvUsd), kpi.orderCount + ' 单') +
+      metric('累计利润', C.money(kpi.profitRmb), '扣平台费后') +
+      metric('平均单笔利润', C.money(kpi.avgProfitRmb), kpi.avgMargin === null ? '—' : '利润率 ' + C.pct(kpi.avgMargin)) +
+      metric('成交率', kpi.wonCount + kpi.lostCount ? C.pct(kpi.winRate, 0) : '—',
+        kpi.wonCount + ' 成交 / ' + kpi.lostCount + ' 丢单') +
+      '</div>';
+
+    /* 明细表 */
+    var orderRows = orders.map(function (o) {
+      var profit = C.num(o.netRmb);
+      return '<tr>' +
+        '<td style="white-space:nowrap;color:#8a919e;font-size:11.5px">' + esc(o.date) + '</td>' +
+        '<td style="max-width:280px">' + esc(o.title || '—') +
+        '<br><span style="color:#8a919e;font-size:10.5px">' + esc(o.sku) +
+        (o.buyer ? ' · ' + esc(o.buyer) : '') + (o.country ? ' · ' + esc(o.country) : '') + '</span></td>' +
+        '<td class="num">' + o.qty + '</td>' +
+        '<td class="num">' + (o.unitPriceUsd ? C.usd(o.unitPriceUsd) : '—') + '</td>' +
+        '<td class="num"><b>' + C.usd(o.amountUsd) + '</b>' +
+        (C.num(o.refundUsd) > 0
+          ? '<br><span style="color:#d92d20;font-size:10.5px">退 ' + C.usd(o.refundUsd) + '</span>'
+          : '') + '</td>' +
+        '<td class="num">' + C.money(o.costRmb) + '</td>' +
+        '<td class="num" style="color:' + (profit < 0 ? '#d92d20' : '#0f9d58') + '">' + C.money(profit) + '</td>' +
+        '<td class="actions" style="white-space:nowrap">' +
+        '<button class="btn sm ghost" data-action="refund-order" data-id="' + o.id + '">退款</button> ' +
+        '<button class="btn sm ghost" data-action="delete-order" data-id="' + o.id + '">删</button></td>' +
+        '</tr>';
+    }).join('');
+
+    var orderCard = '<section class="card"><div class="card-hd">' +
+      '<div class="card-title">订单明细<span class="card-sub">所有成交都记在这里，复盘的数字就是它加出来的' +
+      (allOrders.length > 200 ? ' · 只显示最近 200 条（共 ' + allOrders.length + ' 条）' : '') + '</span></div>' +
+      '<div class="row"><button class="btn sm ghost" data-action="export-orders">导出 CSV</button>' +
+      '<button class="btn sm primary" data-action="new-order">+ 记录一笔订单</button></div></div>' +
+      '<div class="card-bd tight"><div class="table-wrap">' +
+      (orderRows
+        ? '<table class="table"><thead><tr><th>日期</th><th>商品</th><th class="num">数量</th>' +
+        '<th class="num">单价</th><th class="num">成交额</th><th class="num">成本</th>' +
+        '<th class="num">利润</th><th></th></tr></thead><tbody>' + orderRows + '</tbody></table>'
+        : '<div class="empty"><strong>还没有订单</strong>点右上角「+ 记录一笔订单」，把已经成交的单子记进来。</div>') +
+      '</div></div></section>';
+
+    /* 按商品 / 按市场 */
+    function groupBy(keyFn, labelFn) {
+      var map = {};
+      orders.forEach(function (o) {
+        var k = keyFn(o) || '未填';
+        if (!map[k]) map[k] = { cnt: 0, gmv: 0, profit: 0 };
+        map[k].cnt++;
+        map[k].gmv += C.num(o.amountUsd);
+        map[k].profit += C.num(o.netRmb);
+      });
+      return Object.keys(map).sort(function (a, b) { return map[b].profit - map[a].profit; }).map(function (k) {
+        var x = map[k];
+        return '<tr><td>' + esc(labelFn(k)) + '</td><td class="num">' + x.cnt + '</td>' +
+          '<td class="num">' + C.usd(x.gmv) + '</td>' +
+          '<td class="num" style="color:' + (x.profit < 0 ? '#d92d20' : '#0f9d58') + '">' + C.money(x.profit) + '</td></tr>';
+      }).join('');
+    }
+
+    var byProduct = groupBy(function (o) { return o.sku; }, function (k) {
+      var p = s.products.find(function (x) { return x.sku === k; });
+      return p ? p.title.slice(0, 34) : k;
+    });
+    var byCountry = groupBy(function (o) { return o.country; }, function (k) { return k; });
+
+    var gridCards = '<div class="grid grid-2">' +
+      card('按商品', '哪个货真的赚钱',
+        '<div class="table-wrap"><table class="table"><thead><tr><th>商品</th><th class="num">单数</th>' +
+        '<th class="num">成交额</th><th class="num">利润</th></tr></thead><tbody>' +
+        (byProduct || '<tr><td colspan="4" class="empty">暂无数据</td></tr>') + '</tbody></table></div>') +
+      card('按市场', '哪个国家成得多',
+        '<div class="table-wrap"><table class="table"><thead><tr><th>市场</th><th class="num">单数</th>' +
+        '<th class="num">成交额</th><th class="num">利润</th></tr></thead><tbody>' +
+        (byCountry || '<tr><td colspan="4" class="empty">暂无数据</td></tr>') + '</tbody></table></div>') +
+      '</div>';
+
+    /* 丢单 */
+    var lostRows = s.opportunities.filter(function (o) { return o.status === 'lost'; }).map(function (o) {
+      return '<tr><td>' + esc(o.buyer.name) + '</td><td>' + esc(o.buyer.country) + '</td>' +
+        '<td>' + esc((o.deal && o.deal.reason) || '未记录') + '</td>' +
+        '<td class="num" style="color:#8a919e">' + C.fmtDate(o.updatedAt) + '</td></tr>';
+    }).join('');
+
+    var lostCard = card('丢单记录', '每次丢单都记原因',
+      '<div class="table-wrap"><table class="table"><thead><tr><th>买家</th><th>市场</th>' +
+      '<th>原因</th><th class="num">时间</th></tr></thead><tbody>' +
+      (lostRows || '<tr><td colspan="4" class="empty">暂无丢单记录</td></tr>') + '</tbody></table></div>');
+
+    return '<div class="stack">' + metrics + orderCard + monthCard(orders) + fxShockCard() + gridCards + lostCard + '</div>';
+  }
+
+  /* ---------------- 记录订单 ---------------- */
+
+  function openOrder(prefill) {
+    var s = st();
+    prefill = prefill || {};
+    var opts = s.products.map(function (p) {
+      return '<option value="' + p.id + '"' + (prefill.productId === p.id ? ' selected' : '') + '>' +
+        esc(p.title.slice(0, 46)) + ' · ' + esc(p.sku) + '</option>';
+    }).join('');
+
+    var html = modalHead('记录一笔订单') +
+      '<div class="modal-bd">' +
+      '<div class="form-grid">' +
+      '<div class="field full"><label>商品</label>' +
+      '<select id="ord-product"><option value="">（不指定商品）</option>' + opts + '</select></div>' +
+      '<div class="field"><label>数量</label><input type="number" id="ord-qty" min="1" step="1" value="' + (prefill.qty || 1) + '"></div>' +
+      '<div class="field"><label>成交单价（USD）</label><input type="number" id="ord-unit" min="0" step="0.01" value="' + (prefill.unitPriceUsd || '') + '"></div>' +
+      '<div class="field"><label>成交额（USD）</label><input type="number" id="ord-amount" min="0" step="0.01" value="' + (prefill.amountUsd || '') + '"></div>' +
+      '<div class="field"><label>成本合计（元）</label>' +
+      '<input type="number" id="ord-cost" min="0" step="0.01" readonly value="' + (prefill.costRmb || '') + '">' +
+      '<div class="hint" id="ord-cost-hint">按商品档案的 1688 成本自动带出，不能手改。</div></div>' +
+      '<div class="field"><label>成交日期</label><input type="date" id="ord-date" value="' + (prefill.date || new Date().toISOString().slice(0, 10)) + '"></div>' +
+      '<div class="field"><label>买家 / 客户（选填）</label><input type="text" id="ord-buyer" value="' + esc(prefill.buyer || '') + '"></div>' +
+      '<div class="field"><label>市场（选填）</label><input type="text" id="ord-country" value="' + esc(prefill.country || '') + '"></div>' +
+      '<div class="field full"><label>备注（选填）</label><input type="text" id="ord-note" value="' + esc(prefill.note || '') + '"></div>' +
+      '</div>' +
+      '<div class="alert info" style="margin-top:12px"><span class="ic">i</span><div>' +
+      '成本按商品档案自动带出（只读）；成交额留空就按「单价 × 数量」算。利润 = 成交额 × 汇率 × (1 − 平台扣费) − 成本。' +
+      '</div></div>' +
+      '</div>' +
+      '<div class="modal-ft">' +
+      '<button class="btn ghost" data-action="close-modal">取消</button>' +
+      '<button class="btn primary" data-action="save-order">保存</button>' +
+      '</div>';
+    openModal(html, true);
+    var sel = document.getElementById('ord-product');
+    if (sel) sel.addEventListener('change', function () { syncOrderCost(); });
+    var qtyEl = document.getElementById('ord-qty');
+    if (qtyEl) qtyEl.addEventListener('input', function () { syncOrderCost(); });
+    syncOrderCost();
+  }
+
+  /* 成本只能来自商品档案：输入框是只读回显，改数量时跟着重算合计。 */
+  function syncOrderCost() {
+    var sel = document.getElementById('ord-product');
+    var p = sel && sel.value ? productById(sel.value) : null;
+    var unit = p ? C.num(p.costRmb) : 0;
+    var qtyEl = document.getElementById('ord-qty');
+    var qty = Math.max(1, C.num(qtyEl && qtyEl.value) || 1);
+    var box = document.getElementById('ord-cost');
+    if (box) box.value = unit > 0 ? Math.round(unit * qty * 100) / 100 : '';
+    var hint = document.getElementById('ord-cost-hint');
+    if (!hint) return;
+    if (!p) hint.textContent = '选了商品才会带出成本。';
+    else if (unit > 0) hint.textContent = '单价成本 ¥' + C.money(unit) + ' × ' + qty + ' 件，取商品档案，不能手改。';
+    else hint.textContent = '这个商品还没有 1688 成本，先到「补成本」补上，否则这笔的利润算不出来。';
+  }
+
+  /* 退款后重算利润：
+     平台费按实收金额算，成本按实收比例摊（退货能退给供应商的部分） */
+  function recalcOrder(o, settings) {
+    var s = settings || st().settings;
+    var r = C.orderNet({
+      amountUsd: o.amountUsd,
+      refundUsd: o.refundUsd,
+      costRmb: C.num(o.costFullRmb) > 0 ? o.costFullRmb : o.costRmb,
+      fxRate: s.fxRate,
+      feeRate: C.feeRateFor(productById(o.productId) || null, s)
+    });
+    o.feeRmb = r.feeRmb;
+    o.costRmb = r.costRmb;
+    o.netRmb = r.netRmb;
+    return o;
+  }
+
+  /* 导 CSV（带 BOM，Excel 直接打开不乱码） */
+  function downloadCsv(filename, rows) {
+    var esc2 = function (v) {
+      var s = String(v == null ? '' : v);
+      /* Excel 会把 = + - @ 或 Tab/回车 开头的单元格当公式跑。
+         买家名、商品名都是外部导入的，先加个单引号把它按文本处理。 */
+      if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+      return /[",\n\r\t]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    };
+    var text = '\ufeff' + rows.map(function (r) { return r.map(esc2).join(','); }).join('\r\n');
+    var blob = new Blob([text], { type: 'text/csv;charset=utf-8' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+  }
+
+  /* 这两个 CSV 以前把 成本RMB / 最低价USD / 保本价USD 全摊在明面上：
+     谁打开这个站，点一下就拿到全部报价底线，等于把底价直接给了客户。
+     现在对外导出只留可公开字段；含成本与底价的完整数据只走
+     「数据与安全 → 导出备份 JSON」，由老板自己在本机留档。 */
+  function exportOrdersCsv() {
+    var s = st();
+    var rows = [['日期', '商品', 'SKU', '数量', '单价USD', '成交额USD', '退款USD', '买家', '市场']];
+    (s.orders || []).forEach(function (o) {
+      rows.push([o.date, o.title, o.sku, o.qty, o.unitPriceUsd, o.amountUsd,
+        o.refundUsd || 0, o.buyer, o.country]);
+    });
+    downloadCsv('订单明细_' + new Date().toISOString().slice(0, 10) + '.csv', rows);
+    C.audit('导出订单 CSV', (s.orders || []).length + ' 条');
+    toast('已导出 ' + ((s.orders || []).length) + ' 条（不含成本与利润，需要请用“导出备份 JSON”）');
+  }
+
+  function exportCatalogCsv() {
+    var s = st();
+    var rows = [['商品', 'SKU', '挂牌价USD', 'MOQ', '交期(天)', '认证']];
+    s.products.forEach(function (p) {
+      rows.push([p.title, p.sku, p.priceUsd, p.moq, p.leadTimeDays || '',
+        (p.certs || []).join(' ')]);
+    });
+    downloadCsv('商品清单_' + new Date().toISOString().slice(0, 10) + '.csv', rows);
+    C.audit('导出商品 CSV', s.products.length + ' 个');
+    toast('已导出 ' + s.products.length + ' 个商品（不含成本与底价）');
+  }
+
+  function saveOrder() {
+    var s = st();
+    var pid = document.getElementById('ord-product').value;
+    var product = pid ? productById(pid) : null;
+
+    var qty = Math.max(0, C.num(document.getElementById('ord-qty').value));
+    var unit = C.num(document.getElementById('ord-unit').value);
+    var amount = C.num(document.getElementById('ord-amount').value);
+    /* 成本只认商品档案，不再读手填输入框：
+       以前这里取 #ord-cost 的自由输入，谁都能把成本改成 1 块，利润与复盘全失真。 */
+    var costUnit = product ? C.num(product.costRmb) : 0;
+    var cost = costUnit > 0 ? Math.round(costUnit * Math.max(1, qty) * 100) / 100 : 0;
+
+    if (!(amount > 0)) amount = unit * qty;
+    if (!(amount > 0)) { toast('成交额必须大于 0'); return; }
+    if (!(qty > 0)) qty = 1;
+
+    var fx = C.num(s.settings.fxRate, 7.1);
+    var feeRate = product ? C.feeRateFor(product, s.settings) : C.num(s.settings.platformFeeRate);
+    var calc = C.orderNet({ amountUsd: amount, costRmb: cost, fxRate: fx, feeRate: feeRate });
+    var feeRmb = calc.feeRmb;
+    var netRmb = calc.netRmb;
+
+    var order = C.normalizeOrder({
+      productId: pid || (product ? product.id : ''),
+      sku: product ? product.sku : '',
+      title: product ? product.title : (document.getElementById('ord-note').value || '未指定商品'),
+      qty: qty,
+      unitPriceUsd: unit || (qty ? amount / qty : 0),
+      amountUsd: amount,
+      costRmb: cost,
+      costFullRmb: cost,
+      feeRmb: feeRmb,
+      netRmb: netRmb,
+      date: document.getElementById('ord-date').value || new Date().toISOString().slice(0, 10),
+      buyer: document.getElementById('ord-buyer').value.trim(),
+      country: document.getElementById('ord-country').value.trim(),
+      note: document.getElementById('ord-note').value.trim(),
+      source: 'manual'
+    });
+
+    s.orders.push(order);
+    closeModal();
+    invalidate(); C.persist(); render();
+    toast('已记录，利润 ' + C.money(netRmb));
+  }
+  /* =========================================================
+     视图：设置
+     ========================================================= */
+
+  function viewSettings() {
+    var s = st().settings;
+    var fee = C.num(s.platformFeeRate);
+
+    var body = '<div class="grid grid-2">' +
+      card('算价用的三个数', '决定保本价和建议售价',
+        '<div class="form-grid">' +
+        numField('平台扣费（手续费+提现费）', 'set-platformFeeRate', s.platformFeeRate * 100, '%', 0.1) +
+        '<div class="field"><label>美元汇率（CNY）</label>' +
+        '<input type="number" id="set-fxRate" value="' + C.round(s.fxRate, 2) + '" step="0.01">' +
+        '<div class="hint" style="display:flex;gap:8px;align-items:center;margin-top:4px">' +
+        '<span>' + fxAgeText() + '</span>' +
+        '<button class="btn sm ghost" data-action="refresh-fx" type="button">立即更新</button>' +
+        '</div></div>' +
+        numField('每件想赚', 'set-profitRmb', s.profitRmb, '元', 5) +
+        numField('还价最多让到（毛利率不低于）', 'set-minMarginPct', C.num(s.minMarginPct, 8), '%', 1) +
+        numField('国内运费', 'set-domesticShippingRmb', s.domesticShippingRmb, '元/件', 1) +
+        '</div>' +
+        '<div class="alert info" style="margin-top:14px"><span class="ic">i</span><div>' +
+        '成本 100 元的货：<br>' +
+        '· 保本价 = 100 ÷ ' + (1 - fee).toFixed(2) + ' = <b>' + C.money(100 / (1 - fee)) + '</b>（再 ÷ 汇率换成美元）<br>' +
+        '· 想赚 ' + C.money(s.profitRmb) + ' → 卖 <b>' + C.money((100 + C.num(s.profitRmb)) / (1 - fee)) + '</b>' +
+        '<br><br>「每件想赚」填 0 就只看保本价。' +
+        '</div></div>') +
+
+      card('报价默认值', '生成报价单和回复时用',
+        '<div class="form-grid">' +
+        '<div class="field"><label>默认贸易术语</label><input type="text" id="set-defaultIncoterm" value="' +
+        esc(s.defaultIncoterm) + '"></div>' +
+        numField('默认交期', 'set-defaultLeadTimeDays', s.defaultLeadTimeDays, '天', 1) +
+        numField('报价后几天提醒跟进', 'set-followUpDays', C.num(s.followUpDays, 3), '天', 1) +
+        '<div class="field full"><label>付款方式（中文）</label>' +
+        '<input type="text" id="set-paymentTerms" value="' + esc(s.paymentTerms) + '"></div>' +
+        '<div class="field full"><label>付款方式（英文）</label>' +
+        '<input type="text" id="set-paymentTermsEn" value="' + esc(s.paymentTermsEn) + '"></div>' +
+        '<div class="field full"><label>公司抬头（报价单用）</label>' +
+        '<input type="text" id="set-sellerName" value="' + esc(s.sellerName) + '"></div>' +
+        '</div>') +
+      '</div>' +
+
+      card('数据', '所有数据只存在这台电脑的浏览器里',
+        '<div class="stack" style="gap:10px">' +
+        '<div class="alert warn"><span class="ic">!</span><div><strong>没有云同步。</strong>' +
+        '数据存在浏览器 localStorage，换浏览器 / 清缓存会丢。养成导出备份的习惯。</div></div>' +
+        '<div class="row">' +
+        '<button class="btn" data-action="export-json">导出备份 JSON</button>' +
+        '<button class="btn" data-action="import-json">导入备份</button>' +
+        '<button class="btn danger" data-action="reset-demo">重置为演示数据</button>' +
+        '</div>' +
+        storageBlock() +
+        '<div class="card-sub">重置会清空你录入的所有商机和商品，先导出备份。</div>' +
+        '</div>') +
+
+      translateCard(s) +
+      feeTypeCard(s) +
+      logCard() +
+      '<div class="row" style="justify-content:flex-end">' +
+      '<button class="btn primary" data-action="save-settings">保存设置</button></div>';
+
+    return '<div class="stack">' + body + '</div>';
+  }
+  function translateCard(s) {
+    return card('翻译引擎', '优先用服务端通义千问，其次本地引擎，最后免费接口',
+      '<div class="alert info"><span class="ic">i</span><div>' +
+      '通义千问改为走服务端代理 <code>/api/ai</code>：<b>浏览器里不再保存 API Key</b>，' +
+      '密钥只存在服务器的环境变量里。没登录或服务器没配密钥时会自动退回浏览器本地引擎（离线可用），' +
+      '所以英文回复草稿在任何情况下都能生成。</div></div>' +
+      '<div class="row" style="margin-top:10px">' +
+      '<button class="btn sm" data-action="test-qwen">测试服务端翻译</button>' +
+      '<span id="qwen-test-out" style="font-size:12px;color:#6b7280"></span></div>' +
+      '<div class="field" style="margin-top:12px"><label>自建翻译服务地址（选填）</label>' +
+      '<input type="text" id="set-translateEndpoint" value="' + esc(s.translateEndpoint || '') + '" placeholder="http://127.0.0.1:5000">' +
+      '<div class="hint">填了会排在本机引擎前面；自建服务挂了自动退回。' +
+      '<b>只接受 https，本机/内网可用 http</b>（防止询盘原文被发到陌生地址）。</div>' +
+      '<div class="row" style="margin-top:10px">' +
+      '<button class="btn sm" data-action="test-translate">测试自建服务</button>' +
+      '<span id="tr-test-out" style="font-size:12px;color:#6b7280"></span></div></div>');
+  }
+
+  function logCard() {
+    var logs = (st().logs || []).slice(0, 40);
+    var rows = logs.map(function (l) {
+      return '<tr><td class="num" style="white-space:nowrap;color:#8a919e;font-size:11px">' +
+        esc(C.relTime(l.at)) + '</td><td>' + esc(l.action) + '</td>' +
+        '<td style="color:#6b7280;font-size:11.5px">' + esc(l.detail) + '</td></tr>';
+    }).join('');
+
+    return card('操作日志', '谁在什么时候导出了数据、改了什么',
+      '<div class="alert info" style="margin-bottom:10px"><span class="ic">i</span><div>' +
+      '只记操作和条数，不记具体内容。导出、删除、退款、改费率都会留痕，最多保留 500 条。</div></div>' +
+      (rows
+        ? '<div class="table-wrap" style="max-height:260px;overflow:auto"><table class="table">' +
+        '<thead><tr><th class="num">时间</th><th>动作</th><th>备注</th></tr></thead><tbody>' + rows + '</tbody></table></div>'
+        : '<div class="empty">还没有操作记录</div>') +
+      (logs.length ? '<div class="row" style="margin-top:10px">' +
+        '<button class="btn sm ghost" data-action="clear-logs">清空日志</button></div>' : ''));
+  }
+
+  function feeTypeCard(s) {
+    var prods = st().products || [];
+    var counts = {};
+    prods.forEach(function (p) {
+      var t = C.typeOfProduct(p);
+      if (t) counts[t] = (counts[t] || 0) + 1;
+    });
+    var map = s.feeRateByType || {};
+    var keys = C.TYPE_KEYS.filter(function (k) { return (counts[k] || 0) > 0; });
+
+    var rows = keys.map(function (k) {
+      var cur = C.num(map[k]) > 0 ? (C.num(map[k]) * 100) : '';
+      return '<tr><td>' + esc(k) + '</td>' +
+        '<td class="num" style="color:#8a919e">' + counts[k] + ' 个</td>' +
+        '<td class="num"><input type="number" min="0" max="50" step="0.1" ' +
+        'data-fee-type="' + esc(k) + '" value="' + cur + '" placeholder="' +
+        C.round(C.num(s.platformFeeRate) * 100, 1) + '" ' +
+        'style="width:80px;height:28px;text-align:right;font-family:var(--mono)"></td></tr>';
+    }).join('');
+
+    return card('品类费率', '不同品类阿里扣得不一样，可以单独设',
+      '<div class="alert info" style="margin-bottom:12px"><span class="ic">i</span><div>' +
+      '留空＝用上面的全局费率（' + C.pct(C.num(s.platformFeeRate)) + '）。' +
+      '填了就以这里的为准，保本价会按该品类重算。</div></div>' +
+      (rows
+        ? '<div class="table-wrap"><table class="table"><thead><tr><th>品类</th>' +
+        '<th class="num">商品数</th><th class="num">费率 %</th></tr></thead><tbody>' + rows + '</tbody></table></div>'
+        : '<div class="empty">商品里还没识别出品类</div>') +
+      '<div class="row" style="margin-top:12px">' +
+      '<button class="btn sm" data-action="save-fee-types">保存费率</button></div>');
+  }
+
+  function numField(label, id, value, unit, step) {
+    return '<div class="field"><label>' + esc(label) + (unit ? '（' + esc(unit) + '）' : '') + '</label>' +
+      '<input type="number" id="' + id + '" value="' + C.round(value, 4) + '" step="' + (step || 1) + '"></div>';
+  }
+
+  /* =========================================================
+     交互：点击
+     ========================================================= */
+
+  document.addEventListener('click', function (e) {
+    if (e.target && e.target.classList && e.target.classList.contains('modal-mask')) {
+      closeModal();
+      return;
+    }
+    var btn = e.target.closest('[data-action]');
+    if (!btn) return;
+
+    var act = btn.getAttribute('data-action');
+    var id = btn.getAttribute('data-id');
+
+    switch (act) {
+      case 'close-modal': closeModal(); break;
+
+      case 'open-opp':
+        location.hash = '#/opp/' + id;
+        break;
+
+      case 'new-opp': openNewOpp(); break;
+      case 'open-seller-app': {
+        var sok = true;
+        try { window.location.href = 'alisupplier://'; } catch (e) { sok = false; }
+        if (!sok) {
+          window.open('https://seller.alibaba.com/', '_blank', 'noopener');
+          toast('没唤起电脑版，已经给你打开网页版');
+          break;
+        }
+        toast('正在唤起「阿里卖家」…第一次会问一句，点允许');
+        setTimeout(function () {
+          if (document.hasFocus && document.hasFocus()) {
+            toast('客户端没弹出来？点右边「网页版」一样能干活');
+          }
+        }, 2200);
+        break;
+      }
+      case 'open-seller-web':
+        window.open('https://seller.alibaba.com/', '_blank', 'noopener');
+        toast('网页版已在新标签打开');
+        break;
+      case 'quick-demo': runQuickDemo(); break;
+      case 'goto-opps': location.hash = '#/opps'; break;
+      case 'open-help': openHelp(); break;
+      case 'goto-settings': closeModal(); location.hash = '#/settings'; break;
+      case 'edit-opp': openEditOpp(id); break;
+
+      case 'select-product': {
+        var opp = oppById(btn.getAttribute('data-opp'));
+        if (!opp) return;
+        opp.selectedProductId = id;
+        opp.quote.autoPrice = true;
+        opp.quote.unitPriceUsd = 0;
+        C.addLog(opp, '切换匹配商品为 ' + (productById(id) || {}).sku);
+        invalidate(); C.persist(); render();
+        break;
+      }
+
+      case 'apply-recommend': {
+        var o2 = oppById(id);
+        if (!o2) return;
+        o2.quote.autoPrice = true;
+        o2.quote.unitPriceUsd = 0;
+        invalidate(); C.persist(); render();
+        toast('已套用建议价');
+        break;
+      }
+
+      case 'generate-reply':
+      case 'gen-reply': {
+        var o3 = oppById(id || (location.hash.match(/opp\/([^\/]+)/) || [])[1]);
+        if (!o3) return;
+        var lang = btn.getAttribute('data-lang') || 'en';
+        var ctx = ctxFor(prepareOpp(o3));
+        o3.drafts = o3.drafts || {};
+        o3.drafts[lang] = lang === 'en' ? R.replyEn(ctx) : R.replyZh(ctx);
+        C.addLog(o3, '生成' + (lang === 'en' ? '英文' : '中文') + '回复草稿');
+        S.tab = lang;
+        invalidate(); C.persist(); render();
+        toast('草稿已生成，可编辑后复制');
+        break;
+      }
+
+      case 'tab': {
+        S.tab = btn.getAttribute('data-tab');
+        render();
+        break;
+      }
+
+      case 'copy-draft': {
+        var o4 = oppById(id);
+        var text = o4 && o4.drafts ? o4.drafts[btn.getAttribute('data-lang')] : '';
+        copyText(text || '');
+        break;
+      }
+
+      case 'print-quote': {
+        var o5 = oppById(id);
+        if (!o5) return;
+        var doc = R.quoteDocument(ctxFor(prepareOpp(o5)));
+        var w = window.open('', '_blank');
+        if (!w) { toast('浏览器拦截了弹窗，请允许后重试'); return; }
+        try { w.opener = null; } catch (err) { /* 同源新窗口才能置空，置不了也不影响打印 */ }
+        w.document.open();
+        w.document.write(doc);
+        w.document.close();
+        setTimeout(function () { try { w.print(); } catch (err) { } }, 400);
+        break;
+      }
+
+      case 'mark-quoted': {
+        var o6 = oppById(id);
+        if (!o6) return;
+        o6.status = 'quoted';
+        C.pushQuoteVersion(o6, o6.quote, '标记报价');
+        W.startFollow(o6, st().settings);
+        C.addLog(o6, '自动排跟进：' + C.fmtDate(o6.followUpAt, true));
+        invalidate(); C.persist(); render();
+        toast('已标记报价，' + C.num(st().settings.followUpDays, 3) + ' 天后提醒跟进');
+        break;
+      }
+
+      case 'open-follow': openFollow(id); break;
+      case 'save-follow': saveFollow(id); break;
+      case 'copy-follow': copyFollow(id, btn.getAttribute('data-kind'), btn.getAttribute('data-lang') || 'zh'); break;
+      case 'copy-nego': copyNego(id, C.num(btn.getAttribute('data-zone'))); break;
+      case 'restore-backup': doRestoreBackup(); break;
+      case 'cat-only-empty': S.catOnlyEmpty = true; S.catQ = ''; location.hash = '#/catalog'; invalidate(); render(); break;
+
+      case 'open-settle': openSettle(id); break;
+      case 'confirm-settle': confirmSettle(id); break;
+      case 'open-lose': openLose(id); break;
+      case 'confirm-lose': confirmLose(id); break;
+
+      case 'delete-opp': {
+        if (!confirm('确定删除这条商机？')) return;
+        var arr = st().opportunities;
+        var idx = arr.findIndex(function (o) { return o.id === id; });
+        if (idx >= 0) arr.splice(idx, 1);
+        invalidate(); C.persist();
+        location.hash = '#/opps';
+        break;
+      }
+
+      case 'new-product': openProduct(null); break;
+      case 'edit-product': openProduct(id); break;
+
+      case 'delete-product': {
+        if (!confirm('删除这个商品？')) return;
+        var ps = st().products;
+        var pi = ps.findIndex(function (p) { return p.id === id; });
+        if (pi >= 0) {
+          C.audit('删除商品', String(ps[pi].title || ps[pi].sku).slice(0, 40));
+          ps.splice(pi, 1);
+        }
+        invalidate(); C.persist(); render();
+        toast('已删除');
+        break;
+      }
+
+      case 'save-product': saveProduct(id); break;
+      case 'use-price': {
+        var pr0 = productById(id);
+        if (pr0) {
+          pr0.costRmb = C.num(btn.getAttribute('data-price'));
+          pr0.costSource = btn.getAttribute('data-src') || '淘宝';
+          pr0.costNote = '查价页手填';
+          invalidate(); C.persist(); render();
+          toast('已填入 ¥' + pr0.costRmb);
+        }
+        break;
+      }
+
+      /* 批量补成本：只补当前筛选里没成本、且有候选价的商品 */
+      case 'bulk-fill-cost': {
+        var pd = window.PRICE_CANDIDATES || {};
+        var targetsAll = bulkTargets(pd);
+        if (!targetsAll.length) { toast('当前筛选里没有能补成本的商品'); break; }
+        var fac = bulkFactor();
+        if (!confirm('给 ' + targetsAll.length + ' 个商品填入成本？\n\n按候选价中位数 × ' + fac +
+          '\n已有成本的不动；填完可以一键撤销。')) break;
+        S.bulkUndo = targetsAll.map(function (p) {
+          return { id: p.id, costRmb: p.costRmb, costSource: p.costSource, costNote: p.costNote };
+        });
+        var stamp = new Date().toISOString().slice(0, 10);
+        targetsAll.forEach(function (p) {
+          p.costRmb = suggestedCost(p, pd);
+          p.costSource = '淘宝参考价';
+          p.costNote = '批量估算 ' + stamp + ' × ' + fac;
+        });
+        invalidate(); C.persist(); render();
+        toast('已补 ' + targetsAll.length + ' 个，还剩 ' + costlessCount() + ' 个没成本');
+        break;
+      }
+
+      case 'undo-bulk-cost': {
+        if (!S.bulkUndo.length) { toast('没有可撤销的批量操作'); break; }
+        var n0 = 0;
+        S.bulkUndo.forEach(function (r) {
+          var p = productById(r.id);
+          if (!p) return;
+          p.costRmb = r.costRmb;
+          p.costSource = r.costSource;
+          p.costNote = r.costNote;
+          n0++;
+        });
+        S.bulkUndo = [];
+        invalidate(); C.persist(); render();
+        toast('已撤销 ' + n0 + ' 个商品的成本');
+        break;
+      }
+      case 'tr-zh': {
+        var op1 = oppById(id) || oppById(S.oppId);
+        if (!op1 || !window.Translate) break;
+        S.oppId = op1.id;
+        S.oppLang = 'zh';
+        if (S.oppTextZh) { render(); break; }
+        runTranslation(op1);
+        render();
+        setTimeout(function () { paintTr(); paintRawText(); }, 30);
+        break;
+      }
+      case 'tr-raw': S.oppLang = 'raw'; render(); break;
+      case 'clear-logs':
+        if (confirm('清空全部操作日志？')) {
+          st().logs = []; C.persist(); render(); toast('已清空');
+        }
+        break;
+      case 'save-fee-types': {
+        var inputs = [].slice.call(document.querySelectorAll('[data-fee-type]'));
+        var mm = {};
+        inputs.forEach(function (inp) {
+          var v = C.num(inp.value);
+          if (v > 0) mm[inp.getAttribute('data-fee-type')] = Math.min(0.5, v / 100);
+        });
+        C.audit('修改品类费率', Object.keys(mm).length + ' 个品类');
+        st().settings.feeRateByType = mm;
+        invalidate(); C.persist();
+        toast('已保存 ' + Object.keys(mm).length + ' 个品类的费率');
+        break;
+      }
+      case 'export-orders': exportOrdersCsv(); break;
+      case 'export-catalog': exportCatalogCsv(); break;
+      case 'cat-type':
+        S.catType = btn.getAttribute('data-type') || '';
+        render();
+        break;
+      case 'refund-order': {
+        var ords2 = st().orders || [];
+        var o2 = ords2.find(function (x) { return x.id === id; });
+        if (!o2) break;
+        var cur = C.num(o2.refundUsd);
+        var v = prompt('退款金额（USD，整单金额 ' + C.usd(o2.amountUsd) + '）\n填 0 表示撤销退款', String(cur || 0));
+        if (v === null) break;
+        var rv = Math.max(0, Math.min(C.num(v), C.num(o2.amountUsd)));
+        C.audit('记退款', o2.title + ' $' + rv);
+        o2.refundUsd = C.round2(rv);
+        recalcOrder(o2, st().settings);
+        invalidate(); C.persist(); render();
+        toast(rv > 0 ? '已记退款 ' + C.usd(rv) + '，利润重算为 ' + C.money(o2.netRmb) : '已撤销退款');
+        break;
+      }
+      case 'new-order': openOrder(); break;
+      case 'refresh-fx': refreshFx(true); break;
+      case 'toggle-key': {
+        var ki = document.getElementById('set-dashscopeKey');
+        if (ki) {
+          var show = ki.type === 'password';
+          ki.type = show ? 'text' : 'password';
+          if (btn) btn.textContent = show ? '隐藏' : '显示';
+        }
+        break;
+      }
+      case 'test-qwen': {
+        var out1 = document.getElementById('qwen-test-out');
+        if (out1) out1.textContent = '调用中…';
+        /* 前端不再持有密钥：这里只探一下服务端代理通不通 */
+        fetch('/api/ai', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            task: 'translate',
+            text: 'We need 500 pcs of ES900 receiver with CE certificate.',
+            to: 'zh-CN'
+          })
+        }).then(function (r) { return r.json().then(function (j) { return { status: r.status, json: j }; }); }).then(function (res) {
+          var c = res.json && res.json.text;
+          var why = res.status === 401 ? '需要先登录（登录后服务器才肯出密钥）'
+            : res.status === 503 ? '服务器没配 DASHSCOPE_KEY'
+            : res.status === 404 ? '服务端没有 /api/ai' : '';
+          if (out1) out1.innerHTML = (res.status === 200 && c)
+            ? '<span style="color:#0f9d58">成功：' + esc(String(c).trim().slice(0, 60)) + '</span>'
+            : '<span style="color:#d92d20">失败：' + esc(why || ('HTTP ' + res.status)) + '</span>';
+        }).catch(function (e) {
+          if (out1) out1.innerHTML = '<span style="color:#d92d20">失败：' + esc(String(e.message).slice(0, 60)) + '</span>';
+        });
+        break;
+      }
+      case 'test-translate': {
+        var outEl = document.getElementById('tr-test-out');
+        var ep = document.getElementById('set-translateEndpoint');
+        var rawEp = String((ep && ep.value) || '').trim();
+        var okEp = rawEp ? Core.normalizeEndpoint(rawEp) : '';
+        /* 地址先过校验再存：以前直接写进去，公网 http 地址照样保存，
+           测试当场失败但设置已经脏了，下次打开还报同一个错。 */
+        if (rawEp && !okEp) {
+          if (outEl) outEl.innerHTML = '<span style="color:#d92d20">地址不可用：只支持 https，或内网的 http / .local 地址。没有保存。</span>';
+          break;
+        }
+        if (outEl) outEl.textContent = '测试中…';
+        st().settings.translateEndpoint = okEp;
+        if (ep && okEp !== rawEp) ep.value = okEp;
+        if (window.Translate) window.Translate.clearCache();
+        window.Translate.text('We need 500 pcs of ES900 receiver.', 'zh-CN', function (err, res) {
+          if (!outEl) return;
+          if (err) { outEl.innerHTML = '<span style="color:#d92d20">失败：' + esc(err.message) + '</span>'; return; }
+          outEl.innerHTML = '<span style="color:#0f9d58">成功：' + esc(res.text) + '</span>';
+        });
+        break;
+      }
+      case 'save-order': saveOrder(); break;
+      case 'delete-order': {
+        var ords = st().orders || [];
+        var oi = ords.findIndex(function (o) { return o.id === id; });
+        if (oi >= 0 && confirm('删除这条订单记录？')) {
+          C.audit('删除订单', ords[oi].title + ' ' + C.usd(ords[oi].amountUsd));
+          ords.splice(oi, 1);
+          invalidate(); C.persist(); render();
+          toast('已删除');
+        }
+        break;
+      }
+      case 'bulk-cost': openBulkCost(); break;
+      case 'do-bulk-cost': doBulkCost(); break;
+      case 'import-products': openImportProducts(); break;
+      case 'parse-import': parseImport(); break;
+      case 'import-back': openImportProducts(importDraft ? importDraft.raw : ''); break;
+      case 'do-import-products': doImportProducts(); break;
+
+      case 'save-settings': saveSettings(); break;
+
+      case 'reset-demo': {
+        if (!confirm('重置为演示数据？你录入的商机和商品都会被清空。')) return;
+        C.reset();
+        invalidate();
+        location.hash = '#/dashboard';
+        render();
+        toast('已重置');
+        break;
+      }
+
+      case 'export-json': C.exportJson(); break;
+      case 'import-json': document.getElementById('file-input').click(); break;
+      case 'import-merge': {
+        if (!pendingImport) break;
+        var added = C.mergeAll(pendingImport);
+        C.audit('合并导入', '商品 +' + added.products + ' / 商机 +' + added.opportunities + ' / 订单 +' + added.orders);
+        pendingImport = null;
+        closeModal(); invalidate(); render();
+        toast('已合并：商品 +' + added.products + '，商机 +' + added.opportunities + '，订单 +' + added.orders);
+        break;
+      }
+      case 'import-replace': {
+        if (!pendingImport) break;
+        if (!confirm('确定用这份备份覆盖现在的全部数据？覆盖后无法撤销。')) break;
+        var snap = C.validateBackup(pendingImport);
+        C.replaceAll(pendingImport);
+        C.audit('覆盖导入', '商品 ' + snap.counts.products + ' / 商机 ' + snap.counts.opportunities + ' / 订单 ' + snap.counts.orders);
+        pendingImport = null;
+        closeModal(); invalidate(); render();
+        toast('已覆盖导入');
+        break;
+      }
+
+      case 'save-opp': saveOpp(id); break;
+
+      default: break;
+    }
+  });
+
+  /* =========================================================
+     交互：输入
+     ========================================================= */
+
+  document.addEventListener('input', function (e) {
+    var el = e.target;
+
+    /* 搜索框：只换表格内容，保持输入焦点 */
+    if (el.id === 'fx-shock') {
+      var fxOut = document.getElementById('fx-shock-out');
+      if (fxOut) fxOut.innerHTML = fxShockResult(Math.max(1, C.num(el.value, 7.1)));
+      return;
+    }
+    if (el.id === 'sb-price' || el.id === 'sb-qty') {
+      var sbOpp = oppById(el.getAttribute('data-opp'));
+      if (!sbOpp) return;
+      var sbPrice = C.num(document.getElementById('sb-price').value);
+      var sbQty = Math.max(1, C.num(document.getElementById('sb-qty').value));
+      var po = document.getElementById('sb-price-out');
+      var qo = document.getElementById('sb-qty-out');
+      if (po) po.textContent = C.usd(sbPrice);
+      if (qo) qo.textContent = sbQty.toLocaleString();
+      var res = document.getElementById('sb-result');
+      if (res) res.innerHTML = sandboxResult(ctxWithQty(sbOpp, sbQty), sbPrice, sbQty);
+      return;
+    }
+    if (el.id === 'opp-search') {
+      S.oppQ = el.value;
+      debounceSearch(function () {
+        var ob = document.getElementById('opp-body');
+        if (ob) ob.innerHTML = oppRows();
+        var oc = document.getElementById('opp-count');
+        if (oc) oc.textContent = '显示 ' + oppFiltered().length + ' / ' + st().opportunities.length + ' 条';
+      });
+      return;
+    }
+    if (el.id === 'cat-search') {
+      S.catQ = el.value;
+      debounceSearch(function () {
+        var tb = document.getElementById('cat-body');
+        if (tb) tb.innerHTML = catalogRows(S.catQ, S.catOnlyEmpty);
+        var cnt = document.getElementById('cat-count');
+        if (cnt) cnt.textContent = catalogCount();
+      });
+      return;
+    }
+    if (el.id === 'rev-search') {
+      S.revQ = el.value;
+      debounceSearch(paintReview);
+      return;
+    }
+    if (el.id === 'bulk-factor') {
+      S.bulkFactor = el.value;
+      paintReview();
+      return;
+    }
+
+    /* 商机报价字段 */
+    var oppId = el.getAttribute && el.getAttribute('data-opp');
+    var field = el.getAttribute && el.getAttribute('data-field');
+
+    if (oppId && field) {
+      var opp = oppById(oppId);
+      if (!opp) return;
+      var val = el.value;
+      var prodtmp = productById(opp.selectedProductId);
+
+      var needRecalc = false;
+
+      if (field === 'qty') {
+        if (String(val).trim() === '') return;
+        opp.quote.qty = Math.max(1, C.num(val, 1));
+        needRecalc = true;
+      } else if (field === 'costRmb') {
+        opp.quote.costRmb = C.num(val, 0);
+        if (prodtmp) prodtmp.costRmb = opp.quote.costRmb;
+        needRecalc = true;
+      } else if (field === 'marketPriceRmb') {
+        if (prodtmp) prodtmp.marketPriceRmb = C.num(val, 0);
+        needRecalc = true;
+      } else if (field === 'shippingRmb') {
+        opp.quote.shippingRmb = C.num(val, 0);
+        if (prodtmp) prodtmp.shippingRmb = opp.quote.shippingRmb;
+        needRecalc = true;
+      } else if (field === 'unitPriceUsd') {
+        opp.quote.unitPriceUsd = C.num(val, 0);
+        opp.quote.autoPrice = false;
+      } else if (field === 'leadTimeDays') {
+        opp.quote.leadTimeDays = Math.max(0, C.num(val, 0));
+      } else {
+        opp.quote[field] = val;
+      }
+
+      if (needRecalc && opp.quote.autoPrice !== false) {
+        var rec = P.evaluate({
+          product: productById(opp.selectedProductId),
+          qty: opp.quote.qty, settings: st().settings,
+          unitCostRmb: opp.quote.costRmb, shippingRmb: opp.quote.shippingRmb,
+          unitPriceUsd: null
+        }).recommendUsd;
+        opp.quote.unitPriceUsd = rec;
+        var priceInput = document.querySelector('[data-opp="' + oppId + '"][data-field="unitPriceUsd"]');
+        if (priceInput) priceInput.value = C.round(rec, 2);
+      }
+      refreshPricing(oppId);
+      C.persist();
+    }
+  });
+
+  document.addEventListener('change', function (e) {
+    var el = e.target;
+
+    /* 改完价或数量（失焦时）记一版，便于回看这一单改过几次价 */
+    var fName = el.getAttribute && el.getAttribute('data-field');
+    var fOppId = el.getAttribute && el.getAttribute('data-opp');
+    if (fName && fOppId && (fName === 'unitPriceUsd' || fName === 'qty')) {
+      var fOpp = oppById(fOppId);
+      if (fOpp) {
+        C.pushQuoteVersion(fOpp, fOpp.quote, fName === 'qty' ? '改数量' : '手工改价');
+        C.persist();
+      }
+      return;
+    }
+
+    if (el.id === 'opp-f-country') { S.oppCountry = el.value; render(); return; }
+    if (el.id === 'opp-f-type') { S.oppType = el.value; render(); return; }
+    if (el.id === 'opp-f-tier') { S.oppTier = el.value; render(); return; }
+    if (el.id === 'opp-f-status') { S.oppStatus = el.value; render(); return; }
+
+    if (el.id === 'ord-product') {
+      var pd = productById(el.value);
+      if (pd) {
+        var q = C.num(document.getElementById('ord-qty').value, 1) || 1;
+        var tier = P.tierFor(pd, q);
+        var unitEl = document.getElementById('ord-unit');
+        var amtEl = document.getElementById('ord-amount');
+        var costEl = document.getElementById('ord-cost');
+        if (!C.num(unitEl.value)) unitEl.value = C.round(tier.price, 2);
+        if (!C.num(amtEl.value)) amtEl.value = C.round(tier.price * q, 2);
+        if (!C.num(costEl.value) && C.num(pd.costRmb) > 0) costEl.value = C.round(C.num(pd.costRmb) * q, 2);
+      }
+      return;
+    }
+    if (el.id === 'cat-only-empty') {
+      S.catOnlyEmpty = el.checked;
+      var tbA = document.getElementById('cat-body');
+      if (tbA) tbA.innerHTML = catalogRows(S.catQ, S.catOnlyEmpty);
+      var cntA = document.getElementById('cat-count');
+      if (cntA) cntA.textContent = catalogCount();
+      return;
+    }
+    if (el.id === 'rev-only-pending') {
+      S.revOnlyPending = el.checked;
+      paintReview();
+      return;
+    }
+
+    /* 商品库表格里直接改成本 / 市场价 */
+    var pid = el.getAttribute && el.getAttribute('data-prod');
+    var pfield = el.getAttribute && el.getAttribute('data-pfield');
+    if (pid && pfield) {
+      var p0 = productById(pid);
+      if (p0) {
+        p0[pfield] = C.num(el.value, 0);
+        invalidate(); C.persist(); render();
+      }
+      return;
+    }
+
+    /* 导入：列对应关系 */
+    if (el.hasAttribute && el.hasAttribute('data-import-col')) {
+      if (!importDraft) return;
+      var role = el.value || null;
+      var ci = parseInt(el.getAttribute('data-import-col'), 10);
+      if (role) {
+        for (var k = 0; k < importDraft.g.mapping.length; k++) {
+          if (k !== ci && importDraft.g.mapping[k] === role) importDraft.g.mapping[k] = null;
+        }
+      }
+      importDraft.g.mapping[ci] = role;
+      renderImportPreview();
+      return;
+    }
+
+    if (el.id === 'import-replace' && importDraft) { importDraft.replace = el.checked; return; }
+    if (el.id === 'import-cny' && importDraft) { importDraft.convertCny = el.checked; renderImportPreview(); return; }
+
+    if (el.id === 'file-input' && el.files && el.files[0]) {
+      handleBackupFile(el.files[0]);
+      el.value = '';
+    }
+  });
+
+  /* =========================================================
+     局部刷新（避免输入框失焦）
+     ========================================================= */
+
+  /* ---------------- 导入备份：先校验、再预览、后落盘 ---------------- */
+
+  var MAX_BACKUP_MB = 20;
+
+  function handleBackupFile(file) {
+    if (!file) return;
+
+    if (file.size > MAX_BACKUP_MB * 1024 * 1024) {
+      toast('文件太大（' + (file.size / 1024 / 1024).toFixed(1) + 'MB），备份一般只有几 MB');
+      return;
+    }
+    if (!/\.json$/i.test(file.name || '')) {
+      toast('只认 .json 备份文件，你选的是「' + (file.name || '未知') + '」');
+      return;
+    }
+
+    var reader = new FileReader();
+    reader.onerror = function () { toast('文件读不出来，可能已损坏或被占用'); };
+    reader.onload = function () {
+      var obj;
+      try {
+        obj = JSON.parse(String(reader.result));
+      } catch (e) {
+        toast('不是有效的 JSON：' + String(e.message).slice(0, 60));
+        return;
+      }
+
+      var v = C.validateBackup(obj);
+      if (!v.ok) {
+        openModal(modalHead('这个文件不能导入') +
+          '<div class="modal-bd"><div class="alert warn"><span class="ic">!</span><div>' +
+          '<strong>问题：</strong><br>' + v.errors.map(function (e) { return '· ' + esc(e); }).join('<br>') +
+          '<br><br>你的数据没有被改动。</div></div>' +
+          '<div class="hint">这个文件：' + esc(file.name) + ' · ' + (file.size / 1024).toFixed(1) + ' KB</div>' +
+          '</div><div class="modal-ft"><button class="btn ghost" data-action="close-modal">知道了</button></div>', true);
+        return;
+      }
+
+      var c = v.counts;
+      openModal(modalHead('确认导入这份备份') +
+        '<div class="modal-bd">' +
+        '<div class="table-wrap"><table class="table"><thead><tr><th>内容</th><th class="num">文件里</th>' +
+        '<th class="num">你现在的</th></tr></thead><tbody>' +
+        '<tr><td>商品</td><td class="num">' + c.products + '</td><td class="num">' + st().products.length + '</td></tr>' +
+        '<tr><td>商机</td><td class="num">' + c.opportunities + '</td><td class="num">' + st().opportunities.length + '</td></tr>' +
+        '<tr><td>订单</td><td class="num">' + c.orders + '</td><td class="num">' + (st().orders || []).length + '</td></tr>' +
+        '</tbody></table></div>' +
+        '<div class="alert warn" style="margin-top:12px"><span class="ic">!</span><div>' +
+        '<strong>覆盖导入</strong>会用文件里的内容替换你现在的全部数据，无法撤销。<br>' +
+        '<strong>合并导入</strong>只补充文件里有、你这里没有的条目（按 id 去重）。</div></div>' +
+        '<div class="hint">文件：' + esc(file.name) + ' · ' + (file.size / 1024).toFixed(1) + ' KB' +
+        (v.meta && v.meta.exportedAt ? ' · 导出于 ' + esc(String(v.meta.exportedAt).slice(0, 16).replace('T', ' ')) : '') +
+        '</div></div>' +
+        '<div class="modal-ft">' +
+        '<button class="btn ghost" data-action="close-modal">取消</button>' +
+        '<button class="btn" data-action="import-merge">合并导入</button>' +
+        '<button class="btn danger" data-action="import-replace">覆盖导入</button>' +
+        '</div>', true);
+
+      pendingImport = obj;
+    };
+    reader.readAsText(file);
+  }
+
+  var pendingImport = null;
+
+  function refreshPricing(oppId) {
+    var opp = oppById(oppId);
+    if (!opp) return;
+    var ctx = ctxFor(opp);
+
+    var verdict = document.querySelector('[data-pf="verdict"]');
+    if (verdict) verdict.innerHTML = verdictHtml(ctx);
+
+    var split = document.querySelector('[data-pf="split"]');
+    if (split) split.innerHTML = rangeBarHtml(ctx);
+
+    var floors = document.querySelector('[data-pf="floors"]');
+    if (floors) floors.innerHTML = floorsHtml(ctx);
+
+    var profit = document.querySelector('[data-pf="profit"]');
+    if (profit) profit.innerHTML = profitHtml(ctx);
+
+    var flags = document.querySelector('[data-pf="flags"]');
+    if (flags) flags.innerHTML = flagsHtml(ctx);
+
+    var ladder = document.querySelector('[data-pf="ladder"]');
+    if (ladder) ladder.innerHTML = ladderHtml(ctx);
+
+    var sens = document.querySelector('[data-pf="sens"]');
+    if (sens) sens.innerHTML = sensHtml(ctx);
+  }
+
+  /* =========================================================
+     弹窗：新建 / 编辑商机
+     ========================================================= */
+
+  /* 一键体验：用你自己的第一个商品生成一条示例询盘，直接跳到结论页 */
+  function runQuickDemo() {
+    var p = st().products[0];
+    if (!p) { toast('先导入商品，才能演示'); return; }
+
+    var qty = Math.max(Number(p.moq) * 3 || 1000, 100);
+    var target = Math.round(Number(p.priceUsd) * 1.10 * 100) / 100;
+    var certs = (p.certs || []).join(', ');
+
+    var text = 'Dear Sales Manager,\n\n' +
+      'We are a retail chain based in Spain and we are interested in ' + (p.titleEn || p.title) + '.\n\n' +
+      'Quantity: ' + qty + ' pcs\n' +
+      'Target price: USD ' + target + ' per pc, FOB\n' +
+      (certs ? 'Certificates: ' + certs + '\n' : '') +
+      'Lead time: 30 days\n\n' +
+      'Please send your best quotation and MOQ.\n\nBest regards,\nLaura';
+
+    var parsed = M.parse(text);
+    var opp = C.normalizeOpp({
+      buyer: {
+        name: 'Laura Gómez',
+        company: 'Outdoor Life S.L.',
+        country: parsed.country || '西班牙',
+        channel: 'RFQ'
+      },
+      rawText: text,
+      quote: {
+        qty: parsed.qty || qty,
+        unitPriceUsd: 0,
+        incoterm: st().settings.defaultIncoterm,
+        leadTimeDays: 30,
+        validDays: st().settings.quoteValidDays
+      }
+    });
+    C.addLog(opp, '一键体验：自动生成的示例商机');
+
+    st().opportunities.unshift(opp);
+    invalidate();
+    C.persist();
+    location.hash = '#/opp/' + opp.id;
+    render();
+    toast('这是示例商机，下面就是结论');
+  }
+
+  function openNewOpp() {
+    var html = modalHead('新建商机') +
+      '<div class="modal-bd">' +
+      '<div class="alert info" style="margin-bottom:14px"><span class="ic">i</span><div>' +
+      '把买家发来的询盘 / RFQ 原文整个粘进来，系统会自动识别数量、目标价、交期、认证和市场。</div></div>' +
+      '<div class="form-grid">' +
+      '<div class="field"><label>买家称呼</label><input type="text" id="opp-name" placeholder="如 Michael Braun"></div>' +
+      '<div class="field"><label>公司</label><input type="text" id="opp-company" placeholder="选填"></div>' +
+      '<div class="field"><label>市场 / 国家</label><input type="text" id="opp-country" placeholder="如 德国"></div>' +
+      '<div class="field"><label>来源渠道</label><select id="opp-channel">' +
+      '<option>询盘</option><option>RFQ</option><option>旺旺</option><option>访客</option><option>其他</option>' +
+      '</select></div>' +
+      '<div class="field full"><label>询盘 / RFQ 原文</label>' +
+      '<textarea id="opp-raw" style="min-height:200px" placeholder="Dear Sales Manager, ...&#10;&#10;Quantity: 2000 pcs&#10;Target price: USD 3.20 / pc FOB&#10;Certificates: FDA, LFGB&#10;Delivery: 30 days"></textarea></div>' +
+      '</div></div>' +
+      '<div class="modal-ft">' +
+      '<button class="btn ghost" data-action="close-modal">取消</button>' +
+      '<button class="btn primary" data-action="save-opp">解析并创建</button>' +
+      '</div>';
+    openModal(html, true);
+  }
+
+  function openEditOpp(id) {
+    var opp = oppById(id);
+    if (!opp) return;
+    var html = modalHead('编辑商机') +
+      '<div class="modal-bd">' +
+      '<input type="hidden" id="opp-id" value="' + opp.id + '">' +
+      '<div class="form-grid">' +
+      '<div class="field"><label>买家称呼</label><input type="text" id="opp-name" value="' + esc(opp.buyer.name) + '"></div>' +
+      '<div class="field"><label>公司</label><input type="text" id="opp-company" value="' + esc(opp.buyer.company) + '"></div>' +
+      '<div class="field"><label>市场 / 国家</label><input type="text" id="opp-country" value="' + esc(opp.buyer.country) + '"></div>' +
+      '<div class="field"><label>来源渠道</label><select id="opp-channel">' +
+      ['询盘', 'RFQ', '旺旺', '访客', '其他'].map(function (c) {
+        return '<option' + (c === opp.buyer.channel ? ' selected' : '') + '>' + c + '</option>';
+      }).join('') + '</select></div>' +
+      '<div class="field full"><label>询盘 / RFQ 原文</label>' +
+      '<textarea id="opp-raw" style="min-height:200px">' + esc(opp.rawText) + '</textarea></div>' +
+      '</div></div>' +
+      '<div class="modal-ft">' +
+      '<button class="btn ghost" data-action="close-modal">取消</button>' +
+      '<button class="btn primary" data-action="save-opp" data-id="' + opp.id + '">保存并重新解析</button>' +
+      '</div>';
+    openModal(html, true);
+  }
+
+  function saveOpp(id) {
+    var name = document.getElementById('opp-name').value.trim() || '未知买家';
+    var company = document.getElementById('opp-company').value.trim();
+    var country = document.getElementById('opp-country').value.trim();
+    var channel = document.getElementById('opp-channel').value;
+    var raw = document.getElementById('opp-raw').value;
+
+    if (!raw.trim()) { toast('请先粘贴询盘原文'); return; }
+
+    var parsed = M.parse(raw);
+
+    if (id) {
+      var opp = oppById(id);
+      if (!opp) return;
+      opp.buyer.name = name;
+      opp.buyer.company = company;
+      opp.buyer.country = country || parsed.country || opp.buyer.country;
+      opp.buyer.channel = channel;
+      opp.rawText = raw;
+      opp.quote.qty = parsed.qty || opp.quote.qty;
+      opp.quote.autoPrice = true;
+      opp.quote.unitPriceUsd = 0;
+      opp.drafts = {};
+      C.addLog(opp, '更新商机原文并重新解析');
+      closeModal();
+      invalidate(); C.persist(); render();
+      toast('已更新并重新解析');
+      return;
+    }
+
+    var fresh = C.normalizeOpp({
+      buyer: {
+        name: name, company: company,
+        country: country || parsed.country || '',
+        channel: channel
+      },
+      rawText: raw,
+      quote: {
+        qty: parsed.qty || 100,
+        unitPriceUsd: 0,
+        incoterm: parsed.incoterm ? (parsed.incoterm + ' ' + (st().settings.defaultIncoterm.split(' ')[1] || '')) : st().settings.defaultIncoterm,
+        leadTimeDays: parsed.leadTimeDays || st().settings.defaultLeadTimeDays,
+        validDays: st().settings.quoteValidDays
+      }
+    });
+    C.addLog(fresh, '商机创建（' + channel + '渠道）');
+    st().opportunities.unshift(fresh);
+
+    closeModal();
+    invalidate(); C.persist();
+    location.hash = '#/opp/' + fresh.id;
+    render();
+    toast('已创建并完成匹配');
+  }
+
+  /* =========================================================
+     弹窗：成交 / 丢单
+     ========================================================= */
+
+  function openSettle(id) {
+    var opp = oppById(id);
+    if (!opp) return;
+    prepareOpp(opp);
+    var ctx = ctxFor(opp);
+    var defAmount = C.round(ctx.pricing.gmvUsd || (opp.quote.qty * opp.quote.unitPriceUsd), 2);
+
+    var html = modalHead('标记成交') +
+      '<div class="modal-bd">' +
+      '<div class="field"><label>实际成交额（USD，含全部货款）</label>' +
+      '<input type="number" id="settle-amount" value="' + defAmount + '" step="0.01"></div>' +
+      '<div class="alert info" style="margin-top:12px"><span class="ic">i</span><div>' +
+      '系统会按「成交额 − 平台扣费 − 成本」算出真实利润，记进复盘。</div></div>' +
+      '</div>' +
+      '<div class="modal-ft">' +
+      '<button class="btn ghost" data-action="close-modal">取消</button>' +
+      '<button class="btn primary" data-action="confirm-settle" data-id="' + id + '">确认成交</button>' +
+      '</div>';
+    openModal(html);
+  }
+
+  function confirmSettle(id) {
+    var opp = oppById(id);
+    if (!opp) return;
+    var amount = C.num(document.getElementById('settle-amount').value);
+    if (amount <= 0) { toast('成交额必须大于 0'); return; }
+
+    var prod = productById(opp.selectedProductId);
+    /* 成本口径必须和报价页一致：进货价 + 运费，缺一项就从商品库补，
+       否则成交利润会凭空多出「运费 × 件数」，亏单还可能记成赚。 */
+    var unitCost = (opp.quote.costRmb === null || opp.quote.costRmb === undefined || opp.quote.costRmb === '')
+      ? C.num(prod && prod.costRmb) : C.num(opp.quote.costRmb);
+    var unitShip = (opp.quote.shippingRmb === null || opp.quote.shippingRmb === undefined || opp.quote.shippingRmb === '')
+      ? C.num(prod && prod.shippingRmb) : C.num(opp.quote.shippingRmb);
+    var d = P.settleDeal({
+      amountUsd: amount,
+      qty: opp.quote.qty,
+      costRmb: (unitCost + unitShip) * C.num(opp.quote.qty),
+      product: prod,
+      settings: st().settings
+    });
+    opp.status = 'won';
+    opp.deal = {
+      finalAmountUsd: d.amountUsd,
+      netRmb: d.netRmb,
+      closedAt: C.nowIso()
+    };
+    /* 同时写进订单明细，复盘统一从订单汇总 */
+    st().orders.push(C.normalizeOrder({
+      productId: opp.selectedProductId,
+      sku: (productById(opp.selectedProductId) || {}).sku || '',
+      title: (productById(opp.selectedProductId) || {}).title || '',
+      qty: opp.quote.qty,
+      unitPriceUsd: opp.quote.qty ? d.amountUsd / opp.quote.qty : 0,
+      amountUsd: d.amountUsd,
+      costRmb: d.costRmb,
+      feeRmb: d.feeRmb,
+      netRmb: d.netRmb,
+      date: new Date().toISOString().slice(0, 10),
+      buyer: opp.buyer.name,
+      country: opp.buyer.country,
+      source: 'opp'
+    }));
+
+    C.addLog(opp, '成交，金额 ' + C.usd(d.amountUsd) + '，利润 ' + C.money(d.netRmb));
+    closeModal();
+    invalidate(); C.persist(); render();
+    toast('已记录成交，利润 ' + C.money(d.netRmb));
+  }
+
+  function openLose(id) {
+    var html = modalHead('标记丢单') +
+      '<div class="modal-bd">' +
+      '<div class="field"><label>丢单原因</label><select id="lose-reason">' +
+      '<option>价格不匹配</option><option>交期太长</option><option>认证缺失</option>' +
+      '<option>买家无回复</option><option>规格不符</option><option>起订量谈不拢</option><option>其他</option>' +
+      '</select></div>' +
+      '<div class="alert info" style="margin-top:12px"><span class="ic">i</span><div>' +
+      '记原因比记结果有用。三个月后你会想知道：是价格问题多，还是产品问题多。</div></div>' +
+      '</div>' +
+      '<div class="modal-ft">' +
+      '<button class="btn ghost" data-action="close-modal">取消</button>' +
+      '<button class="btn danger" data-action="confirm-lose" data-id="' + id + '">确认丢单</button>' +
+      '</div>';
+    openModal(html);
+  }
+
+  function confirmLose(id) {
+    var opp = oppById(id);
+    if (!opp) return;
+    var reason = document.getElementById('lose-reason').value;
+    opp.status = 'lost';
+    opp.deal = Object.assign({}, opp.deal || {}, { reason: reason, closedAt: C.nowIso() });
+    C.addLog(opp, '丢单：' + reason);
+    closeModal();
+    invalidate(); C.persist(); render();
+    toast('已记录丢单原因');
+  }
+
+  /* =========================================================
+     弹窗：商品
+     ========================================================= */
+
+  function openProduct(id) {
+    var p = id ? productById(id) : null;
+    var v = function (k, d) { return p ? (p[k] === undefined ? d : p[k]) : d; };
+
+    var html = modalHead(p ? '编辑商品' : '新增商品') +
+      '<div class="modal-bd">' +
+      '<div class="form-grid">' +
+      '<div class="field"><label>SKU</label><input type="text" id="f-sku" value="' + esc(v('sku', '')) + '"></div>' +
+      '<div class="field"><label>类目</label><input type="text" id="f-category" value="' + esc(v('category', '')) + '"></div>' +
+      '<div class="field full"><label>中文名称</label><input type="text" id="f-title" value="' + esc(v('title', '')) + '"></div>' +
+      '<div class="field full"><label>英文名称</label><input type="text" id="f-titleEn" value="' + esc(v('titleEn', '')) + '"></div>' +
+      '<div class="field full"><label>关键词（逗号分隔，越全匹配越准）</label>' +
+      '<input type="text" id="f-keywords" value="' + esc((v('keywords', []) || []).join(', ')) + '"></div>' +
+      '<div class="field full"><label>规格描述（中文）</label><input type="text" id="f-specs" value="' + esc(v('specs', '')) + '"></div>' +
+      '<div class="field full"><label>规格描述（英文，写进英文回复和报价单）</label><input type="text" id="f-specsEn" value="' + esc(v('specsEn', '')) + '"></div>' +
+      '<div class="field"><label>橱窗价（USD，按 MOQ 数量）</label><input type="number" id="f-priceUsd" step="0.01" value="' + v('priceUsd', 0) + '"></div>' +
+      '<div class="field"><label>价格区间下限（可选）</label><input type="number" id="f-priceFloorUsd" step="0.01" value="' + v('priceFloorUsd', 0) + '"></div>' +
+      '<div class="field"><label>采购成本（元/件，1688 查的）</label><input type="number" id="f-costRmb" step="0.01" value="' + v('costRmb', 0) + '"></div>' +
+      '<div class="field"><label>别家卖多少（元/件）</label><input type="number" id="f-marketPriceRmb" step="0.01" value="' + v('marketPriceRmb', 0) + '"></div>' +
+      
+      '<div class="field"><label>MOQ</label><input type="number" id="f-moq" step="1" value="' + v('moq', 100) + '"></div>' +
+      '<div class="field"><label>交期（天）</label><input type="number" id="f-leadTimeDays" step="1" value="' + v('leadTimeDays', 15) + '"></div>' +
+      '<div class="field"><label>认证（逗号分隔）</label><input type="text" id="f-certs" value="' + esc((v('certs', []) || []).join(', ')) + '"></div>' +
+      '<div class="field"><label>HS 编码</label><input type="text" id="f-hsCode" value="' + esc(v('hsCode', '')) + '"></div>' +
+      '<div class="field"><label>库存状态</label><input type="text" id="f-stock" value="' + esc(v('stock', '备货')) + '"></div>' +
+      '<div class="field full"><label>备注</label><input type="text" id="f-note" value="' + esc(v('note', '')) + '"></div>' +
+      '</div></div>' +
+      '<div class="modal-ft">' +
+      '<button class="btn ghost" data-action="close-modal">取消</button>' +
+      '<button class="btn primary" data-action="save-product" data-id="' + (id || '') + '">保存</button>' +
+      '</div>';
+    openModal(html, true);
+  }
+
+  function saveProduct(id) {
+    var data = {
+      sku: document.getElementById('f-sku').value.trim(),
+      category: document.getElementById('f-category').value.trim(),
+      title: document.getElementById('f-title').value.trim(),
+      titleEn: document.getElementById('f-titleEn').value.trim(),
+      keywords: C.splitList(document.getElementById('f-keywords').value),
+      specs: document.getElementById('f-specs').value.trim(),
+      specsEn: document.getElementById('f-specsEn').value.trim(),
+      priceUsd: C.num(document.getElementById('f-priceUsd').value),
+      priceFloorUsd: C.num(document.getElementById('f-priceFloorUsd').value),
+      costRmb: C.num(document.getElementById('f-costRmb').value),
+      marketPriceRmb: C.num(document.getElementById('f-marketPriceRmb').value),
+
+      moq: Math.max(1, C.num(document.getElementById('f-moq').value, 1)),
+      leadTimeDays: Math.max(1, C.num(document.getElementById('f-leadTimeDays').value, 15)),
+      certs: C.splitList(document.getElementById('f-certs').value).map(function (x) { return x.toUpperCase(); }),
+      hsCode: document.getElementById('f-hsCode').value.trim(),
+      stock: document.getElementById('f-stock').value.trim(),
+      note: document.getElementById('f-note').value.trim()
+    };
+
+    if (!data.title) { toast('商品名称必填'); return; }
+    if (!(data.priceUsd > 0)) { toast('橱窗价必须大于 0'); return; }
+
+    if (id) {
+      var p = productById(id);
+      Object.assign(p, data);
+      p.id = id;
+    } else {
+      st().products.push(C.normalizeProduct(data));
+      st().demoMode = false;
+    }
+
+    closeModal();
+    invalidate(); C.persist(); render();
+    toast('已保存');
+  }
+
+  /* =========================================================
+     弹窗：智能导入商品
+     流程：粘贴 → 自动识别列 → 预览+改列 → 导入
+     ========================================================= */
+
+  var importDraft = null;
+
+  function openBulkCost() {
+    var s = st();
+    var unset = s.products.filter(function (p) { return !(C.num(p.costRmb) > 0); }).length;
+
+    var html = modalHead('批量填成本') +
+      '<div class="modal-bd">' +
+      '<div class="alert info" style="margin-bottom:14px"><span class="ic">i</span><div>' +
+      '一共 ' + s.products.length + ' 个商品，其中 <strong>' + unset + '</strong> 个还没填成本。' +
+      '成本不一样的商品，之后在商品库表格里直接改就行。</div></div>' +
+      '<div class="field"><label>采购成本（元/件）</label>' +
+      '<input type="number" id="bulk-cost" step="0.01" min="0" value="' + '"></div>' +
+      '<label class="row" style="gap:8px;margin-top:14px;font-size:12.5px;cursor:pointer">' +
+      '<input type="checkbox" id="bulk-only-empty" checked style="width:auto;height:auto"> 只填充还没填成本的商品</label>' +
+      '</div>' +
+      '<div class="modal-ft">' +
+      '<button class="btn ghost" data-action="close-modal">取消</button>' +
+      '<button class="btn primary" data-action="do-bulk-cost">应用</button>' +
+      '</div>';
+    openModal(html);
+  }
+
+  function doBulkCost() {
+    var val = C.num(document.getElementById('bulk-cost').value);
+    var onlyEmptyEl = document.getElementById('bulk-only-empty');
+    var onlyEmpty = onlyEmptyEl ? onlyEmptyEl.checked : true;
+    if (!(val > 0)) { toast('填一个大于 0 的数'); return; }
+
+    var n = 0;
+    st().products.forEach(function (p) {
+      if (onlyEmpty && C.num(p.costRmb) > 0) return;
+      p.costRmb = val;
+      n++;
+    });
+
+    st().opportunities.forEach(function (o) { o.quote.costRmb = null; });
+
+    closeModal();
+    invalidate(); C.persist(); render();
+    toast('已给 ' + n + ' 个商品填成本 ' + C.money(val) + ' / 件');
+  }
+  function openImportProducts(prefill) {
+    importDraft = null;
+    var html = modalHead('导入商品') +
+      '<div class="modal-bd">' +
+      '<div class="alert info" style="margin-bottom:14px"><span class="ic">i</span><div>' +
+      '<strong>从阿里后台复制：</strong>商品管理 → 勾选商品（或整页 Ctrl+A）→ <strong>Ctrl+C</strong> → 粘到下面。' +
+      '从 Excel 复制也行。列的顺序不用管，下一步会自动识别。</div></div>' +
+      '<div class="field"><label>粘贴区域</label>' +
+      '<textarea id="import-text" style="min-height:240px;font-family:var(--mono);font-size:12px" ' +
+      'placeholder="把从阿里后台或 Excel 复制的内容粘在这里…&#10;&#10;例如：&#10;产品名称&#9;价格&#9;MOQ&#9;交期&#10;304不锈钢保温杯 500ml&#9;$3.20&#9;100&#9;15">' +
+      esc(prefill || '') + '</textarea></div>' +
+      '</div>' +
+      '<div class="modal-ft">' +
+      '<button class="btn ghost" data-action="close-modal">取消</button>' +
+      '<button class="btn primary" data-action="parse-import">下一步：识别列</button>' +
+      '</div>';
+    openModal(html, true);
+  }
+
+  function parseImport() {
+    var el = document.getElementById('import-text');
+    var text = el ? el.value : '';
+    if (!text.trim()) { toast('请先粘贴内容'); return; }
+
+    var g = window.Importer.guess(text);
+    if (!g.rows.length) { toast('没识别到内容'); return; }
+
+    var mapped = g.mapping.filter(Boolean);
+    if (mapped.indexOf('priceUsd') < 0 || (mapped.indexOf('title') < 0 && mapped.indexOf('titleEn') < 0)) {
+      // 猜不出来也别卡住，让用户在预览里手动指
+    }
+
+    importDraft = {
+      raw: text,
+      g: g,
+      convertCny: window.Importer.detectCny(g.rows, g.mapping),
+      replace: !!st().demoMode
+    };
+    renderImportPreview();
+  }
+
+  function roleOptions(selected) {
+    var out = '<option value="">（忽略这列）</option>';
+    window.Importer.ROLES.forEach(function (r) {
+      out += '<option value="' + r.key + '"' + (selected === r.key ? ' selected' : '') + '>' +
+        esc(r.label) + '</option>';
+    });
+    return out;
+  }
+
+  function renderImportPreview() {
+    if (!importDraft) return;
+    var g = importDraft.g;
+
+    var products = window.Importer.toProducts(g.rows, g.mapping, {
+      header: g.header,
+      fxRate: st().settings.fxRate,
+      convertCny: importDraft.convertCny
+    });
+
+    var head = '<tr><th style="width:38px">#</th>';
+    for (var c = 0; c < g.cols; c++) {
+      var caption = g.header ? String(g.rows[0][c] || '').trim() : '';
+      if (caption.length > 12) caption = caption.slice(0, 12) + '…';
+      head += '<th style="padding:6px;vertical-align:top">' +
+        '<div style="font-size:10.5px;color:var(--ink-3);font-weight:500;margin-bottom:4px;' +
+        'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:118px" title="' +
+        esc(caption) + '">' + (caption ? esc(caption) : '第 ' + (c + 1) + ' 列') + '</div>' +
+        '<select data-import-col="' + c + '" ' +
+        'style="height:28px;font-size:11.5px;min-width:118px;border-color:' +
+        (g.mapping[c] ? 'var(--brand)' : 'var(--line-strong)') + ';color:' +
+        (g.mapping[c] ? 'var(--ink)' : 'var(--ink-3)') + '">' +
+        roleOptions(g.mapping[c]) + '</select></th>';
+    }
+    head += '</tr>';
+
+    var bodyStart = g.header ? 1 : 0;
+    var preview = g.rows.slice(bodyStart, bodyStart + 5).map(function (r, i) {
+      var tds = r.map(function (cell) {
+        var s = String(cell || '');
+        if (s.length > 38) s = s.slice(0, 38) + '…';
+        return '<td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(s) + '</td>';
+      }).join('');
+      return '<tr><td style="color:#8a919e">' + (i + 1) + '</td>' + tds + '</tr>';
+    }).join('');
+
+    var missing = [];
+    if (g.mapping.indexOf('priceUsd') < 0) missing.push('价格');
+    if (g.mapping.indexOf('title') < 0 && g.mapping.indexOf('titleEn') < 0) missing.push('商品名');
+
+    var html = modalHead('确认列对应关系') +
+      '<div class="modal-bd">' +
+      (missing.length
+        ? '<div class="alert danger" style="margin-bottom:12px"><span class="ic">✕</span><div>' +
+        '还没认出<strong>' + missing.join('、') + '</strong>是哪一列。请在上方每一列的下拉框里手动指定一下。</div></div>'
+        : '<div class="alert ok" style="margin-bottom:12px"><span class="ic">✓</span><div>' +
+        '识别完成：共 ' + g.cols + ' 列' + (g.header ? '（第一行是表头，已跳过）' : '') +
+        '，将导入 <strong>' + products.length + '</strong> 条商品。识别错了就改上面的下拉框。</div></div>') +
+      '<div class="table-wrap" style="max-height:320px;overflow:auto;border:1px solid var(--line);border-radius:8px">' +
+      '<table class="table" style="font-size:11.5px"><thead>' + head + '</thead><tbody>' + preview + '</tbody></table>' +
+      '</div>' +
+      '<div class="row" style="margin-top:14px;gap:18px">' +
+      '<label class="row" style="gap:6px;font-size:12.5px;cursor:pointer">' +
+      '<input type="checkbox" id="import-replace" ' + (importDraft.replace ? 'checked' : '') + ' style="width:auto;height:auto">' +
+      '先清空现有商品</label>' +
+      (true
+        ? '<label class="row" style="gap:6px;font-size:12.5px;cursor:pointer">' +
+        '<input type="checkbox" id="import-cny" ' + (importDraft.convertCny ? 'checked' : '') + ' style="width:auto;height:auto">' +
+        '这些是人民币价，按 ' + st().settings.fxRate + ' 折成美元' +
+        (importDraft.convertCny ? '' : '（没检测到 ¥/元，勾上就按人民币算）') + '</label>'
+        : '') +
+      '</div>' +
+      '</div>' +
+      '<div class="modal-ft">' +
+      '<button class="btn ghost" data-action="import-back">返回重贴</button>' +
+      '<button class="btn primary" data-action="do-import-products">导入 ' + products.length + ' 条</button>' +
+      '</div>';
+
+    document.getElementById('modal-root').innerHTML =
+      '<div class="modal-mask"><div class="modal wide">' + html + '</div></div>';
+  }
+
+  function doImportProducts() {
+    if (!importDraft) return;
+    var g = importDraft.g;
+    var replaceEl = document.getElementById('import-replace');
+    var cnyEl = document.getElementById('import-cny');
+    var replace = replaceEl ? replaceEl.checked : false;
+    var convertCny = cnyEl ? cnyEl.checked : false;
+
+    var products = window.Importer.toProducts(g.rows, g.mapping, {
+      header: g.header,
+      fxRate: st().settings.fxRate,
+      convertCny: convertCny
+    });
+
+    if (!products.length) { toast('没有解析到有效商品，检查一下列对应关系'); return; }
+
+    var list = products.map(function (p) { return C.normalizeProduct(p); });
+    if (replace) st().products = list;
+    else st().products = st().products.concat(list);
+
+    st().demoMode = false;
+    closeModal();
+    importDraft = null;
+    invalidate(); C.persist(); render();
+    toast('已导入 ' + list.length + ' 条商品');
+  }
+
+  /* =========================================================
+     设置保存
+     ========================================================= */
+
+  function saveSettings() {
+    var s = st().settings;
+    var g = function (id) { var el = document.getElementById(id); return el ? el.value : ''; };
+
+    s.platformFeeRate = C.num(g('set-platformFeeRate')) / 100;
+    s.fxRate = C.num(g('set-fxRate'), 7.1);
+    s.profitRmb = C.num(g('set-profitRmb'));
+    s.minMarginPct = C.num(g('set-minMarginPct'), 8);
+    s.followUpDays = Math.max(1, C.num(g('set-followUpDays'), 3));
+    s.domesticShippingRmb = C.num(g('set-domesticShippingRmb'));
+
+    s.defaultIncoterm = g('set-defaultIncoterm');
+    s.defaultLeadTimeDays = C.num(g('set-defaultLeadTimeDays'), 15);
+    s.paymentTerms = g('set-paymentTerms');
+    s.paymentTermsEn = g('set-paymentTermsEn');
+    s.sellerName = g('set-sellerName');
+    s.translateEndpoint = String(g('set-translateEndpoint') || '').trim();
+    /* API Key 已移到服务端环境变量，前端不再保存（老值在 core.js 载入时丢弃）。 */
+
+    /* 统一过一遍白名单/区间：手输 700 的汇率、0 的扣费率不能直接落盘 */
+    var rawEndpoint = s.translateEndpoint;
+    var before = { fx: s.fxRate, fee: s.platformFeeRate, margin: s.minMarginPct, profit: s.profitRmb };
+    st().settings = C.normalizeSettings(s);
+    var endpointDropped = !!(rawEndpoint && !st().settings.translateEndpoint);
+
+    /* 报价里存过的手填价，跟着设置变（只重算「自动定价」的那些） */
+    st().opportunities.forEach(function (o) {
+      if (o.quote.autoPrice) o.quote.unitPriceUsd = 0;
+    });
+
+    invalidate(); C.persist(); render();
+
+    if (endpointDropped) {
+      toast('翻译地址没保存：只接受 https（本机/内网可用 http）');
+      return;
+    }
+    var fixed = [];
+    if (st().settings.fxRate !== before.fx) fixed.push('汇率 ' + before.fx + '→' + st().settings.fxRate);
+    if (st().settings.platformFeeRate !== before.fee) fixed.push('扣费率 ' + (before.fee * 100).toFixed(1) + '%→' + (st().settings.platformFeeRate * 100).toFixed(1) + '%');
+    if (st().settings.minMarginPct !== before.margin) fixed.push('最低毛利 ' + before.margin + '%→' + st().settings.minMarginPct + '%');
+    if (fixed.length) {
+      toast('设置已保存（已纠正不合理数值：' + fixed.join('，') + '），报价已重算');
+      return;
+    }
+    toast('设置已保存，报价已重算');
+  }
+  /* =========================================================
+     弹窗：怎么用
+     ========================================================= */
+
+  function helpStep(n, title, body, action, btn) {
+    return '<div class="row" style="align-items:flex-start;gap:14px">' +
+      '<div style="flex:none;width:26px;height:26px;border-radius:50%;background:var(--brand);color:#fff;' +
+      'display:grid;place-items:center;font-size:12px;font-weight:700">' + n + '</div>' +
+      '<div style="flex:1;min-width:0">' +
+      '<div style="font-weight:650;font-size:13.5px">' + title + '</div>' +
+      '<div style="color:var(--ink-2);font-size:12.5px;margin-top:3px;line-height:1.7">' + body + '</div>' +
+      (action ? '<button class="btn sm" style="margin-top:8px" data-action="' + action + '">' + btn + '</button>' : '') +
+      '</div></div>';
+  }
+
+  function openHelp() {
+    var body = '<div class="stack" style="gap:18px">' +
+      helpStep(1, '把你的橱窗商品导进来（只做一次）',
+        '工作台点「导入商品」→ 打开阿里后台的商品管理页，勾选商品或直接 Ctrl+A → <b>Ctrl+C</b> → ' +
+        '回到这里 <b>Ctrl+V</b> → 点「识别列」。' +
+        '<br>列的顺序不用管，它会自己认出哪列是商品名、哪列是价格、哪列是 MOQ。认错了在预览里改下拉框就行。' +
+        '<br><span style="color:var(--ink-3)">如果你是从后台导出 Excel，就打开那个 Excel，全选复制，一样能粘。</span>',
+        'import-products', '去导入商品') +
+      helpStep(2, '把买家原文粘进来',
+        '点「粘贴一条新询盘」，把邮件 / RFQ / 旺旺对话整段粘进去，不用整理格式。' +
+        '<br>它会自动认出：数量、目标价、交期、认证要求、发往哪个国家。',
+        'new-opp', '粘贴一条') +
+      helpStep(3, '看第一眼的结论',
+        '打开任意一条商机，最上面那一条就是答案：<b>报多少、你能净赚多少、低于多少不能报</b>。' +
+        '<br>要发出去的内容在页面最下面的四个标签里：英文回复、中文回复、议价话术、报价单。',
+        'quick-demo', '先看一个例子') +
+      '<div style="border-top:1px solid var(--line);padding-top:16px">' +
+      '<div style="font-weight:650;font-size:13.5px;margin-bottom:8px">算价就两步</div>' +
+      '<div class="rawtext" style="max-height:none;font-size:13px">' +
+      '保本价 = 成本 ÷ 0.97 ÷ 汇率' + "\n" + '建议售价 = (成本 + 想赚的) ÷ 0.97 ÷ 汇率</div>' +
+      '<div style="font-size:12.5px;color:var(--ink-2);line-height:1.9;margin-top:10px">' +
+      '0.97 就是扣掉平台 3% 后你实际拿到手的比例。<br>' +
+      '成本 100 元的东西，卖 103.09 元才刚好不亏。<br>' +
+      '再去查一下别家卖多少，就知道你建议的价能不能卖动。' +
+      '</div>' +
+      '<button class="btn sm" style="margin-top:10px" data-action="goto-settings">去设汇率和想赚的利润</button>' +
+      '</div>' +
+      '<div class="alert info"><span class="ic">i</span><div>' +
+      '<b>为什么不能直接帮你登录阿里后台？</b><br>' +
+      '登录要你的账号密码和短信验证码，而且用脚本操作账号违反平台规则、有封号风险。' +
+      '所以这里走「复制粘贴」：你手动复制，它自动整理。30 秒的事，账号零风险。' +
+      '</div></div>' +
+      '</div>';
+
+    var html = modalHead('怎么用（30 秒看完）') +
+      '<div class="modal-bd">' + body + '</div>' +
+      '<div class="modal-ft"><button class="btn primary" data-action="close-modal">知道了</button></div>';
+    openModal(html, true);
+  }
+
+  /* =========================================================
+     启动
+     ========================================================= */
+
+  function boot() {
+    window.addEventListener('hashchange', render);
+    if (!location.hash) location.hash = '#/dashboard';
+    render();
+
+    startBridge();
+    setTimeout(detectLocalTranslate, 600);
+
+    /* 汇率超过 6 小时就自动更新一次 */
+    try {
+      var lastAt = st().settings.fxUpdatedAt ? new Date(st().settings.fxUpdatedAt).getTime() : 0;
+      if (typeof fetch === 'function' && location && location.href && (!lastAt || Date.now() - lastAt > 6 * 3600 * 1000)) {
+        setTimeout(function () { refreshFx(false); }, 1200);
+      }
+    } catch (e) { }
+
+    /* 本地数据读坏过就说清楚，别让老板以为商品自己没了 */
+    try {
+      var issue = C.loadIssue && C.loadIssue();
+      if (issue) {
+        setTimeout(function () { toast(issue); }, 800);
+        if (C.clearLoadIssue) C.clearLoadIssue();
+      }
+    } catch (e) { }
+
+    /* 第一次打开自动弹「怎么用」 */
+    try {
+      var seen = localStorage.getItem('ali_copilot_seen_help');
+      if (!seen) {
+        localStorage.setItem('ali_copilot_seen_help', '1');
+        openHelp();
+      }
+    } catch (e) { /* 隐私模式下忽略 */ }
+  }
+
+  /* =========================================================
+     今日待办 / 老板看的那几个数 / 还价底线 / 跟进
+     ========================================================= */
+
+  /* 详情页：这条跟到哪一步了，下一步干什么 */
+  function followCard(opp) {
+    if (opp.status === 'won' || opp.status === 'lost') return '';
+    var f = W.followState(opp, st().settings) || {};
+    var n = C.num(opp.followCount, 0);
+    var when = f.none ? '没排跟进' : f.label;
+    var cls = f.overdue ? 'red' : f.today ? 'amber' : 'gray';
+    var last = opp.lastContactAt ? C.relTime(opp.lastContactAt) : '—';
+    var notes = (opp.followLog || []).slice(-3).reverse().map(function (x) {
+      return '<div style="font-size:11.5px;color:#6b7280;padding:4px 0;border-bottom:1px dashed #f0f1f4">' +
+        '<span style="color:#a0a6b0">' + esc(C.fmtDate(x.at)) + '</span> ' + esc(x.note || '（无备注）') + '</div>';
+    }).join('');
+
+    return '<section class="card"><div class="card-hd"><div class="card-title">跟进' +
+      '<span class="card-sub">' + (n ? '已跟 ' + n + ' 次' : '一次都还没跟') + '</span></div>' +
+      '<span class="badge ' + cls + '">' + esc(when) + '</span></div>' +
+      '<div class="card-bd stack" style="gap:8px">' +
+      '<div class="row" style="gap:16px;font-size:12px;color:#6b7280">' +
+      '<span>上次联系 ' + esc(last) + '</span>' +
+      (f.at ? '<span>原定 ' + C.fmtDate(f.at) + '</span>' : '') + '</div>' +
+      '<div class="row" style="gap:6px;flex-wrap:wrap">' +
+      '<button class="btn sm primary" data-action="open-follow" data-id="' + opp.id + '">记录这次跟进</button>' +
+      '<button class="btn sm ghost" data-action="copy-follow" data-kind="nudge" data-lang="zh" data-id="' + opp.id + '">催单（中）</button>' +
+      '<button class="btn sm ghost" data-action="copy-follow" data-kind="nudge" data-lang="en" data-id="' + opp.id + '">催单（EN）</button>' +
+      '<button class="btn sm ghost" data-action="copy-follow" data-kind="counter" data-lang="zh" data-id="' + opp.id + '">还价（中）</button>' +
+      '<button class="btn sm ghost" data-action="copy-follow" data-kind="sample" data-lang="zh" data-id="' + opp.id + '">要样品（中）</button>' +
+      '<button class="btn sm ghost" data-action="copy-follow" data-kind="close" data-lang="zh" data-id="' + opp.id + '">逼成交（中）</button>' +
+      '</div>' + notes + '</div></section>';
+  }
+
+  /* 首页第一块：今天必须做的事，按要紧程度排 */
+  function todoCard() {    var list = W.todos(st());
+    if (!list.length) {
+      return '<section class="card"><div class="card-hd"><div class="card-title">今天要做的事' +
+        '<span class="card-sub">没有欠账</span></div></div>' +
+        '<div class="card-bd"><div class="alert info"><span class="ic">✓</span><div>' +
+        '商机都回完了、该跟的都跟了、成本都填了。有新询盘直接粘进来。' +
+        '</div></div></div></section>';
+    }
+
+    var rows = list.map(function (t) {
+      var btn;
+      if (t.action === 'refresh-fx') {
+        btn = '<button class="btn sm" data-action="refresh-fx">现在更新</button>';
+      } else if (t.action === 'only-empty') {
+        btn = '<button class="btn sm" data-action="cat-only-empty">只看没成本的</button>';
+      } else {
+        btn = '<a class="btn sm" href="' + esc(t.hash || '#/opps') + '">去处理</a>';
+      }
+      return '<div class="row" style="gap:12px;padding:11px 0;border-bottom:1px solid #f0f1f4;align-items:center">' +
+        '<span class="badge ' + (t.severity === 'high' ? 'red' : 'amber') + '" style="min-width:34px;justify-content:center">' +
+        esc(String(t.count)) + '</span>' +
+        '<div style="flex:1;min-width:0">' +
+        '<div style="font-weight:600;font-size:13.5px">' + esc(t.label) + '</div>' +
+        '<div style="color:#8a919e;font-size:11.5px;margin-top:2px">' + esc(t.desc) + '</div></div>' +
+        btn + '</div>';
+    }).join('');
+
+    return '<section class="card"><div class="card-hd"><div class="card-title">今天要做的事' +
+      '<span class="card-sub">系统自己排的，从上往下做</span></div>' +
+      '<button class="btn sm primary" data-action="new-opp">+ 粘一条新询盘</button></div>' +
+      '<div class="card-bd" style="padding-top:4px;padding-bottom:8px">' + rows + '</div></section>';
+  }
+
+  /* 老板只关心四个数：进来多少、报了多少、成了几个、赚了多少 */
+  function bossStrip() {
+    var s = st();
+    var w = W.weekSummary(s);
+    var win = w.winRate === null || w.winRate === undefined ? '—' : Math.round(w.winRate * 100) + '%';
+    return '<section class="card"><div class="card-hd"><div class="card-title">本周（近 7 天）' +
+      '<span class="card-sub">不用去后台导表</span></div>' +
+      '<a href="#/analytics" style="font-size:12px;color:#8a919e">看全部 →</a></div>' +
+      '<div class="card-bd"><div class="grid grid-4">' +
+      metric('新询盘', String(w.weekIn), '近 7 天进店') +
+      metric('发出去的报价', String(w.quoted), '近 7 天，含后续成交/丢单') +
+      metric('成交率', win, '近 7 天 ' + w.won + ' 成 / ' + w.lost + ' 丢') +
+      metric('成了的单均毛利', w.avgNet === null ? '—' : C.money(w.avgNet),
+        '近 7 天合计 ' + C.money(w.netRmb), w.netRmb < 0 ? 'bad' : 'ok') +
+      '</div></div></section>';
+  }
+
+  /* 列表里的跟进小标 */
+  function followChip(o) {
+    if (!o || o.status === 'won' || o.status === 'lost') return '';
+    var f = W.followState(o, st().settings);
+    if (!f || f.none) return '';
+    var txt = f.overdue ? '逾期' + f.days + '天' : f.today ? '今天跟' : f.days + '天后跟';
+    return ' <span class="badge ' + (f.cls === 'red' ? 'red' : f.cls === 'amber' ? 'amber' : 'gray') +
+      '" title="' + esc(f.label) + '">' + esc(txt) + '</span>';
+  }
+
+  /* 还价底线：客服不用问老板就知道能让到哪 */
+  function negBlock(ctx) {
+    var opp = ctx.opp;
+    var a = analyzeOpp(opp);
+    var target = a.parsed.targetPriceUsd || 0;
+    var ng = W.negotiation({
+      product: ctx.product, qty: opp.quote.qty, settings: ctx.settings,
+      unitPriceUsd: opp.quote.unitPriceUsd, buyerTargetUsd: target
+    });
+
+    var box = 'border:1px solid #eceef2;border-radius:8px;padding:12px;margin-top:6px;background:#fafbfc';
+
+    if (!ng.ok) {
+      return '<div style="' + box + '"><div style="font-weight:650;font-size:12.5px;margin-bottom:8px">还价底线</div>' +
+        '<div class="alert warn" style="margin:0"><span class="ic">!</span><div>' +
+        esc(W.negoHeadline(ng)) + '</div></div></div>';
+    }
+
+    var head = '<div style="font-weight:650;font-size:12.5px;margin-bottom:8px">还价底线' +
+      '<span style="color:#8a919e;font-weight:400;font-size:11.5px"> · 低于底线不如不接</span></div>';
+
+    var line = '<div class="alert ' + (ng.roomUsd > 0 ? 'info' : 'warn') + '" style="margin:0">' +
+      '<span class="ic">' + (ng.roomUsd > 0 ? 'i' : '!') + '</span><div>' + esc(W.negoHeadline(ng)) +
+      (target ? '<br>' + esc(W.targetText(ng)) : '') + '</div></div>';
+
+    var facts = '<div class="grid grid-3" style="gap:10px;margin-top:10px">' +
+      '<div><div style="font-size:11px;color:#8a919e">报到客户</div>' +
+      '<div style="font-family:var(--mono);font-size:16px;font-weight:600">' + C.usd(ng.askUsd) + '</div></div>' +
+      '<div><div style="font-size:11px;color:#8a919e">底线（低于不接）</div>' +
+      '<div style="font-family:var(--mono);font-size:16px;font-weight:600;color:#d92d20">' + C.usd(ng.floorUsd) + '</div></div>' +
+      '<div><div style="font-size:11px;color:#8a919e">每让 $' + C.round(ng.stepUsd, 2) + '</div>' +
+      '<div style="font-family:var(--mono);font-size:16px;font-weight:600">-' + C.money(ng.perStepRmb) + '</div></div>' +
+      '</div>';
+
+    var rows = ng.zones.map(function (z, i) {
+      var neg = z.marginOnCost <= 0;
+      return '<tr><td><strong>' + esc(z.label) + '</strong>' +
+        (z.bottom ? ' <span class="badge red">不能再低</span>' : '') + '</td>' +
+        '<td class="num" style="font-family:var(--mono);font-weight:600">' + C.usd(z.priceUsd) + '</td>' +
+        '<td class="num">' + (z.dropUsd > 0 ? '-' + C.usd(z.dropUsd) : '—') + '</td>' +
+        '<td class="num" style="color:' + (neg ? '#d92d20' : '#0f9d58') + '">' +
+        (z.netRmb ? C.money(z.netRmb) : '—') + '<br>' +
+        '<span style="font-size:10.5px;color:#8a919e">毛利 ' + C.pct(z.marginOnCost) + '</span></td>' +
+        '<td class="actions"><button class="btn sm ghost" data-action="copy-nego" data-id="' + opp.id +
+        '" data-zone="' + i + '">复制话术</button></td></tr>';
+    }).join('');
+
+    var table = '<div class="table-wrap" style="margin-top:10px"><table class="table">' +
+      '<thead><tr><th>让到第几口</th><th class="num">报价</th><th class="num">比首报少</th>' +
+      '<th class="num">这单赚</th><th></th></tr></thead><tbody>' + rows + '</tbody></table></div>' +
+      '<div style="font-size:11px;color:#8a919e;margin-top:8px">底线按「毛利率不低于 ' +
+      C.pct(ng.minMarginPct) + '」算，在设置里改。点「复制话术」直接发客户。</div>';
+
+    return '<div style="' + box + '">' + head + line + facts + table + '</div>';
+  }
+
+  /* 设置页：本地存储健康 + 一键回滚 */
+  function storageBlock() {
+    var h = C.storageHealth();
+    var size = h.bytes > 0 ? (h.bytes / 1024).toFixed(0) + ' KB' : '0 KB';
+    var bk = h.backupAt ? '上次自动快照：' + C.relTime(h.backupAt) : '还没有自动快照（改动满 10 分钟才存一份）';
+    return '<div style="margin-top:10px;padding-top:10px;border-top:1px solid #f0f1f4">' +
+      (h.ok ? '' : '<div class="alert warn" style="margin-bottom:8px"><span class="ic">!</span><div>' +
+        '<strong>本地保存失败：' + esc(h.error) + '</strong><br>刚改的内容可能没存进去。' +
+        '先「导出备份 JSON」，再清掉不用的浏览器数据。</div></div>') +
+      '<div style="font-size:12px;color:#8a919e;margin-bottom:6px">当前数据 ' + size + ' · ' + esc(bk) + '</div>' +
+      '<button class="btn sm ghost" data-action="restore-backup">回滚到上一个快照</button>' +
+      '</div>';
+  }
+
+  /* ---------------- 跟进 ---------------- */
+
+  function openFollow(id) {
+    var o = oppById(id);
+    if (!o) return;
+    var s = st().settings;
+    var f = W.followState(o, s) || {};
+    var days = Math.max(1, C.num(s.followUpDays, 3));
+    var last = o.lastContactAt ? '上次联系：' + C.relTime(o.lastContactAt) : '还没记录过联系';
+    var when = f.overdue ? '已经逾期 ' + f.days + ' 天' : f.today ? '今天该跟'
+      : (f.at ? '计划 ' + C.fmtDate(f.at) : '还没排跟进');
+
+    var html = modalHead('记录这次跟进') +
+      '<div class="card-bd stack">' +
+      '<div class="alert ' + (f.overdue ? 'warn' : 'info') + '"><span class="ic">' +
+      (f.overdue ? '!' : 'i') + '</span><div>' + esc(last) + ' · ' + esc(when) + '</div></div>' +
+      '<div class="field"><label>买家怎么回的 / 你做了什么</label>' +
+      '<textarea id="fu-note" rows="3" placeholder="例：嫌贵 5%，问 500 件能不能 4.6"></textarea></div>' +
+      '<div class="field"><label>下一步</label><select id="fu-next">' +
+      '<option value="wait">他还在考虑，' + days + ' 天后再跟</option>' +
+      '<option value="counter">他要还价，我去看底线</option>' +
+      '<option value="sample">要样品 / 要资料</option>' +
+      '<option value="won">谈成了，记成交</option>' +
+      '<option value="lost">不做了，记丢单</option>' +
+      '</select></div>' +
+      '<div class="field"><label>下次跟进日期（留空按设置自动算）</label>' +
+      '<input type="date" id="fu-date"></div>' +
+      '</div>' +
+      '<div class="modal-ft"><button class="btn ghost" data-action="close-modal">取消</button>' +
+      '<button class="btn primary" data-action="save-follow" data-id="' + o.id + '">保存</button></div>';
+    openModal(html);
+  }
+
+  function saveFollow(id) {
+    var o = oppById(id);
+    if (!o) return;
+    var g = function (i) { var el = document.getElementById(i); return el ? el.value : ''; };
+    var note = String(g('fu-note') || '').trim();
+    var next = g('fu-next') || 'wait';
+    var date = String(g('fu-date') || '').trim();
+    var s = st().settings;
+
+    if (next === 'won') { closeModal(); openSettle(id); return; }
+    if (next === 'lost') { closeModal(); openLose(id); return; }
+
+    o.lastContactAt = C.nowIso();
+    o.followCount = C.num(o.followCount, 0) + 1;
+    o.followLog = (o.followLog || []).concat([{ at: o.lastContactAt, note: note, next: next }]).slice(-100);
+    if (note) C.addLog(o, '跟进：' + note);
+
+    var d = date ? new Date(date + 'T09:00:00') : null;
+    if (d && !isNaN(d.getTime())) {
+      o.followUpAt = d.toISOString();
+    } else {
+      o.followUpAt = new Date(Date.now() + Math.max(1, C.num(s.followUpDays, 3)) * 86400000).toISOString();
+    }
+
+    if (next === 'counter') S.tab = 'nego';
+    if (o.status === 'new') o.status = 'matched';
+
+    invalidate(); C.persist(); closeModal(); render();
+    toast('已记录，下次跟进 ' + C.fmtDate(o.followUpAt));
+  }
+
+  function copyFollow(id, kind, lang) {
+    var o = oppById(id);
+    if (!o) return;
+    var text = W.followDraft(o, kind || 'nudge', lang || 'zh');
+    if (!text) { toast('这条还没有报价，先生成报价'); return; }
+    copyText(text);
+  }
+
+  function copyNego(id, zone) {
+    var o = oppById(id);
+    if (!o) return;
+    var ctx = ctxFor(o);
+    var a = analyzeOpp(o);
+    var ng = W.negotiation({
+      product: ctx.product, qty: o.quote.qty, settings: st().settings,
+      unitPriceUsd: o.quote.unitPriceUsd, buyerTargetUsd: a.parsed.targetPriceUsd
+    });
+    if (!ng.ok) { toast('这条商品还没填成本，算不出底线'); return; }
+    var z = ng.zones[zone] || ng.zones[ng.zones.length - 1];
+    var qty = C.num(o.quote.qty);
+    var term = o.quote.incoterm || st().settings.defaultIncoterm || 'FOB';
+    copyText('您好 ' + (o.buyer.name || '') + '，价格我们又核算了一遍：' +
+      (qty ? qty.toLocaleString() + ' 件，' : '') + C.usd(z.priceUsd) + '/件 ' + term +
+      '，这已经贴着我们的成本了，再低就做不下来。' +
+      (qty ? '如果数量能加到 ' + (qty * 2).toLocaleString() + ' 件，我再去申请一下。' : '') +
+      '您看这个价格能不能确认？');
+  }
+
+  function doRestoreBackup() {
+    if (!confirm('用上一个自动快照覆盖当前数据？当前改动会丢。')) return;
+    var r = C.restoreBackup();
+    if (!r.ok) { toast(r.reason || '回滚失败'); return; }
+    invalidate(); render();
+    toast('已回滚到 ' + C.fmtDate(r.at, true));
+  }
+
+  /* 调试钩子：仅在 URL 带 ?debug=1 时暴露，供截图/自动化用 */
+  if (String((location && location.search) || '').indexOf('debug=1') >= 0) {
+    window.__dbg = {
+      openImport: openImportProducts,
+      openHelp: openHelp,
+      parseImport: parseImport,
+      getDraft: function () { return importDraft; }
+    };
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot);
+  } else {
+    boot();
+  }
+})();

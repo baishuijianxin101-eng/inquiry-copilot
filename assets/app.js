@@ -1280,7 +1280,14 @@
       '<small>成本 ' + C.money(r.costUnitRmb) + '/件 ÷ ' + (1 - r.feeRate).toFixed(2) + ' ÷ ' + r.fx.toFixed(2) + '</small></div>' +
       '<div class="pl-val">' + C.usd(r.floorUsd) + '</div></div>' +
       '<div class="priceline suggest"><div class="pl-label">建议报价' +
-      '<small>（成本 ' + C.money(r.costUnitRmb) + ' + 想赚 ' + C.money(r.profitPerUnitRmb) + '/件）÷ ' + (1 - r.feeRate).toFixed(2) + '</small></div>' +
+      '<small>' + (function () {
+        var tgt = r.fx > 0 ? (r.costUnitRmb + r.profitPerUnitRmb) / (1 - r.feeRate) / r.fx : 0;
+        if (tgt > r.recommendUsd + 0.005) {
+          return '想赚 ' + C.money(r.profitPerUnitRmb) + '/件 得报 ' + C.usd(tgt) +
+            '，但你的挂牌价只有 ' + C.usd(r.listUsd) + '，这里只能按挂牌价封顶——先调价';
+        }
+        return '（成本 ' + C.money(r.costUnitRmb) + ' + 想赚 ' + C.money(r.profitPerUnitRmb) + '/件）÷ ' + (1 - r.feeRate).toFixed(2);
+      })() + '</small></div>' +
       '<div class="pl-val">' + C.usd(r.recommendUsd) + '</div></div>' +
       (r.listUsd > 0
         ? '<div class="priceline ceiling"><div class="pl-label">你的挂牌价' +

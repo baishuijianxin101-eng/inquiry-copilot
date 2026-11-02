@@ -600,6 +600,39 @@
     return opp;
   }
 
+  /* 解析结果的人工修正：只收白名单字段、限长限值，脏数据进不来。
+     修正只影响解析展示与待确认问题；有真实落点的字段（数量/市场/交期/术语）
+     由保存动作同步写回 quote/buyer，不在这里处理。 */
+  var REPLY_SCENARIOS = ['first', 'prequote', 'spec', 'moq', 'negotiation', 'sample', 'clarify'];
+  function sanitizeReplyDrafts(rd) {
+    if (!rd || typeof rd !== 'object' || Array.isArray(rd)) return {};
+    var out = {};
+    REPLY_SCENARIOS.forEach(function (k) {
+      var d = rd[k];
+      if (d && typeof d === 'object' && typeof d.en === 'string') {
+        out[k] = {
+          en: d.en.slice(0, 6000),
+          zh: typeof d.zh === 'string' ? d.zh.slice(0, 6000) : '',
+          edited: !!d.edited,
+          at: d.at || null
+        };
+      }
+    });
+    return out;
+  }
+
+  function sanitizeParseEdits(e) {
+    if (!e || typeof e !== 'object' || Array.isArray(e)) return {};
+    var out = {};
+    ['productName', 'purpose', 'country', 'destination', 'incoterm', 'certsText', 'modelsText', 'specsText'].forEach(function (k) {
+      if (typeof e[k] === 'string' && e[k].trim()) out[k] = e[k].trim().slice(0, 160);
+    });
+    if (num(e.qty, 0) > 0) out.qty = Math.round(num(e.qty, 0));
+    if (num(e.targetPriceUsd, 0) > 0) out.targetPriceUsd = Math.round(num(e.targetPriceUsd, 0) * 100) / 100;
+    if (num(e.leadTimeDays, 0) > 0) out.leadTimeDays = Math.round(num(e.leadTimeDays, 0));
+    return out;
+  }
+
   function normalizeOpp(o) {
     o = o || {};
     var buyer = o.buyer || {};
@@ -629,6 +662,14 @@
       selectedProductId: o.selectedProductId ? String(o.selectedProductId).slice(0, 60) : null,
       /* 型号不符拦截的人工放行标记：销售核对后显式放行才为 true，换商品时重置 */
       matchOverride: !!o.matchOverride,
+      parseEdits: sanitizeParseEdits(o.parseEdits),
+      /* 阶段四回复草稿：按场景存中英正文，只认白名单场景键，防脏数据膨胀 */
+      replyDrafts: sanitizeReplyDrafts(o.replyDrafts),
+      /* 人工价值判断记录：卖家自己的结论（重点/正常/搁置）+ 备注，只认白名单值 */
+      valueNote: (o.valueNote && typeof o.valueNote === 'object' && !Array.isArray(o.valueNote) &&
+        ['focus', 'normal', 'defer'].indexOf(o.valueNote.verdict) >= 0)
+        ? { verdict: o.valueNote.verdict, note: String(o.valueNote.note || '').slice(0, 200), at: o.valueNote.at || null }
+        : null,
       quote: normalizeQuote(o.quote),
       quoteVersions: Array.isArray(o.quoteVersions) ? o.quoteVersions.filter(function (v) {
         return v && typeof v === 'object' && !Array.isArray(v);
@@ -651,6 +692,8 @@
       nextActionAt: o.nextActionAt || o.followUpAt || null,
       priority: String(o.priority || '').slice(0, 20),
       followCount: num(o.followCount, 0),
+      /* 阶段五跟进状态（人工设置）：只认白名单键，其余一律清空走推导 */
+      followStatus: ['todo', 'waiting', 'internal', 'planned', 'done'].indexOf(o.followStatus) >= 0 ? o.followStatus : null,
       followLog: Array.isArray(o.followLog) ? o.followLog.filter(function (x) {
         return x && typeof x === 'object' && !Array.isArray(x);
       }).slice(-100) : [],

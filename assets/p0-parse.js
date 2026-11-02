@@ -105,7 +105,7 @@
       model: '', models: [], qty: 0, qtyUnit: 'pcs',
       targetPriceUsd: 0, incoterm: '', deadlineDays: 0, deadlineText: '',
       destination: '', certs: [], colors: [], materials: [],
-      specs: [], productText: ''
+      specs: [], productText: '', productName: '', purpose: ''
     };
     var evidence = {};
     var confidence = {};
@@ -133,6 +133,7 @@
     var PRE = [
       /\$\s*(\d+(?:\.\d+)?)/,
       /(\d+(?:\.\d+)?)\s*(?:usd|dollars?|美金|美元)/i,
+      /(?:usd|dollars?|美金|美元)\s*(\d+(?:\.\d+)?)/i,
       /(?:target|best)\s*(?:price)?\D{0,6}(\d+(?:\.\d+)?)/i
     ];
     for (var pi = 0; pi < PRE.length; pi++) {
@@ -238,6 +239,64 @@
       confidence.model = 0;
     }
 
+    /* 电压 / 功率 / 容量：电子类询盘最常见的三项规格，只认带单位的明确写法 */
+    var VRE = /(\d{2,3}(?:\.\d)?)\s*V\b/;
+    m = VRE.exec(spacedTxt);
+    if (m) fields.specs.push({ name: '电压', value: m[1] + ' V', evidence: snippet(spacedTxt, m.index, m[0].length) });
+    var WRE = /(\d+(?:\.\d+)?)\s*W\b/;
+    m = WRE.exec(spacedTxt);
+    if (m) fields.specs.push({ name: '功率', value: m[1] + ' W', evidence: snippet(spacedTxt, m.index, m[0].length) });
+    var CRE = /(\d+(?:\.\d+)?)\s*(mAh|Ah|ml|L)\b/;
+    m = CRE.exec(spacedTxt);
+    if (m) fields.specs.push({ name: '容量', value: m[1] + ' ' + m[2], evidence: snippet(spacedTxt, m.index, m[0].length) });
+
+    /* 商品名称：只认明确句式（looking for / interested in / we need / 标注行），
+       抽不到就留空，绝不拿整段原文冒充商品名 */
+    var NRE = [
+      /(?:product(?:\s*name)?|item|goods)\s*[:：]\s*([^\n,;]{3,60})/i,
+      /(?:looking for|interested in|inquiring about|inquiry (?:for|about)|searching for)\s+(?:about\s+)?(.{3,60})/i,
+      /(?:we need|we want to (?:buy|import|order|purchase)|want to buy|please quote(?: us)? for)\s+(?:about\s+)?(.{3,60})/i
+    ];
+    for (var ni = 0; ni < NRE.length; ni++) {
+      m = NRE[ni].exec(folded);
+      if (!m) continue;
+      var candName = m[1]
+        .replace(/^\d[\d,]*\s*(?:pcs|pieces|units|sets|pairs|cartons|boxes)?\s*(?:of\s+)?/i, '')
+        .replace(/^(?:your|the|a|an)\s+/i, '')
+        .split(/[,;\n]|\.\s|\s+for\s+(?:our|my|the|a|an)\s+|\s+quantity\b|\s+qty\b/i)[0]
+        .replace(/\s{2,}/g, ' ')
+        .trim();
+      if (candName.length >= 3 && candName.length <= 60 &&
+        !/^(price|quotation|quote|sample|samples|products?|goods|items?)$/i.test(candName) &&
+        !/^(?:some|any|these|those)\s/i.test(candName)) {
+        fields.productName = candName;
+        evidence.productName = snippet(folded, m.index, m[0].length);
+        confidence.productName = ni === 0 ? 0.9 : 0.75;
+        break;
+      }
+    }
+    if (!fields.productName) confidence.productName = 0;
+
+    /* 用途 / 销售渠道：只认明说的短语，猜测一律不写 */
+    var PURPOSES = [
+      { label: '零售转售', re: /\bfor\s+(?:our\s+)?(?:retail|resale)\b|\bresale\b|\bretail\s+(?:chain|stores?|shops?)\b|\bsell\s+in\s+our\s+(?:stores?|shops?|supermarket)\b/i },
+      { label: '电商销售', re: /\bamazon\b|\bsell\s+(?:on|online)\b|\bonline\s+(?:store|shop|selling)\b|\be-?commerce\b|\bshopify\b|\bebay\b/i },
+      { label: '自用', re: /\bfor\s+(?:personal|our own|internal|company)\s+use\b|\bour\s+own\s+use\b/i },
+      { label: '促销礼品', re: /\bpromotion(?:al)?\s+(?:gifts?|items?|products?)\b|\bgiveaways?\b|\bgifts?\s+for\s+(?:our\s+)?(?:customers|clients|employees|staff)\b/i },
+      { label: '工程项目', re: /\bfor\s+(?:a|our|the)\s+(?:construction\s+|engineering\s+)?project\b|\bproject\s+use\b/i },
+      { label: '定制品牌', re: /\bprivate\s+label\b|\bour\s+(?:own\s+)?brand\b|\bwith\s+our\s+(?:logo|brand)\b|\boem\b/i }
+    ];
+    for (var ui = 0; ui < PURPOSES.length; ui++) {
+      m = PURPOSES[ui].re.exec(folded);
+      if (m) {
+        fields.purpose = PURPOSES[ui].label;
+        evidence.purpose = snippet(folded, m.index, m[0].length);
+        confidence.purpose = 0.8;
+        break;
+      }
+    }
+    if (!fields.purpose) confidence.purpose = 0;
+
     /* 产品描述：去掉数量/价格/术语后剩下的第一段，供匹配用 */
     var ptxt = spacedTxt
       .replace(/\$?\s*\d[\d,]*(?:\.\d+)?\s*(?:pcs|pieces|units|sets|cartons|pairs|bags|boxes|个|件|套|只|usd|dollars?)/gi, ' ')
@@ -266,6 +325,12 @@
     }
     if (!fields.targetPriceUsd) {
       needsReview.push({ field: 'targetPriceUsd', level: 'low', why: '客户没给目标价', ask: '可选：问客户目标价位，便于判断是否值得跟' });
+    }
+    if (!fields.productName) {
+      needsReview.push({ field: 'productName', level: 'mid', why: '没识别到明确商品名称', ask: '确认客户要的具体商品名称，避免匹配错品类' });
+    }
+    if (!fields.purpose) {
+      needsReview.push({ field: 'purpose', level: 'low', why: '客户没写用途 / 销售渠道', ask: '可选：问一句用途或销售渠道，便于推荐款式与包装' });
     }
 
     var critical = ['qty', 'model', 'incoterm', 'deadlineDays'];
@@ -323,7 +388,7 @@
   P.applyEdits = applyEdits;
   P.fold = fold;
   P.findModels = findModels;
-  P.VERSION = '1.0.0';
+  P.VERSION = '1.1.0';
 
   (typeof window !== 'undefined' ? window : globalThis).P0Parse = P;
 })();

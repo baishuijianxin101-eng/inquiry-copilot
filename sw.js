@@ -1,7 +1,7 @@
 ﻿/* sw.js — 离线可用，但联网时永远拿最新
    策略：先走网络，成功就更新缓存；断网时用缓存。
 */
-const CACHE = 'copilot-v5';
+const CACHE = 'copilot-v6';
 
 self.addEventListener('install', (e) => { self.skipWaiting(); });
 

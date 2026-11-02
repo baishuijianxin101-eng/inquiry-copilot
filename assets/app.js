@@ -36,10 +36,11 @@
     searchTimer = setTimeout(fn, 120);
   }
 
-  var S = { tab: 'en', cache: {}, catQ: '', catOnlyEmpty: false, revQ: '', revOnlyPending: true,
+  var S = { tab: 'en', cache: {}, scoreCache: {}, catQ: '', catOnlyEmpty: false, revQ: '', revOnlyPending: true,
     bulkFactor: 1, bulkUndo: [],
     catType: '',
     oppQ: '', oppCountry: '', oppType: '', oppTier: '', oppStatus: '',
+    oppSort: 'default', oppTodoOnly: false, oppOverdueOnly: false, replyScenario: 'auto',
     oppLang: 'zh', oppTextZh: null, oppId: '' };
   var toastTimer = null;
 
@@ -67,7 +68,7 @@
 
   function openModal(html, wide) {
     document.getElementById('modal-root').innerHTML =
-      '<div class="modal-mask" data-mask="1"><div class="modal' + (wide ? ' wide' : '') + '">' + html + '</div></div>';
+      '<div class="modal-mask" data-mask="1"><div class="modal' + (wide ? ' wide' : '') + '" role="dialog" aria-modal="true">' + html + '</div></div>';
   }
 
   function closeModal() {
@@ -76,7 +77,7 @@
 
   function modalHead(title) {
     return '<div class="modal-hd"><div class="modal-title">' + esc(title) +
-      '</div><button class="icon-btn" data-action="close-modal">×</button></div>';
+      '</div><button class="icon-btn" data-action="close-modal" aria-label="关闭">×</button></div>';
   }
 
   function badge(status) {
@@ -107,7 +108,7 @@
     document.body.removeChild(ta);
   }
 
-  function invalidate() { S.cache = {}; }
+  function invalidate() { S.cache = {}; S.scoreCache = {}; }
 
   /* =========================================================
      商机分析
@@ -127,6 +128,400 @@
     }).filter(function (x) { return !!x.product; });
     S.cache[k] = res;
     return res;
+  }
+
+  /* =========================================================
+     阶段一：询盘解析结果（结构化展示 / 人工修正 / 待确认问题）
+
+     口径：Matching.parse 是主解析（匹配、报价都在用，不动它）；
+     P0Parse 补商品名、用途、规格、目的地与原文证据；
+     opp.parseEdits 是人工修正层，只覆盖解析展示与待确认问题，
+     其中数量/市场/交期/术语在保存时同步写回 quote/buyer 的真实字段。
+     ========================================================= */
+
+  function effectiveParsed(opp, a) {
+    var mp = (a && a.parsed) || {};
+    var p0 = null;
+    try { p0 = window.P0Parse ? window.P0Parse.extract(opp.rawText || '') : null; } catch (e) { p0 = null; }
+    var f = (p0 && p0.fields) || {};
+    var eff = {
+      productName: f.productName || '',
+      purpose: f.purpose || '',
+      qty: mp.qty || f.qty || 0,
+      targetPriceUsd: mp.targetPriceUsd || f.targetPriceUsd || 0,
+      country: mp.country || opp.buyer.country || '',
+      destination: f.destination || '',
+      leadTimeDays: mp.leadTimeDays || f.deadlineDays || 0,
+      deadlineText: f.deadlineText || '',
+      certs: (mp.certs && mp.certs.length ? mp.certs : f.certs) || [],
+      incoterm: mp.incoterm || f.incoterm || '',
+      models: mp.models || f.models || [],
+      types: mp.types || [],
+      specs: f.specs || [],
+      specsText: '',
+      productText: f.productText || '',
+      evidence: (p0 && p0.evidence) || {},
+      edited: {}
+    };
+    var ed = opp.parseEdits || {};
+    Object.keys(ed).forEach(function (k) { eff.edited[k] = true; });
+    if (ed.productName) eff.productName = ed.productName;
+    if (ed.purpose) eff.purpose = ed.purpose;
+    if (ed.qty) eff.qty = ed.qty;
+    if (ed.targetPriceUsd) eff.targetPriceUsd = ed.targetPriceUsd;
+    if (ed.country) eff.country = ed.country;
+    if (ed.destination) eff.destination = ed.destination;
+    if (ed.leadTimeDays) eff.leadTimeDays = ed.leadTimeDays;
+    if (ed.incoterm) eff.incoterm = ed.incoterm;
+    if (ed.certsText) eff.certs = ed.certsText.split(/[,，/、\s]+/).filter(Boolean);
+    if (ed.modelsText) eff.models = ed.modelsText.split(/[,，、\s]+/).filter(Boolean);
+    if (ed.specsText) eff.specsText = ed.specsText;
+    return eff;
+  }
+
+  /* 缺什么就问什么：问题给买家看的英文 + 给卖家看的中文，
+     只生成清单供人工复制发送，系统不自动发任何消息 */
+  function followQuestions(eff) {
+    var q = [];
+    if (!eff.productName && !eff.models.length) q.push({ must: true, zh: '确认具体商品 / 型号', en: 'Could you please share the exact product name or model number (a product photo would also help), so we can quote the right item?' });
+    if (!eff.qty) q.push({ must: true, zh: '确认采购数量', en: 'What quantity do you need for this order?' });
+    if (!eff.country && !eff.destination) q.push({ must: true, zh: '确认目的国 / 目的港', en: 'Which country and port should we ship the goods to?' });
+    if (!eff.leadTimeDays && !eff.deadlineText) q.push({ must: false, zh: '确认期望交期', en: 'When do you need the goods to be delivered?' });
+    if (!eff.certs.length) q.push({ must: false, zh: '确认认证要求', en: 'Do you need any certificates for your market, such as CE or RoHS?' });
+    if (!eff.purpose) q.push({ must: false, zh: '确认用途 / 销售渠道', en: 'May I know the end use or sales channel (retail, online selling, promotion, etc.)? It helps us recommend the right option and packing.' });
+    if (!eff.targetPriceUsd) q.push({ must: false, zh: '试探目标价位', en: 'Do you have a target price range in mind for this product?' });
+    return q;
+  }
+
+  function parseCard(opp, a, effIn) {
+    var eff = effIn || effectiveParsed(opp, a);
+    function row(label, value, editKey, evKey) {
+      var v = value
+        ? '<span class="pv-val">' + esc(value) + '</span>' + (editKey && eff.edited[editKey] ? ' <span class="badge amber">已修正</span>' : '')
+        : '<span class="pv-none">未识别</span>';
+      var ev = evKey && eff.evidence[evKey]
+        ? '<div class="pv-ev">原文：' + esc(eff.evidence[evKey]) + '</div>' : '';
+      return '<div class="pv-row"><div class="pv-label">' + label + '</div>' +
+        '<div class="pv-main">' + v + ev + '</div></div>';
+    }
+    var specsText = eff.specs.map(function (s) { return s.name + ' ' + s.value; }).join('；');
+    if (eff.specsText) specsText = specsText ? specsText + '；' + eff.specsText : eff.specsText;
+    var rows =
+      row('商品名称', eff.productName, 'productName', 'productName') +
+      row('型号', eff.models.join(' / '), 'modelsText', 'model') +
+      row('品类', eff.types.join(' / '), '', '') +
+      row('数量', eff.qty ? eff.qty.toLocaleString() + ' pcs' : '', 'qty', 'qty') +
+      row('目标价', eff.targetPriceUsd ? C.usd(eff.targetPriceUsd) : '', 'targetPriceUsd', 'targetPriceUsd') +
+      row('目标市场', eff.country, 'country', '') +
+      row('目的地', eff.destination, 'destination', 'destination') +
+      row('交期', eff.leadTimeDays ? eff.leadTimeDays + ' 天' : (eff.deadlineText || ''), 'leadTimeDays', 'deadlineDays') +
+      row('贸易术语', eff.incoterm, 'incoterm', 'incoterm') +
+      row('认证', eff.certs.join(' / '), 'certsText', '') +
+      row('规格', specsText, 'specsText', '') +
+      row('用途', eff.purpose, 'purpose', 'purpose');
+
+    var qs = followQuestions(eff);
+    var qHtml = '';
+    if (qs.length) {
+      qHtml = '<div class="pv-questions"><div class="pv-q-title">需要向买家确认（' + qs.length + ' 项）</div>' +
+        qs.map(function (x) {
+          return '<div class="pv-q"><span class="badge ' + (x.must ? 'red' : 'gray') + '">' +
+            (x.must ? '必问' : '可选') + '</span><div><div>' + esc(x.zh) + '</div>' +
+            '<div class="pv-q-en">' + esc(x.en) + '</div></div></div>';
+        }).join('') +
+        '<div class="row" style="margin-top:10px"><button class="btn sm" data-action="copy-questions" data-id="' + opp.id + '">复制全部问题（英文）</button>' +
+        '<span class="card-sub">复制后由你粘贴到阿里后台发送，系统不会自动发消息</span></div></div>';
+    } else {
+      qHtml = '<div class="pv-questions"><span class="badge green">信息完整</span> <span style="font-size:12px;color:var(--ink-2)">关键字段都识别到了，没有必须向买家补问的项。</span></div>';
+    }
+
+    return '<section class="card"><div class="card-hd">' +
+      '<div class="card-title">解析结果<span class="card-sub">自动识别 + 原文证据，识别错了可以修正</span></div>' +
+      '<button class="btn sm" data-action="edit-parsed" data-id="' + opp.id + '">修正解析</button></div>' +
+      '<div class="card-bd"><div class="pv-grid">' + rows + '</div>' + qHtml + '</div></section>';
+  }
+
+  function openEditParsed(id) {
+    var opp = oppById(id);
+    if (!opp) return;
+    var eff = effectiveParsed(opp, analyzeOpp(opp));
+    function fld(label, inputHtml, hint) {
+      return '<div class="field"><label>' + label + '</label>' + inputHtml +
+        (hint ? '<div class="hint">' + hint + '</div>' : '') + '</div>';
+    }
+    function txt(idAttr, val, ph) {
+      return '<input type="text" id="' + idAttr + '" value="' + esc(val || '') + '" placeholder="' + esc(ph || '') + '">';
+    }
+    function numI(idAttr, val, ph) {
+      return '<input type="number" min="0" step="any" id="' + idAttr + '" value="' + (val || '') + '" placeholder="' + esc(ph || '') + '">';
+    }
+    var html = modalHead('修正解析结果') +
+      '<div class="modal-bd">' +
+      '<div class="alert info" style="margin-bottom:12px"><span class="ic">i</span><div>' +
+      '只改识别错的字段就行，<strong>留空 = 恢复自动识别</strong>。数量、市场、交期、术语保存时会同步到报价与买家信息；其余字段用于解析展示和待确认问题。</div></div>' +
+      '<div class="form-grid">' +
+      fld('商品名称', txt('pp-name', eff.productName, '如 TWS bluetooth earbuds')) +
+      fld('型号（多个用 / 分开）', txt('pp-models', eff.models.join(' / '), '如 ES900')) +
+      fld('数量 (pcs)', numI('pp-qty', eff.qty)) +
+      fld('目标价 (USD)', numI('pp-price', eff.targetPriceUsd)) +
+      fld('目标市场 / 国家', txt('pp-country', eff.country, '如 德国')) +
+      fld('目的地 / 港口', txt('pp-dest', eff.destination, '如 Hamburg')) +
+      fld('交期（天）', numI('pp-lead', eff.leadTimeDays)) +
+      fld('贸易术语', txt('pp-incoterm', eff.incoterm, '如 FOB / CIF')) +
+      fld('认证（多个用 / 分开）', txt('pp-certs', eff.certs.join(' / '), '如 CE / RoHS')) +
+      fld('用途 / 销售渠道', txt('pp-purpose', eff.purpose, '如 零售转售 / 电商销售 / 自用')) +
+      '<div class="field full"><label>规格补充</label>' +
+      '<input type="text" id="pp-specs" value="' + esc(eff.specsText || '') + '" placeholder="自动识别的规格会照常显示，这里只填要补充的，如 壳体颜色：曜石黑"></div>' +
+      '</div></div>' +
+      '<div class="modal-ft">' +
+      '<button class="btn ghost" data-action="close-modal">取消</button>' +
+      '<button class="btn primary" data-action="save-parsed" data-id="' + opp.id + '">保存修正</button>' +
+      '</div>';
+    openModal(html, true);
+  }
+
+  function saveParsed(id) {
+    var opp = oppById(id);
+    if (!opp) return;
+    function v(attr) { var el = document.getElementById(attr); return el ? el.value.trim() : ''; }
+    function n(attr) { var x = parseFloat(v(attr)); return isFinite(x) && x > 0 ? x : 0; }
+    var ed = {};
+    if (v('pp-name')) ed.productName = v('pp-name');
+    if (v('pp-models')) ed.modelsText = v('pp-models');
+    if (n('pp-qty')) ed.qty = Math.round(n('pp-qty'));
+    if (n('pp-price')) ed.targetPriceUsd = Math.round(n('pp-price') * 100) / 100;
+    if (v('pp-country')) ed.country = v('pp-country');
+    if (v('pp-dest')) ed.destination = v('pp-dest');
+    if (n('pp-lead')) ed.leadTimeDays = Math.round(n('pp-lead'));
+    if (v('pp-incoterm')) ed.incoterm = v('pp-incoterm').toUpperCase();
+    if (v('pp-certs')) ed.certsText = v('pp-certs');
+    if (v('pp-purpose')) ed.purpose = v('pp-purpose');
+    if (v('pp-specs')) ed.specsText = v('pp-specs');
+    opp.parseEdits = ed;
+    /* 有真实落点的字段同步写回，避免解析卡和报价口径各说各话 */
+    if (ed.qty) opp.quote.qty = ed.qty;
+    if (ed.country) opp.buyer.country = ed.country;
+    if (ed.leadTimeDays) opp.quote.leadTimeDays = ed.leadTimeDays;
+    if (ed.incoterm) opp.quote.incoterm = ed.incoterm;
+    C.addLog(opp, '人工修正解析结果' + (Object.keys(ed).length ? '：' + Object.keys(ed).join('、') : '（全部恢复自动识别）'));
+    closeModal();
+    invalidate();
+    C.persist();
+    render();
+    toast(Object.keys(ed).length ? '解析修正已保存' : '已恢复自动识别');
+  }
+
+  /* =========================================================
+     阶段三：商机价值判断（OppScore）
+
+     评分输入 = 有效解析（人工修正优先）+ SmartMatch 结果 + 商机自身进展，
+     每次渲染实时重算：解析被修正、选品变化后分数自动更新。
+     人工判断（valueNote）只改「有效优先级」的展示与排序，不改系统原始分。
+     ========================================================= */
+
+  function scoreForOpp(o) {
+    if (!window.OppScore || !window.SmartMatch) return null;
+    var key = o.id + '|' + (o.updatedAt || '') + '|' + (o.selectedProductId || '');
+    if (S.scoreCache[key]) return S.scoreCache[key];
+    var a = analyzeOpp(o);
+    var eff = effectiveParsed(o, a);
+    var pool = a.ordered.slice(0, 10);
+    if (o.selectedProductId && !pool.some(function (x) { return x.product.id === o.selectedProductId; })) {
+      var sp = productById(o.selectedProductId);
+      if (sp) pool.push({ product: sp, match: null });
+    }
+    var ranked = window.SmartMatch.rank(eff, o.rawText || '', pool);
+    var pick = null;
+    if (o.selectedProductId) ranked.forEach(function (x) { if (x.product.id === o.selectedProductId) pick = x; });
+    if (!pick) pick = ranked[0] || null;
+    var res = window.OppScore.score({
+      opp: o, eff: eff,
+      match: pick ? { score: pick.result.score, keyConflict: pick.result.keyConflict } : null,
+      matchLabel: pick ? (o.selectedProductId === pick.product.id ? '已选商品' : '最佳候选') : '',
+      moq: pick ? (pick.product.moq || 0) : 0
+    });
+    res.eff = eff;
+    res.pick = pick;
+    S.scoreCache[key] = res;
+    return res;
+  }
+
+  /* 有效优先级：人工标了重点/搁置就按人工的来，并明确标注是人工判断 */
+  function effLevelOf(o, res) {
+    if (!res || res.level === 'closed') return { level: res ? res.level : 'low', label: res ? res.levelLabel : '', manual: false };
+    var v = o.valueNote && o.valueNote.verdict;
+    if (v === 'focus') return { level: 'high', label: '高优先级', manual: true };
+    if (v === 'defer') return { level: 'low', label: '低优先级', manual: true };
+    return { level: res.level, label: res.levelLabel, manual: false };
+  }
+
+  function oppScoreCard(opp) {
+    var res = scoreForOpp(opp);
+    if (!res) return '';
+    var el = effLevelOf(opp, res);
+    var badgeCls = el.level === 'high' ? 'red' : el.level === 'mid' ? 'amber' : 'gray';
+    var dims = res.dims.map(function (d) {
+      var pct = d.max ? Math.round(d.score / d.max * 100) : 0;
+      return '<div class="os-dim"><div class="os-dim-hd"><span>' + d.label + '</span>' +
+        '<b>' + d.score + ' / ' + d.max + '</b></div>' +
+        '<div class="os-bar"><div style="width:' + pct + '%"></div></div>' +
+        '<div class="os-why">' + d.reasons.map(esc).join('；') + '</div></div>';
+    }).join('');
+    var changes = res.changeFactors.length
+      ? '<div class="os-sec"><div class="os-sec-t">哪些信息可能改变评分</div>' +
+        res.changeFactors.map(function (c) {
+          return '<div class="os-change">' + esc(c.text) + '<span>' + esc(c.gain) + '</span></div>';
+        }).join('') + '</div>'
+      : '';
+    var qCount = followQuestions(res.eff).length;
+    var vn = opp.valueNote || {};
+    var vnText = vn.verdict
+      ? '<div style="font-size:12px;color:var(--ink-2);margin-top:6px">你的人工判断：<b>' +
+        ({ focus: '重点跟进', normal: '正常跟进', defer: '暂时搁置' })[vn.verdict] + '</b>' +
+        (vn.note ? ' · ' + esc(vn.note) : '') +
+        (vn.at ? ' <span style="color:var(--ink-3)">' + C.fmtDate(vn.at, true) + '</span>' : '') + '</div>'
+      : '';
+    return '<section class="card"><div class="card-hd">' +
+      '<div class="card-title">价值判断<span class="card-sub">规则评分，代表处理优先级，不是成交概率</span></div>' +
+      '<span class="badge ' + badgeCls + '">' + el.label + ' · ' + res.total + ' 分' + (el.manual ? '（人工）' : '') + '</span></div>' +
+      '<div class="card-bd">' +
+      '<div class="os-action"><div><b>推荐下一步：</b>' + esc(res.action) + '</div>' +
+      '<div style="margin-top:4px"><b>为什么现在处理：</b>' + esc(res.whyNow) + '</div>' +
+      (qCount ? '<div style="margin-top:4px">还有 ' + qCount + ' 个待确认问题，清单在下方「解析结果」卡里，可一键复制发给买家。</div>' : '') +
+      '</div>' +
+      '<div class="os-grid">' + dims + '</div>' +
+      changes +
+      '<div class="os-sec"><div class="os-sec-t">记录人工判断</div>' +
+      '<div class="row" style="gap:8px">' +
+      '<select id="vn-verdict" style="width:150px;flex:none">' +
+      '<option value="">按系统评分</option>' +
+      ['focus', 'normal', 'defer'].map(function (v) {
+        return '<option value="' + v + '"' + (vn.verdict === v ? ' selected' : '') + '>' +
+          ({ focus: '重点跟进', normal: '正常跟进', defer: '暂时搁置' })[v] + '</option>';
+      }).join('') + '</select>' +
+      '<input type="text" id="vn-note" style="flex:1;min-width:140px" maxlength="200" placeholder="备注：为什么这样判断（可选）" value="' + esc(vn.note || '') + '">' +
+      '<button class="btn sm" data-action="save-value-note" data-id="' + opp.id + '">保存判断</button>' +
+      '</div>' + vnText +
+      '<div style="font-size:11px;color:var(--ink-3);margin-top:8px">评分按当前解析与匹配结果实时计算 · 更新于 ' + C.fmtDate(res.computedAt, true) + '；商机状态仍用页面顶部按钮调整（标记已报价 / 成交 / 丢单）。</div>' +
+      '</div></div></section>';
+  }
+
+  function saveValueNote(id) {
+    var opp = oppById(id);
+    if (!opp) return;
+    var sel = document.getElementById('vn-verdict');
+    var noteEl = document.getElementById('vn-note');
+    var verdict = sel ? sel.value : '';
+    var note = noteEl ? noteEl.value.trim() : '';
+    opp.valueNote = verdict ? { verdict: verdict, note: note, at: C.nowIso() } : null;
+    C.addLog(opp, verdict ? '记录人工判断：' + ({ focus: '重点跟进', normal: '正常跟进', defer: '暂时搁置' })[verdict] + (note ? '（' + note + '）' : '') : '清除人工判断，恢复系统评分');
+    S.scoreCache = {};
+    C.persist();
+    render();
+    toast('人工判断已保存');
+  }
+
+  /* =========================================================
+     阶段四：AI 回复助手（ReplyAssistant）
+
+     输入全部来自已落地的管线：有效解析 + SmartMatch + 现有报价结果。
+     价格只在现有定价不低于底价时才传给生成器；草稿按场景存
+     opp.replyDrafts，人工编辑后刷新保留；本卡只生成草稿，永不发送。
+     ========================================================= */
+
+  function replyGenFor(opp, ctx) {
+    if (!window.ReplyAssistant) return null;
+    var res = scoreForOpp(opp);
+    var pick = res && res.pick;
+    var pr = ctx && ctx.pricing;
+    var price = (pr && pr.unitPriceUsd > 0 && pr.floorUsd > 0 && pr.unitPriceUsd >= pr.floorUsd)
+      ? { unit: pr.unitPriceUsd, floor: pr.floorUsd } : null;
+    return window.ReplyAssistant.generate({
+      opp: opp,
+      eff: res ? res.eff : effectiveParsed(opp, ctx),
+      product: ctx ? ctx.product : null,
+      match: pick ? { score: pick.result.score, keyConflict: pick.result.keyConflict, conflicts: pick.result.conflicts } : null,
+      price: price,
+      sellerName: st().settings.sellerName || '',
+      scenario: S.replyScenario
+    });
+  }
+
+  function replyAssistantCard(opp, ctx) {
+    var gen = replyGenFor(opp, ctx);
+    if (!gen) return '';
+    var saved = (opp.replyDrafts || {})[gen.scenario] || null;
+    var en = saved ? saved.en : gen.en;
+    var zh = saved ? saved.zh : gen.zh;
+    var stale = saved && opp.updatedAt && saved.at && new Date(opp.updatedAt) > new Date(saved.at);
+    var warnHtml = gen.warnings.length
+      ? gen.warnings.map(function (w) {
+        return '<div class="alert danger" style="margin-bottom:8px"><span class="ic">!</span><div>' + esc(w) + '</div></div>';
+      }).join('')
+      : '';
+    var uncHtml = gen.unconfirmed.length
+      ? '<div class="sm-list mute"><span class="sm-list-t">尚未确认：</span>' + gen.unconfirmed.map(esc).join('；') + '</div>'
+      : '';
+    return '<section class="card"><div class="card-hd">' +
+      '<div class="card-title">AI 回复助手<span class="card-sub">只生成草稿，不自动发送；内容只用已确认的商品信息</span></div>' +
+      '<select id="ra-scenario" style="width:auto;height:32px">' +
+      '<option value="auto"' + (S.replyScenario === 'auto' ? ' selected' : '') + '>自动场景（当前：' + gen.scenarioLabel + '）</option>' +
+      window.ReplyAssistant.SCENARIOS.map(function (s) {
+        return '<option value="' + s.key + '"' + (S.replyScenario === s.key ? ' selected' : '') + '>' + s.label + '</option>';
+      }).join('') + '</select></div>' +
+      '<div class="card-bd">' + warnHtml +
+      '<div class="os-action"><div><b>回复目的：</b>' + esc(gen.purpose) + '</div>' +
+      '<div style="margin-top:4px"><b>谈判策略（' + esc(gen.strategyLabel) + '）：</b>' + esc(gen.strategy) + '</div>' +
+      uncHtml + '</div>' +
+      '<div style="margin-top:12px;font-size:12px;color:var(--ink-3)">' +
+      (saved
+        ? '已保存草稿 · ' + C.fmtDate(saved.at, true) + (saved.edited ? ' · 已人工编辑' : '') + (stale ? ' · <b style="color:#8a5209">询盘信息在此之后有更新，建议重新生成</b>' : '')
+        : '当前是实时生成的预览，编辑后点「保存编辑」才会存下来') +
+      '</div>' +
+      '<label style="margin-top:10px">英文正文（发给买家的就是这份）</label>' +
+      '<textarea id="ra-en" style="min-height:170px">' + esc(en) + '</textarea>' +
+      '<label style="margin-top:10px">中文对照（只给你看，不发送）</label>' +
+      '<textarea id="ra-zh" style="min-height:150px">' + esc(zh) + '</textarea>' +
+      '<div class="row" style="gap:8px;margin-top:12px">' +
+      '<button class="btn primary" data-action="ra-generate" data-id="' + opp.id + '">' + (saved ? '重新生成' : '生成并保存') + '</button>' +
+      '<button class="btn" data-action="ra-save" data-id="' + opp.id + '">保存编辑</button>' +
+      '<button class="btn" data-action="ra-copy" data-id="' + opp.id + '">复制英文</button>' +
+      (saved ? '<button class="btn" data-action="ra-sent-open" data-id="' + opp.id + '">记为已发送跟进</button>' : '') +
+      '<span style="font-size:11.5px;color:var(--ink-3)">复制后到阿里后台粘贴发送，发送动作始终由你完成；发完回来点「记为已发送跟进」留痕</span>' +
+      '</div></div></section>';
+  }
+
+  function raGenerate(id) {
+    var opp = oppById(id);
+    if (!opp) return;
+    var ctx = analyzeOpp(opp);
+    var gen = replyGenFor(opp, ctx);
+    if (!gen) return;
+    opp.replyDrafts = opp.replyDrafts || {};
+    opp.replyDrafts[gen.scenario] = { en: gen.en, zh: gen.zh, edited: false, at: C.nowIso() };
+    C.addLog(opp, 'AI 回复助手生成草稿：' + gen.scenarioLabel + '（策略：' + gen.strategyLabel + '，未发送）');
+    S.scoreCache = {};
+    C.persist();
+    render();
+    toast('草稿已生成并保存（未发送）');
+  }
+
+  function raSave(id) {
+    var opp = oppById(id);
+    if (!opp) return;
+    var ctx = analyzeOpp(opp);
+    var gen = replyGenFor(opp, ctx);
+    if (!gen) return;
+    var enEl = document.getElementById('ra-en');
+    var zhEl = document.getElementById('ra-zh');
+    if (!enEl) return;
+    var en = enEl.value, zh = zhEl ? zhEl.value : '';
+    opp.replyDrafts = opp.replyDrafts || {};
+    opp.replyDrafts[gen.scenario] = { en: en, zh: zh, edited: en !== gen.en || zh !== gen.zh, at: C.nowIso() };
+    C.addLog(opp, '保存回复草稿编辑：' + gen.scenarioLabel);
+    C.persist();
+    render();
+    toast('草稿编辑已保存');
   }
 
   /* 补齐默认值：选品、数量、成本、单价 */
@@ -749,6 +1144,15 @@
       if (S.oppType && c.type !== S.oppType) return false;
       if (S.oppTier && c.tier !== S.oppTier) return false;
       if (S.oppStatus && c.status !== S.oppStatus) return false;
+      if (S.oppTodoOnly) {
+        if (o.status === 'won' || o.status === 'lost') return false;
+        var fs = W.followState(o, s.settings);
+        if (!(o.status === 'new' || (fs && (fs.overdue || fs.today)))) return false;
+      }
+      if (S.oppOverdueOnly) {
+        if (!window.FollowUp) return false;
+        if (window.FollowUp.dueState(o, Date.now()).state !== 'overdue') return false;
+      }
       if (S.oppQ) {
         var hay = [o.buyer.name, o.buyer.company, o.buyer.country, o.rawText].join(' ').toLowerCase();
         var words = S.oppQ.toLowerCase().split(/\s+/).filter(Boolean);
@@ -759,12 +1163,42 @@
   }
 
   function oppRows() {
-    var list = oppFiltered().slice().sort(function (a, b) {
-      var order = { new: 0, matched: 1, quoted: 2, won: 3, lost: 4 };
-      var d = (order[a.status] || 9) - (order[b.status] || 9);
-      if (d !== 0) return d;
-      return new Date(b.createdAt) - new Date(a.createdAt);
-    });
+    var list = oppFiltered().slice();
+    if (S.oppSort === 'priority') {
+      var rank = { high: 0, mid: 1, low: 2, closed: 3 };
+      list.sort(function (a, b) {
+        var ra = scoreForOpp(a), rb = scoreForOpp(b);
+        var la = rank[effLevelOf(a, ra).level], lb = rank[effLevelOf(b, rb).level];
+        if (la !== lb) return la - lb;
+        var ta = ra ? ra.total : 0, tb = rb ? rb.total : 0;
+        if (tb !== ta) return tb - ta;
+        return new Date(b.updatedAt || b.createdAt) - new Date(a.updatedAt || a.createdAt);
+      });
+    } else if (S.oppSort === 'follow' && window.FollowUp) {
+      list.sort(function (a, b) {
+        var ra = window.FollowUp.sortRank(a, Date.now());
+        var rb = window.FollowUp.sortRank(b, Date.now());
+        if (ra[0] !== rb[0]) return ra[0] - rb[0];
+        if (ra[1] !== rb[1]) return ra[1] - rb[1];
+        return new Date(b.updatedAt || b.createdAt) - new Date(a.updatedAt || a.createdAt);
+      });
+    } else if (S.oppSort === 'recent') {
+      list.sort(function (a, b) {
+        var ca = (a.status === 'won' || a.status === 'lost') ? 1 : 0;
+        var cb = (b.status === 'won' || b.status === 'lost') ? 1 : 0;
+        if (ca !== cb) return ca - cb;
+        var ka = new Date(a.lastTouchAt || a.lastContactAt || a.updatedAt || a.createdAt);
+        var kb = new Date(b.lastTouchAt || b.lastContactAt || b.updatedAt || b.createdAt);
+        return kb - ka;
+      });
+    } else {
+      list.sort(function (a, b) {
+        var order = { new: 0, matched: 1, quoted: 2, won: 3, lost: 4 };
+        var d = (order[a.status] || 9) - (order[b.status] || 9);
+        if (d !== 0) return d;
+        return new Date(b.createdAt) - new Date(a.createdAt);
+      });
+    }
 
     if (!list.length) {
       return '<tr><td colspan="7"><div class="empty">没有符合条件的商机</div></td></tr>';
@@ -777,10 +1211,29 @@
       var tierCls = c.tier === '大单' ? 'green' : c.tier === '批量单' ? 'green' :
         c.tier === '小批量' ? 'amber' : 'gray';
 
+      var sc = scoreForOpp(o);
+      var scEl = sc ? effLevelOf(o, sc) : null;
+      var scBadge = scEl && scEl.level !== 'closed'
+        ? ' <span class="badge ' + (scEl.level === 'high' ? 'red' : scEl.level === 'mid' ? 'amber' : 'gray') + '" title="价值评分 ' + sc.total + '（规则优先级分）">' +
+          ({ high: '高优先', mid: '中优先', low: '低优先' })[scEl.level] + ' ' + sc.total + '</span>'
+        : '';
+      var fuLine = '';
+      if (window.FollowUp) {
+        var fuSt = window.FollowUp.deriveStatus(o);
+        var fuDue = window.FollowUp.dueState(o, Date.now());
+        if (fuSt === 'done') {
+          fuLine = '<br><span style="color:#8a919e;font-size:11px">跟进：已完成</span>';
+        } else {
+          var fuTxt = '跟进：' + window.FollowUp.statusLabel(fuSt) +
+            (o.followUpAt ? ' · 下次 ' + C.fmtDate(o.followUpAt) : ' · 未排下次');
+          if (fuDue.state === 'overdue') fuTxt += ' · 逾期 ' + fuDue.days + ' 天';
+          fuLine = '<br><span style="font-size:11px;color:' + (fuDue.state === 'overdue' ? '#b3352c' : '#8a919e') + '">' + esc(fuTxt) + '</span>';
+        }
+      }
       return '<tr>' +
-        '<td>' + badge(o.status) + followChip(o) + '</td>' +
+        '<td>' + badge(o.status) + followChip(o) + scBadge + '</td>' +
         '<td><strong>' + esc(o.buyer.name) + '</strong><br>' +
-        '<span style="color:#8a919e;font-size:11px">' + esc(o.buyer.company || '—') + '</span></td>' +
+        '<span style="color:#8a919e;font-size:11px">' + esc(o.buyer.company || '—') + '</span>' + fuLine + '</td>' +
         '<td>' + esc(c.country) + '<br><span style="color:#8a919e;font-size:11px">' + esc(o.buyer.channel || '') + '</span></td>' +
         '<td><span class="badge gray">' + esc(c.type) + '</span> ' +
         '<span class="badge ' + tierCls + '">' + esc(c.tier) + '</span></td>' +
@@ -865,6 +1318,12 @@
       oppSelect('opp-f-type', '全部品类', S.oppType, types.sort()) +
       oppSelect('opp-f-tier', '全部量级', S.oppTier, ['样品单', '小批量', '批量单', '大单', '未填数量']) +
       oppSelect('opp-f-status', '全部状态', S.oppStatus, ['new', 'matched', 'quoted', 'won', 'lost']) +
+      '<select id="opp-sort" style="width:auto;height:32px">' +
+      [['default', '默认排序'], ['priority', '按优先级'], ['recent', '按最近活动'], ['follow', '按跟进时间']].map(function (x) {
+        return '<option value="' + x[0] + '"' + (S.oppSort === x[0] ? ' selected' : '') + '>' + x[1] + '</option>';
+      }).join('') + '</select>' +
+      '<button class="btn sm' + (S.oppTodoOnly ? ' primary' : '') + '" data-action="toggle-todo">只看待跟进</button>' +
+      '<button class="btn sm' + (S.oppOverdueOnly ? ' primary' : '') + '" data-action="toggle-overdue">只看已逾期</button>' +
       '<span id="opp-count" style="color:#8a919e;font-size:12px">显示 ' + oppFiltered().length + ' / ' + s.opportunities.length + ' 条</span>' +
       '</div></div>';
 
@@ -1218,42 +1677,104 @@
       '</div></section>';
 
     /* ---- 匹配列表：只显示相关度够高的，避免一堆 0 分占地方 ---- */
-    var visibleMatches = a.ordered.filter(function (x) { return x.match.score >= 8 || x.match.modelHit; }).slice(0, 5);
-    if (!visibleMatches.length && a.ordered.length) visibleMatches = a.ordered.slice(0, 1);
-    var hiddenMatches = a.ordered.length - visibleMatches.length;
+    /* ---- 智能匹配（阶段二）：候选池仍来自现有 Matching，
+       排序与评分换成 SmartMatch 的多维规则分（人工修正优先），
+       自动选品与报价拦截仍走原有管线，不在这里改动 ---- */
+    var effP = effectiveParsed(opp, a);
+    var pool = a.ordered.slice(0, 10);
+    if (opp.selectedProductId && !pool.some(function (x) { return x.product.id === opp.selectedProductId; })) {
+      var selP = productById(opp.selectedProductId);
+      if (selP) pool.push({ product: selP, match: null });
+    }
+    var ranked = [];
+    if (window.SmartMatch && pool.length) {
+      ranked = window.SmartMatch.rank(effP, opp.rawText || '', pool);
+    } else {
+      ranked = pool.map(function (x) {
+        return { product: x.product, result: { score: x.match ? x.match.score : 0, level: '中', keyConflict: !!(x.match && x.match.hardFail), dims: {}, hits: x.match ? (x.match.reasons || []) : [], conflicts: x.match ? (x.match.gaps || []) : [], unconfirmed: [], questions: [] } };
+      });
+    }
+    var visibleRanked = ranked.slice(0, 5);
+    var hiddenRanked = ranked.length - visibleRanked.length;
 
-    var matchHtml = visibleMatches.length
-      ? visibleMatches.map(function (x) {
-        var sel = x.product.id === opp.selectedProductId;
-        var cls = x.match.score >= 80 ? 'hi' : x.match.score >= 55 ? 'mid' : 'lo';
+    function dimChips(r) {
+      var sym = { hit: '✓', part: '◐', conflict: '✗', unknown: '?', miss: '✗', na: '' };
+      var cls = { hit: 'good', part: '', conflict: 'bad', unknown: '', miss: 'bad', na: '' };
+      return Object.keys(r.dims || {}).map(function (k) {
+        var d = r.dims[k];
+        if (!d || d.status === 'na') return '';
+        return '<span class="chip ' + cls[d.status] + '">' + d.label + ' ' + sym[d.status] +
+          (d.max ? ' ' + d.score + '/' + d.max : '') + '</span>';
+      }).join('');
+    }
+    function listHtml(title, items, cls, limit) {
+      if (!items || !items.length) return '';
+      var show = items.slice(0, limit);
+      var more = items.length - show.length;
+      return '<div class="sm-list ' + cls + '"><span class="sm-list-t">' + title + '</span>' +
+        show.map(esc).join('；') + (more > 0 ? '；等 ' + items.length + ' 项' : '') + '</div>';
+    }
+
+    var matchHtml = visibleRanked.length
+      ? visibleRanked.map(function (x) {
+        var p = x.product, r = x.result;
+        var sel = p.id === opp.selectedProductId;
+        var cls = r.keyConflict ? 'conflict' : r.level === '高' ? 'hi' : r.level === '中' ? 'mid' : 'lo';
+        var base = pool.filter(function (y) { return y.product.id === p.id; })[0];
         var tags = [];
-        if (x.match.modelHit) tags.push('<span class="chip good">型号 ' + esc(x.match.model || '') + '</span>');
-        else if (x.match.hardFail) tags.push('<span class="chip bad">型号不符</span>');
-        if (x.match.hardFail) tags.push('<span class="chip bad">不可报价</span>');
-        else if (x.match.quotable) tags.push('<span class="chip good">可报价</span>');
-        else tags.push('<span class="chip bad">待补成本</span>');
-        x.match.gaps.forEach(function (g) { tags.push('<span class="chip bad">' + esc(g) + '</span>'); });
-
+        if (base && base.match) {
+          if (base.match.hardFail) tags.push('<span class="chip bad">不可报价</span>');
+          else if (base.match.quotable) tags.push('<span class="chip good">可报价</span>');
+          else tags.push('<span class="chip bad">待补成本</span>');
+        }
+        if (sel) tags.push('<span class="chip good">已选为报价商品</span>');
+        if (r.keyConflict) tags.push('<span class="chip bad">关键冲突</span>');
         return '<div class="match-item' + (sel ? ' selected' : '') + '" data-action="select-product" data-id="' +
-          x.product.id + '" data-opp="' + opp.id + '">' +
-          '<div class="match-score ' + cls + '">' + x.match.score + '</div>' +
+          p.id + '" data-opp="' + opp.id + '" title="点击选为报价商品">' +
+          '<div class="match-score ' + cls + '">' + r.score + '</div>' +
           '<div class="match-body">' +
-          '<div class="match-name">' + esc(x.product.title) + '</div>' +
-          '<div class="match-sku">' + esc(x.product.sku) + ' · ' + esc(x.product.category) +
-          ' · ' + (x.product.priceFloorUsd > 0 ? C.usd(x.product.priceFloorUsd) + '–' + C.usd(x.product.priceUsd) : '橱窗价 ' + C.usd(x.product.priceUsd)) + ' · MOQ ' + x.product.moq + '</div>' +
-          '<div class="chips" style="margin-top:6px">' + tags.join('') + '</div>' +
-          '<div class="match-reasons">命中：' + (x.match.reasons.length ? esc(x.match.reasons.join('、')) : '—') + '</div>' +
+          '<div class="match-name">' + esc(p.title) +
+          ' <span class="badge ' + (r.level === '高' ? 'green' : r.level === '中' ? 'amber' : 'gray') + '">匹配' + r.level + '</span></div>' +
+          '<div class="match-sku">' + esc(p.sku) + ' · ' + esc(p.category) +
+          ' · ' + (p.priceFloorUsd > 0 ? C.usd(p.priceFloorUsd) + '–' + C.usd(p.priceUsd) : '橱窗价 ' + C.usd(p.priceUsd)) + ' · MOQ ' + p.moq + '</div>' +
+          '<div class="chips" style="margin-top:6px">' + dimChips(r) + tags.join('') + '</div>' +
+          listHtml('符合：', r.hits, 'ok', 4) +
+          listHtml('不符合：', r.conflicts, 'bad', 4) +
+          listHtml('未确认：', r.unconfirmed, 'mute', 3) +
+          listHtml('需确认：', r.questions, 'warn', 2) +
           '</div></div>';
       }).join('') +
-      (hiddenMatches > 0
+      (hiddenRanked > 0
         ? '<div style="padding:10px 14px;font-size:11.5px;color:var(--ink-3);border-top:1px solid #f0f1f4">' +
-        '另外 ' + hiddenMatches + ' 个商品相关度太低，已隐藏</div>'
+        '另外 ' + hiddenRanked + ' 个候选匹配度较低，已折叠</div>'
         : '')
       : '<div class="empty"><strong>没有匹配到商品</strong>可能是品类不在你的橱窗里，先到「商品库」补充。</div>';
 
+    /* 匹配依据来源：人工修正过的字段明确标注，与原文冲突时以修正为准 */
+    var srcBits = [];
+    function srcBit(label, present, editKey) {
+      if (present) srcBits.push(label + '（' + (effP.edited[editKey] ? '人工修正' : '自动识别') + '）');
+    }
+    srcBit('商品名', !!effP.productName, 'productName');
+    srcBit('型号', effP.models.length > 0, 'modelsText');
+    srcBit('数量', effP.qty > 0, 'qty');
+    srcBit('规格', effP.specs.length > 0 || !!effP.specsText, 'specsText');
+    srcBit('认证', effP.certs.length > 0, 'certsText');
+    srcBit('用途', !!effP.purpose, 'purpose');
+    var selRanked = ranked.filter(function (x) { return x.product.id === opp.selectedProductId; })[0];
+    var selWarn = selRanked && selRanked.result.keyConflict
+      ? '<div class="alert danger" style="margin:12px 14px 0"><span class="ic">!</span><div>' +
+        '<strong>当前已选商品存在关键冲突：</strong>' + selRanked.result.conflicts.map(esc).join('；') +
+        '。建议先看下面候选重新选择，或人工核对后再报价。</div></div>'
+      : '';
+
     var matchCard = '<section class="card"><div class="card-hd">' +
-      '<div class="card-title">橱窗匹配<span class="card-sub">先看型号命中，再看匹配度</span></div>' +
-      '<span class="badge gray">' + visibleMatches.length + ' 个候选</span></div>' +
+      '<div class="card-title">智能匹配<span class="card-sub">规则匹配度，不是成交概率；点任意候选即选为报价商品</span></div>' +
+      '<span class="row" style="gap:8px"><span class="badge gray">' + visibleRanked.length + ' 个候选</span>' +
+      '<button class="btn sm" data-action="rematch" data-id="' + opp.id + '">重新匹配</button></span></div>' +
+      (srcBits.length ? '<div style="padding:10px 14px 0;font-size:11.5px;color:var(--ink-3)">匹配依据：' +
+        srcBits.map(esc).join(' · ') + '；原始询盘文本作辅助依据</div>' : '') +
+      selWarn +
       '<div class="card-bd tight">' + matchHtml + '</div></section>';
 
     /* ---- 数量阶梯 ---- */
@@ -1272,8 +1793,10 @@
 
     return '<div class="stack">' + head + quoteBannerHtml(opp) + '<div data-pf="verdict">' + verdictHtml(ctx) + '</div>' +
       '<div data-pf="judge">' + (window.Judge ? window.Judge.render(ctx) : '') + '</div>' +
+      oppScoreCard(opp) +
       '<div class="grid grid-2 top">' + left + right + '</div>' +
-      buyerCard(opp) + followCard(opp) + sandboxCard(ctx) + matchCard + extra + tabs + '</div>';
+      parseCard(opp, a, effP) +
+      buyerCard(opp) + followCard(opp) + sandboxCard(ctx) + matchCard + extra + replyAssistantCard(opp, ctx) + tabs + '</div>';
   }
 
   /* 详情页第一眼：能不能报、报多少、赚多少 */
@@ -1414,14 +1937,14 @@
       unitCostRmb: r.unitCostRmb, shippingRmb: r.unitShipRmb
     });
 
-    return '<table class="table"><thead><tr><th>数量</th><th class="num">建议单价</th>' +
+    return '<div class="table-wrap"><table class="table"><thead><tr><th>数量</th><th class="num">建议单价</th>' +
       '<th class="num">成本合计</th><th class="num">这一单赚</th></tr></thead><tbody>' +
       rows.map(function (x) {
         return '<tr><td>' + x.qty.toLocaleString() + ' pcs</td>' +
           '<td class="num">' + C.usd(x.unitPriceUsd) + '</td>' +
           '<td class="num" style="color:#8a919e">' + C.money(x.costTotalRmb) + '</td>' +
           '<td class="num" style="color:' + (x.netRmb < 0 ? '#d92d20' : '#0f9d58') + '">' + C.money(x.netRmb) + '</td></tr>';
-      }).join('') + '</tbody></table>';
+      }).join('') + '</tbody></table></div>';
   }
 
   function sensHtml(ctx) {
@@ -1433,12 +1956,12 @@
       unitCostRmb: r.unitCostRmb, shippingRmb: r.unitShipRmb,
       unitPriceUsd: ctx.opp.quote.unitPriceUsd
     });
-    return '<table class="table"><thead><tr><th>报价变动</th><th class="num">单价</th><th class="num">这一单赚</th></tr></thead><tbody>' +
+    return '<div class="table-wrap"><table class="table"><thead><tr><th>报价变动</th><th class="num">单价</th><th class="num">这一单赚</th></tr></thead><tbody>' +
       rows.map(function (x) {
         return '<tr><td>' + (x.delta > 0 ? '+' : '') + (x.delta * 100).toFixed(0) + '%</td>' +
           '<td class="num">' + C.usd(x.unitPriceUsd) + '</td>' +
           '<td class="num" style="color:' + (x.belowCost ? '#d92d20' : '#0f9d58') + '">' + C.money(x.netRmb) + '</td></tr>';
-      }).join('') + '</tbody></table>';
+      }).join('') + '</tbody></table></div>';
   }
   function tabBtn(key, label, opp) {
     return '<button class="tab' + (S.tab === key ? ' active' : '') + '" data-action="tab" data-tab="' + key +
@@ -1490,9 +2013,9 @@
 
     if (S.tab === 'log') {
       if (!opp.log || !opp.log.length) return '<div class="empty">暂无记录</div>';
-      return '<table class="table"><tbody>' + opp.log.map(function (l) {
+      return '<div class="table-wrap"><table class="table"><tbody>' + opp.log.map(function (l) {
         return '<tr><td style="width:150px;color:#8a919e">' + C.fmtDate(l.ts, true) + '</td><td>' + esc(l.text) + '</td></tr>';
-      }).join('') + '</tbody></table>';
+      }).join('') + '</tbody></table></div>';
     }
 
     return '';
@@ -1657,7 +2180,7 @@
       '<input type="checkbox" id="cat-only-empty" ' + (S.catOnlyEmpty ? 'checked' : '') + ' style="width:auto;height:auto"> 只看没填成本的</label>' +
       '</div></div>' +
       '<div class="card-bd tight" style="margin-top:10px"><div class="table-wrap">' +
-      '<table class="table"><thead><tr><th>品类</th><th>商品</th><th class="num">阿里挂牌价</th><th class="num">市场价 ¥</th>' +
+      '<table class="table wide"><thead><tr><th>品类</th><th>商品</th><th class="num">阿里挂牌价</th><th class="num">市场价 ¥</th>' +
       '<th class="num">1688价 ¥</th><th class="num">别家价 ¥</th>' +
       '<th class="num">保本价 $</th><th class="num">建议售价 $</th><th>判断</th><th></th></tr></thead>' +
       '<tbody id="cat-body">' + catalogRows(S.catQ, S.catOnlyEmpty) + '</tbody></table>' +
@@ -2383,6 +2906,15 @@
      交互：点击
      ========================================================= */
 
+  /* Esc 关闭弹窗：在输入框/文本域里不拦截，避免编辑中误关丢内容 */
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape') return;
+    var t = e.target;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) return;
+    var root = document.getElementById('modal-root');
+    if (root && root.innerHTML) closeModal();
+  });
+
   document.addEventListener('click', function (e) {
     if (e.target && e.target.classList && e.target.classList.contains('modal-mask')) {
       closeModal();
@@ -2427,6 +2959,33 @@
       case 'open-help': openHelp(); break;
       case 'goto-settings': closeModal(); location.hash = '#/settings'; break;
       case 'edit-opp': openEditOpp(id); break;
+      case 'edit-parsed': openEditParsed(id); break;
+      case 'rematch': S.scoreCache = {}; invalidate(); render(); toast('已按当前解析结果重新匹配'); break;
+      case 'save-value-note': saveValueNote(id); break;
+      case 'ra-generate': raGenerate(id); break;
+      case 'ra-save': raSave(id); break;
+      case 'ra-copy': { var raEl = document.getElementById('ra-en'); if (raEl) copyText(raEl.value); break; }
+      case 'ra-sent-open': openSentConfirm(id); break;
+      case 'ra-sent-confirm': doSentConfirm(id); break;
+      case 'follow-edit': openFollowEdit(id, btn.getAttribute('data-rid')); break;
+      case 'follow-edit-save': saveFollowEdit(id, btn.getAttribute('data-rid')); break;
+      case 'follow-del': askFollowDelete(id, btn.getAttribute('data-rid')); break;
+      case 'follow-del-confirm': doFollowDelete(id, btn.getAttribute('data-rid')); break;
+      case 'toggle-todo': S.oppTodoOnly = !S.oppTodoOnly; render(); break;
+      case 'toggle-overdue': S.oppOverdueOnly = !S.oppOverdueOnly; render(); break;
+      case 'save-parsed': saveParsed(id); break;
+      case 'copy-questions': {
+        var oq = oppById(id);
+        if (oq) {
+          var qs = followQuestions(effectiveParsed(oq, analyzeOpp(oq)));
+          if (qs.length) {
+            copyText(qs.map(function (x, i) { return (i + 1) + '. ' + x.en; }).join('\n'));
+          } else {
+            toast('没有需要补问的问题');
+          }
+        }
+        break;
+      }
 
       case 'select-product': {
         var opp = oppById(btn.getAttribute('data-opp'));
@@ -2907,6 +3466,17 @@
     if (el.id === 'opp-f-type') { S.oppType = el.value; render(); return; }
     if (el.id === 'opp-f-tier') { S.oppTier = el.value; render(); return; }
     if (el.id === 'opp-f-status') { S.oppStatus = el.value; render(); return; }
+    if (el.id === 'opp-sort') { S.oppSort = el.value; render(); return; }
+    if (el.id === 'ra-scenario') { S.replyScenario = el.value; render(); return; }
+    if (el.id === 'fu-status-sel') {
+      var fso = oppById(S.oppId);
+      if (fso) {
+        fso.followStatus = el.value || null;
+        C.addLog(fso, '跟进状态改为：' + (el.value && window.FollowUp ? window.FollowUp.statusLabel(el.value) : '自动推导'));
+        C.persist();
+      }
+      render(); return;
+    }
 
     if (el.id === 'ord-product') {
       var pd = productById(el.value);
@@ -3564,7 +4134,7 @@
       '</div>';
 
     document.getElementById('modal-root').innerHTML =
-      '<div class="modal-mask"><div class="modal wide">' + html + '</div></div>';
+      '<div class="modal-mask"><div class="modal wide" role="dialog" aria-modal="true">' + html + '</div></div>';
   }
 
   function doImportProducts() {
@@ -3743,25 +4313,61 @@
      ========================================================= */
 
   /* 详情页：这条跟到哪一步了，下一步干什么 */
+  /* 跟进时间线：结构化记录（阶段五）与旧记录（只有 note）兼容展示，倒序 */
+  function followTimelineHtml(opp, editable) {
+    if (!window.FollowUp) return '';
+    var list = window.FollowUp.recordsDesc(opp);
+    if (!list.length) return '<div style="font-size:12px;color:var(--ink-3)">还没有跟进记录。</div>';
+    return '<div style="max-height:340px;overflow:auto">' + list.map(function (x) {
+      var head = '<span style="color:#a0a6b0">' + esc(C.fmtDate(x.at, true)) + '</span> ';
+      if (x.id) {
+        return '<div style="font-size:12px;color:#4b5563;padding:7px 0;border-bottom:1px dashed #f0f1f4">' + head +
+          '<span class="badge gray">' + esc(window.FollowUp.typeLabel(x.type)) + '</span> ' +
+          (x.source === 'draft' ? '<span class="badge gray">由回复草稿确认生成</span> ' : '') +
+          '<span>' + esc(x.summary) + '</span>' +
+          (x.feedback ? '<div style="margin-top:2px">客户反馈：' + esc(x.feedback) + '</div>' : '') +
+          (x.nextAction ? '<div style="margin-top:2px">下一步：' + esc(x.nextAction) + '</div>' : '') +
+          (x.plannedAt ? '<div style="margin-top:2px;color:#8a919e">计划跟进：' + esc(C.fmtDate(x.plannedAt)) + '</div>' : '') +
+          (editable ? '<div style="margin-top:3px"><button class="btn sm ghost" data-action="follow-edit" data-id="' + opp.id + '" data-rid="' + x.id + '">编辑</button> ' +
+            '<button class="btn sm ghost" data-action="follow-del" data-id="' + opp.id + '" data-rid="' + x.id + '">删除</button></div>' : '') +
+          '</div>';
+      }
+      return '<div style="font-size:11.5px;color:#6b7280;padding:4px 0;border-bottom:1px dashed #f0f1f4">' + head +
+        esc(x.note || x.summary || '（无备注）') + '</div>';
+    }).join('') + '</div>';
+  }
+
   function followCard(opp) {
-    if (opp.status === 'won' || opp.status === 'lost') return '';
-    var f = W.followState(opp, st().settings) || {};
+    var closed = opp.status === 'won' || opp.status === 'lost';
     var n = C.num(opp.followCount, 0);
+    /* 已关闭：停止提醒，但历史跟进记录只读保留 */
+    if (closed) {
+      return '<section class="card"><div class="card-hd"><div class="card-title">跟进记录' +
+        '<span class="card-sub">商机已' + (opp.status === 'won' ? '成交' : '丢单') + '，已停止跟进提醒，历史记录保留</span></div>' +
+        '<span class="badge gray">已完成</span></div>' +
+        '<div class="card-bd">' + followTimelineHtml(opp, false) + '</div></section>';
+    }
+    var f = W.followState(opp, st().settings) || {};
     var when = f.none ? '没排跟进' : f.label;
     var cls = f.overdue ? 'red' : f.today ? 'amber' : 'gray';
     var last = opp.lastContactAt ? C.relTime(opp.lastContactAt) : '—';
-    var notes = (opp.followLog || []).slice(-3).reverse().map(function (x) {
-      return '<div style="font-size:11.5px;color:#6b7280;padding:4px 0;border-bottom:1px dashed #f0f1f4">' +
-        '<span style="color:#a0a6b0">' + esc(C.fmtDate(x.at)) + '</span> ' + esc(x.note || '（无备注）') + '</div>';
-    }).join('');
+    var fuStatus = window.FollowUp ? window.FollowUp.deriveStatus(opp) : 'todo';
+    var statusSel = window.FollowUp
+      ? '<div class="row" style="gap:8px;align-items:center"><span style="font-size:12px;color:#6b7280">跟进状态</span>' +
+        '<select id="fu-status-sel" style="width:auto;height:30px">' +
+        '<option value="">自动（当前：' + window.FollowUp.statusLabel(fuStatus) + '）</option>' +
+        window.FollowUp.STATUSES.map(function (s) {
+          return '<option value="' + s.key + '"' + (opp.followStatus === s.key ? ' selected' : '') + '>' + s.label + '</option>';
+        }).join('') + '</select></div>'
+      : '';
 
     return '<section class="card"><div class="card-hd"><div class="card-title">跟进' +
       '<span class="card-sub">' + (n ? '已跟 ' + n + ' 次' : '一次都还没跟') + '</span></div>' +
       '<span class="badge ' + cls + '">' + esc(when) + '</span></div>' +
       '<div class="card-bd stack" style="gap:8px">' +
-      '<div class="row" style="gap:16px;font-size:12px;color:#6b7280">' +
+      '<div class="row" style="gap:16px;font-size:12px;color:#6b7280;flex-wrap:wrap">' +
       '<span>上次联系 ' + esc(last) + '</span>' +
-      (f.at ? '<span>原定 ' + C.fmtDate(f.at) + '</span>' : '') + '</div>' +
+      (f.at ? '<span>下次跟进 ' + C.fmtDate(f.at) + '</span>' : '') + statusSel + '</div>' +
       '<div class="row" style="gap:6px;flex-wrap:wrap">' +
       '<button class="btn sm primary" data-action="open-follow" data-id="' + opp.id + '">记录这次跟进</button>' +
       '<button class="btn sm ghost" data-action="copy-follow" data-kind="nudge" data-lang="zh" data-id="' + opp.id + '">催单（中）</button>' +
@@ -3769,7 +4375,7 @@
       '<button class="btn sm ghost" data-action="copy-follow" data-kind="counter" data-lang="zh" data-id="' + opp.id + '">还价（中）</button>' +
       '<button class="btn sm ghost" data-action="copy-follow" data-kind="sample" data-lang="zh" data-id="' + opp.id + '">要样品（中）</button>' +
       '<button class="btn sm ghost" data-action="copy-follow" data-kind="close" data-lang="zh" data-id="' + opp.id + '">逼成交（中）</button>' +
-      '</div>' + notes + '</div></section>';
+      '</div>' + followTimelineHtml(opp, true) + '</div></section>';
   }
 
   /* 首页第一块：今天必须做的事，按要紧程度排 */
@@ -3919,14 +4525,29 @@
       '<div class="card-bd stack">' +
       '<div class="alert ' + (f.overdue ? 'warn' : 'info') + '"><span class="ic">' +
       (f.overdue ? '!' : 'i') + '</span><div>' + esc(last) + ' · ' + esc(when) + '</div></div>' +
-      '<div class="field"><label>买家怎么回的 / 你做了什么</label>' +
-      '<textarea id="fu-note" rows="3" placeholder="例：嫌贵 5%，问 500 件能不能 4.6"></textarea></div>' +
-      '<div class="field"><label>下一步</label><select id="fu-next">' +
+      '<div class="field"><label>跟进类型</label><select id="fu-type">' +
+      (window.FollowUp ? window.FollowUp.TYPES.map(function (t) {
+        return '<option value="' + t.key + '">' + t.label + '</option>';
+      }).join('') : '<option value="other">其他</option>') + '</select></div>' +
+      '<div class="field"><label>沟通摘要（你做了什么）</label>' +
+      '<textarea id="fu-note" rows="3" placeholder="例：把报价单和规格表发过去了"></textarea></div>' +
+      '<div class="field"><label>客户反馈（买家原话或大意，没有就留空，不要编）</label>' +
+      '<input type="text" id="fu-feedback" placeholder="例：嫌贵 5%，问 500 件能不能 4.6"></div>' +
+      '<div class="field"><label>下一步行动（文字）</label>' +
+      '<input type="text" id="fu-action" placeholder="例：等回复后寄样"></div>' +
+      '<div class="field"><label>流程走向</label><select id="fu-next">' +
       '<option value="wait">他还在考虑，' + days + ' 天后再跟</option>' +
       '<option value="counter">他要还价，我去看底线</option>' +
       '<option value="sample">要样品 / 要资料</option>' +
       '<option value="won">谈成了，记成交</option>' +
       '<option value="lost">不做了，记丢单</option>' +
+      '</select></div>' +
+      '<div class="field"><label>记录后跟进状态</label><select id="fu-fstatus">' +
+      '<option value="">不修改（按系统推导）</option>' +
+      '<option value="waiting">等待客户回复</option>' +
+      '<option value="internal">需要内部确认</option>' +
+      '<option value="planned">计划再次联系</option>' +
+      '<option value="todo">待联系</option>' +
       '</select></div>' +
       '<div class="field"><label>下次跟进日期（留空按设置自动算）</label>' +
       '<input type="date" id="fu-date"></div>' +
@@ -3950,21 +4571,150 @@
 
     o.lastContactAt = C.nowIso();
     o.followCount = C.num(o.followCount, 0) + 1;
-    o.followLog = (o.followLog || []).concat([{ at: o.lastContactAt, note: note, next: next }]).slice(-100);
-    if (note) C.addLog(o, '跟进：' + note);
 
     var d = date ? new Date(date + 'T09:00:00') : null;
-    if (d && !isNaN(d.getTime())) {
-      o.followUpAt = d.toISOString();
-    } else {
-      o.followUpAt = new Date(Date.now() + Math.max(1, C.num(s.followUpDays, 3)) * 86400000).toISOString();
+    var plannedIso = (d && !isNaN(d.getTime()))
+      ? d.toISOString()
+      : new Date(Date.now() + Math.max(1, C.num(s.followUpDays, 3)) * 86400000).toISOString();
+
+    /* 阶段五：写结构化记录（兼容旧 followLog 存储）；摘要为空时用类型兜底，不编内容 */
+    var fuType = g('fu-type') || 'other';
+    var summary = note || ('记录了一次跟进（' + (window.FollowUp ? window.FollowUp.typeLabel(fuType) : '其他') + '）');
+    var rec = window.FollowUp
+      ? window.FollowUp.addRecord(o, {
+        type: fuType, summary: summary,
+        feedback: String(g('fu-feedback') || '').trim(),
+        nextAction: String(g('fu-action') || '').trim(),
+        plannedAt: plannedIso
+      }, o.lastContactAt, C.uid('fu'))
+      : null;
+    if (!rec) {
+      o.followLog = (o.followLog || []).concat([{ at: o.lastContactAt, note: note, next: next }]).slice(-100);
+      o.followUpAt = plannedIso;
     }
+    var fst = g('fu-fstatus');
+    if (fst && window.FollowUp && window.FollowUp.validStatus(fst)) o.followStatus = fst;
+    if (note) C.addLog(o, '跟进：' + note);
 
     if (next === 'counter') S.tab = 'nego';
     if (o.status === 'new') o.status = 'matched';
 
     invalidate(); C.persist(); closeModal(); render();
     toast('已记录，下次跟进 ' + C.fmtDate(o.followUpAt));
+  }
+
+  /* 阶段五：结构化记录的编辑 / 删除（旧记录无 id，不可改，保持历史原样） */
+  function openFollowEdit(oppId, rid) {
+    var o = oppById(oppId);
+    if (!o || !window.FollowUp) return;
+    var rec = (o.followLog || []).filter(function (x) { return x && x.id === rid; })[0];
+    if (!rec) return;
+    var dateVal = rec.plannedAt ? String(rec.plannedAt).slice(0, 10) : '';
+    var html = modalHead('编辑跟进记录') +
+      '<div class="card-bd stack">' +
+      '<div class="field"><label>跟进类型</label><select id="fe-type">' +
+      window.FollowUp.TYPES.map(function (t) {
+        return '<option value="' + t.key + '"' + (rec.type === t.key ? ' selected' : '') + '>' + t.label + '</option>';
+      }).join('') + '</select></div>' +
+      '<div class="field"><label>沟通摘要</label>' +
+      '<textarea id="fe-summary" rows="3">' + esc(rec.summary || '') + '</textarea></div>' +
+      '<div class="field"><label>客户反馈</label>' +
+      '<input type="text" id="fe-feedback" value="' + esc(rec.feedback || '') + '"></div>' +
+      '<div class="field"><label>下一步行动</label>' +
+      '<input type="text" id="fe-next" value="' + esc(rec.nextAction || '') + '"></div>' +
+      '<div class="field"><label>计划跟进日期</label>' +
+      '<input type="date" id="fe-date" value="' + dateVal + '"></div>' +
+      '</div>' +
+      '<div class="modal-ft"><button class="btn ghost" data-action="close-modal">取消</button>' +
+      '<button class="btn" data-action="follow-del" data-id="' + o.id + '" data-rid="' + rid + '">删除此记录</button>' +
+      '<button class="btn primary" data-action="follow-edit-save" data-id="' + o.id + '" data-rid="' + rid + '">保存</button></div>';
+    openModal(html);
+  }
+
+  function saveFollowEdit(oppId, rid) {
+    var o = oppById(oppId);
+    if (!o || !window.FollowUp) return;
+    var g = function (i) { var el = document.getElementById(i); return el ? el.value : ''; };
+    var date = String(g('fe-date') || '').trim();
+    var d = date ? new Date(date + 'T09:00:00') : null;
+    var okEdit = window.FollowUp.editRecord(o, rid, {
+      type: g('fe-type'),
+      summary: String(g('fe-summary') || '').trim(),
+      feedback: String(g('fe-feedback') || '').trim(),
+      nextAction: String(g('fe-next') || '').trim(),
+      plannedAt: (d && !isNaN(d.getTime())) ? d.toISOString() : null
+    });
+    if (!okEdit) { toast('保存失败：摘要不能为空'); return; }
+    C.addLog(o, '编辑了跟进记录');
+    invalidate(); C.persist(); closeModal(); render();
+    toast('跟进记录已更新');
+  }
+
+  function askFollowDelete(oppId, rid) {
+    var html = modalHead('删除跟进记录') +
+      '<div class="card-bd"><p style="font-size:13px;line-height:1.7">确定要删除这条跟进记录吗？删除后无法恢复（商机本身和其它记录不受影响）。</p></div>' +
+      '<div class="modal-ft"><button class="btn ghost" data-action="close-modal">取消</button>' +
+      '<button class="btn danger" data-action="follow-del-confirm" data-id="' + oppId + '" data-rid="' + rid + '">确认删除</button></div>';
+    openModal(html);
+  }
+
+  function doFollowDelete(oppId, rid) {
+    var o = oppById(oppId);
+    if (!o || !window.FollowUp) return;
+    if (window.FollowUp.removeRecord(o, rid)) {
+      C.addLog(o, '删除了一条跟进记录');
+      invalidate(); C.persist();
+    }
+    closeModal(); render();
+    toast('跟进记录已删除');
+  }
+
+  /* 阶段四草稿 → 跟进记录：必须人工勾选确认「已实际发送」，复制/生成不算发送 */
+  function openSentConfirm(id) {
+    var o = oppById(id);
+    if (!o) return;
+    var ctx = analyzeOpp(o);
+    var gen = replyGenFor(o, ctx);
+    if (!gen) return;
+    var saved = (o.replyDrafts || {})[gen.scenario];
+    if (!saved) { toast('先生成并保存草稿，再记录发送'); return; }
+    var html = modalHead('记录已发送的回复') +
+      '<div class="card-bd stack">' +
+      '<div class="alert warn"><span class="ic">!</span><div>只有当你<b>已经在阿里后台把这份回复实际发给买家</b>之后，才能记为已发送。生成或复制草稿都不算发送。</div></div>' +
+      '<div style="font-size:12.5px">场景：' + esc(gen.scenarioLabel) + ' · 草稿保存于 ' + esc(C.fmtDate(saved.at, true)) + (saved.edited ? ' · 已人工编辑' : '') + '</div>' +
+      '<label style="display:flex;gap:8px;align-items:flex-start;font-size:13px;line-height:1.6">' +
+      '<input type="checkbox" id="ms-confirm" style="margin-top:3px">我确认这份回复已经实际发送给买家</label>' +
+      '<div class="field"><label>下次跟进日期（留空按设置自动算）</label><input type="date" id="ms-date"></div>' +
+      '</div>' +
+      '<div class="modal-ft"><button class="btn ghost" data-action="close-modal">取消</button>' +
+      '<button class="btn primary" data-action="ra-sent-confirm" data-id="' + o.id + '">确认并记录</button></div>';
+    openModal(html);
+  }
+
+  function doSentConfirm(id) {
+    var o = oppById(id);
+    if (!o || !window.FollowUp) return;
+    var chk = document.getElementById('ms-confirm');
+    if (!chk || !chk.checked) { toast('请先勾选确认：这份回复已经实际发送'); return; }
+    var ctx = analyzeOpp(o);
+    var gen = replyGenFor(o, ctx);
+    if (!gen) return;
+    var dateEl = document.getElementById('ms-date');
+    var date = dateEl ? String(dateEl.value || '').trim() : '';
+    var d = date ? new Date(date + 'T09:00:00') : null;
+    var plannedIso = (d && !isNaN(d.getTime()))
+      ? d.toISOString()
+      : new Date(Date.now() + Math.max(1, C.num(st().settings.followUpDays, 3)) * 86400000).toISOString();
+    var fields = window.FollowUp.draftRecordFields(gen.scenario, gen.scenarioLabel);
+    fields.plannedAt = plannedIso;
+    var rec = window.FollowUp.addRecord(o, fields, C.nowIso(), C.uid('fu'));
+    if (!rec) { toast('记录失败'); return; }
+    o.lastContactAt = C.nowIso();
+    o.followCount = C.num(o.followCount, 0) + 1;
+    o.followStatus = 'waiting';
+    C.addLog(o, '确认已发送回复（' + gen.scenarioLabel + '），已生成跟进记录');
+    invalidate(); C.persist(); closeModal(); render();
+    toast('已记录为已发送，下次跟进 ' + C.fmtDate(plannedIso));
   }
 
   function copyFollow(id, kind, lang) {

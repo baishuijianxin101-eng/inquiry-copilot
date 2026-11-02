@@ -467,6 +467,50 @@
     ];
   }
 
+  /* ---------------- 演示数据隔离（阶段六） ----------------
+     演示实体一律带 demo:true 标记。旧版本地数据没有这个字段，
+     靠种子数据的固定 id 识别并在规范化时自动补标（迁移兼容）。
+     真实业务统计与真实商机列表只认 demo !== true 的记录；
+     演示数据的增删改只作用于演示集合，不触碰真实数据。 */
+  var DEMO_OPP_IDS = { opp_demo_1: true, opp_demo_2: true, opp_demo_3: true, opp_quick_demo: true };
+  var DEMO_PRODUCT_IDS = { p_tws_001: true, p_cup_500: true, p_glass_350: true, p_juicer_380: true, p_bottle_750: true, p_french_350: true };
+
+  function isDemoOpp(o) { return !!o && (o.demo === true || !!DEMO_OPP_IDS[o.id]); }
+  function isDemoProduct(p) { return !!p && (p.demo === true || !!DEMO_PRODUCT_IDS[p.id]); }
+  function isDemoOrder(o) { return !!o && o.demo === true; }
+
+  /* 按视图取商机：view='demo' 只看演示，其余（默认）只看真实。
+     损坏条目（null/非对象）直接跳过，不影响另一类数据。 */
+  function visibleOpps(state, view) {
+    var list = (state && Array.isArray(state.opportunities)) ? state.opportunities : [];
+    return list.filter(function (o) {
+      if (!o || typeof o !== 'object') return false;
+      return view === 'demo' ? isDemoOpp(o) : !isDemoOpp(o);
+    });
+  }
+
+  /* 只清除演示数据（商机/订单/商品），真实数据一律不动。 */
+  function purgeDemo(state) {
+    var counts = { opps: 0, products: 0, orders: 0 };
+    if (!state || typeof state !== 'object') return counts;
+    if (Array.isArray(state.opportunities)) {
+      var b1 = state.opportunities.length;
+      state.opportunities = state.opportunities.filter(function (o) { return !isDemoOpp(o); });
+      counts.opps = b1 - state.opportunities.length;
+    }
+    if (Array.isArray(state.products)) {
+      var b2 = state.products.length;
+      state.products = state.products.filter(function (p) { return !isDemoProduct(p); });
+      counts.products = b2 - state.products.length;
+    }
+    if (Array.isArray(state.orders)) {
+      var b3 = state.orders.length;
+      state.orders = state.orders.filter(function (o) { return !isDemoOrder(o); });
+      counts.orders = b3 - state.orders.length;
+    }
+    return counts;
+  }
+
   /* ---------------- 状态管理 ---------------- */
 
   function freshState(opts) {
@@ -487,8 +531,8 @@
         s.products = seed.products.map(normalizeProduct);
         s.demoMode = false;
       } else {
-        s.products = seedProducts();
-        s.opportunities = seedOpportunities();
+        s.products = seedProducts().map(function (p) { p.demo = true; return p; });
+        s.opportunities = seedOpportunities().map(function (o) { o.demo = true; return o; });
       }
     }
     return s;
@@ -511,6 +555,7 @@
   function normalizeProduct(p) {
     return {
       id: safeId(p.id, 'p'),
+      demo: p.demo === true || !!DEMO_PRODUCT_IDS[p.id],
       sku: String(p.sku || '').trim(),
       title: String(p.title || '').trim(),
       titleEn: String(p.titleEn || '').trim(),
@@ -640,6 +685,7 @@
     var deal = (o.deal && typeof o.deal === 'object' && !Array.isArray(o.deal)) ? o.deal : null;
     return {
       id: safeId(o.id, 'opp'),
+      demo: o.demo === true || !!DEMO_OPP_IDS[o.id],
       createdAt: o.createdAt || nowIso(),
       updatedAt: o.updatedAt || o.createdAt || nowIso(),
       buyer: {
@@ -709,6 +755,7 @@
     o = o || {};
     return {
       id: safeId(o.id, 'ord'),
+      demo: o.demo === true,
       date: o.date || (new Date().toISOString().slice(0, 10)),
       productId: o.productId || '',
       sku: String(o.sku || ''),
@@ -981,8 +1028,11 @@
 
   function stats() {
     var s = get();
-    var opps = s.opportunities || [];
-    var orders = s.orders || [];
+    /* 经营统计只算真实业务：演示商机/演示订单一律排除，另行给出演示计数 */
+    var oppsAll = Array.isArray(s.opportunities) ? s.opportunities : [];
+    var ordersAll = Array.isArray(s.orders) ? s.orders : [];
+    var opps = oppsAll.filter(function (o) { return !isDemoOpp(o); });
+    var orders = ordersAll.filter(function (o) { return !isDemoOrder(o); });
 
     var won = opps.filter(function (o) { return o.status === 'won'; });
     var lost = opps.filter(function (o) { return o.status === 'lost'; });
@@ -997,6 +1047,8 @@
     var costRmb = round2(sum(orders, function (o) { return num(o.costRmb); }));
 
     return {
+      demoOppCount: oppsAll.filter(isDemoOpp).length,
+      demoOrderCount: ordersAll.filter(isDemoOrder).length,
       totalOpps: opps.length,
       openCount: open.length,
       wonCount: won.length,
@@ -1055,6 +1107,8 @@
     storageHealth: storageHealth, restoreBackup: restoreBackup,
     validateBackup: validateBackup, mergeAll: mergeAll, BACKUP_VERSION: BACKUP_VERSION,
     addLog: addLog, stats: stats,
+    isDemoOpp: isDemoOpp, isDemoProduct: isDemoProduct, isDemoOrder: isDemoOrder,
+    visibleOpps: visibleOpps, purgeDemo: purgeDemo,
     // 规范化
     normalizeProduct: normalizeProduct, normalizeOpp: normalizeOpp, normalizeOrder: normalizeOrder,
     normalizeSettings: normalizeSettings, normalizeQuote: normalizeQuote, normalizeEndpoint: normalizeEndpoint,

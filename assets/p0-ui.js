@@ -335,14 +335,21 @@
 
   function renderOppPage() {
     var actions = null;
-    var oppsList = state().opportunities || [];
+    /* 演示隔离：今日销售行动跟随当前数据视图（偏好键与主界面共用），
+       真实视图不推演示行动，演示视图只推演示并在标题标注 */
+    var viewPref = 'real';
+    try { viewPref = (root.localStorage && root.localStorage.getItem('ic_data_view') === 'demo') ? 'demo' : 'real'; } catch (e) { viewPref = 'real'; }
+    var oppsList = (state().opportunities || []).filter(function (o) {
+      var isD = (root.Core && root.Core.isDemoOpp) ? root.Core.isDemoOpp(o) : (o && o.demo === true);
+      return viewPref === 'demo' ? isD : !isD;
+    });
     var actions = null;
     try {
       actions = root.P0Cockpit && root.P0Cockpit.actions
         ? root.P0Cockpit.actions(oppsList)
         : null;
     } catch (e) { actions = null; }
-    var inner = '<div class="p0-sec-title">今日销售行动 <span class="p0-mute">按逾期、报价到期、久未联系自动排序</span></div>' +
+    var inner = '<div class="p0-sec-title">今日销售行动' + (viewPref === 'demo' ? '（演示）' : '') + ' <span class="p0-mute">按逾期、报价到期、久未联系自动排序</span></div>' +
       (actions ? actionHtml(actions, oppsList) : '<div class="p0-empty">行动中心未加载</div>') +
       '<div class="p0-sec-title" style="margin-top:18px">新询盘处理</div>' +
       renderFlow();

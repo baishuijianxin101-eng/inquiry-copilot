@@ -41,7 +41,9 @@
     catType: '',
     oppQ: '', oppCountry: '', oppType: '', oppTier: '', oppStatus: '',
     oppSort: 'default', oppTodoOnly: false, oppOverdueOnly: false, replyScenario: 'auto',
-    oppLang: 'zh', oppTextZh: null, oppId: '' };
+    oppLang: 'zh', oppTextZh: null, oppId: '', dataView: 'real' };
+  /* 数据视图偏好单独存，不进业务数据：切换视图永远不改动商机本身 */
+  try { var dvPref = localStorage.getItem('ic_data_view'); if (dvPref === 'demo' || dvPref === 'real') S.dataView = dvPref; } catch (e) {}
   var toastTimer = null;
 
   /* =========================================================
@@ -996,7 +998,8 @@
     var productCount = s.products.length;
 
     var open = s.opportunities.filter(function (o) {
-      return o.status === 'new' || o.status === 'matched';
+      /* 工作台只推真实待办，演示商机不混进来 */
+      return !C.isDemoOpp(o) && (o.status === 'new' || o.status === 'matched');
     }).sort(function (a, b) { return new Date(b.createdAt) - new Date(a.createdAt); });
 
     /* ---- 最顶上：进阿里卖家后台 ---- */
@@ -1112,7 +1115,10 @@
       '<a href="#/settings" style="font-size:12px;color:var(--ink-3)">改汇率 / 利润 →</a>' +
       '</div></section>';
 
-    return '<div class="stack">' + sellerBar + demoBanner + hero + todoCard() + bossStrip() + steps + queue + moneyLine + '</div>';
+    var demoOppHint = kpi.demoOppCount > 0
+      ? '<div class="alert info"><span class="ic">i</span><div>另有 <strong>' + kpi.demoOppCount + ' 条演示商机</strong>未计入上面的真实待办与统计，在「商机」页切到「演示数据」查看。</div></div>'
+      : '';
+    return '<div class="stack">' + sellerBar + demoBanner + demoOppHint + hero + todoCard() + bossStrip() + steps + queue + moneyLine + '</div>';
   }
 
 
@@ -1160,7 +1166,8 @@
 
   function oppFiltered() {
     var s = st();
-    return s.opportunities.filter(function (o) {
+    /* 演示隔离：先按数据视图（真实/演示）分区，再套其余筛选与排序 */
+    return C.visibleOpps(s, S.dataView).filter(function (o) {
       var c = oppClass(o);
       if (S.oppCountry && c.country !== S.oppCountry) return false;
       if (S.oppType && c.type !== S.oppType) return false;
@@ -1253,7 +1260,7 @@
         }
       }
       return '<tr>' +
-        '<td>' + badge(o.status) + followChip(o) + scBadge + '</td>' +
+        '<td>' + badge(o.status) + followChip(o) + scBadge + (C.isDemoOpp(o) ? ' <span class="badge amber">演示</span>' : '') + '</td>' +
         '<td><strong>' + esc(o.buyer.name) + '</strong><br>' +
         '<span style="color:#8a919e;font-size:11px">' + esc(o.buyer.company || '—') + '</span>' + fuLine + '</td>' +
         '<td>' + esc(c.country) + '<br><span style="color:#8a919e;font-size:11px">' + esc(o.buyer.channel || '') + '</span></td>' +
@@ -1273,7 +1280,8 @@
 
   function oppSummary() {
     var s = st();
-    var all = s.opportunities;
+    /* 汇总口径跟随当前视图：真实视图不统计演示，演示视图不混真实 */
+    var all = C.visibleOpps(s, S.dataView);
     if (!all.length) {
       return '<div class="card-bd" style="border-bottom:1px solid #f0f1f4">' +
         '<div class="grid grid-3" style="gap:16px">' +
@@ -1326,7 +1334,7 @@
   function viewOpps() {
     var s = st();
     var countries = [], types = [], tiers = [];
-    s.opportunities.forEach(function (o) {
+    C.visibleOpps(s, S.dataView).forEach(function (o) {
       var c = oppClass(o);
       if (countries.indexOf(c.country) < 0) countries.push(c.country);
       if (types.indexOf(c.type) < 0) types.push(c.type);
@@ -1346,17 +1354,21 @@
       }).join('') + '</select>' +
       '<button class="btn sm' + (S.oppTodoOnly ? ' primary' : '') + '" data-action="toggle-todo">只看待跟进</button>' +
       '<button class="btn sm' + (S.oppOverdueOnly ? ' primary' : '') + '" data-action="toggle-overdue">只看已逾期</button>' +
-      '<span id="opp-count" style="color:#8a919e;font-size:12px">显示 ' + oppFiltered().length + ' / ' + s.opportunities.length + ' 条</span>' +
+      '<span id="opp-count" style="color:#8a919e;font-size:12px">显示 ' + oppFiltered().length + ' / ' + C.visibleOpps(s, S.dataView).length + ' 条（' + (S.dataView === 'demo' ? '演示数据' : '真实商机') + '）</span>' +
       '</div></div>';
 
     return '<section class="card"><div class="card-hd">' +
       '<div class="card-title">商机<span class="card-sub">自动分类：国家 / 品类 / 订单量级</span></div>' +
-      '<button class="btn sm primary" data-action="new-opp">+ 新建商机</button></div>' +
+      '<div class="row" style="gap:6px">' +
+      '<button class="btn sm' + (S.dataView === 'real' ? ' primary' : '') + '" data-action="dataview" data-view="real">真实商机</button>' +
+      '<button class="btn sm' + (S.dataView === 'demo' ? ' primary' : '') + '" data-action="dataview" data-view="demo">演示数据（' + C.visibleOpps(s, 'demo').length + '）</button>' +
+      '<button class="btn sm primary" data-action="new-opp">+ 新建商机</button></div></div>' +
+      (S.dataView === 'demo' ? '<div class="alert warn" style="margin:12px 18px 0"><span class="ic">!</span><div><strong>正在看演示数据。</strong>这些商机是示例，不计入经营统计，也不是真实客户；在演示里做的修改不会影响真实商机。</div></div>' : '') +
       oppSummary() + filters +
       '<div class="card-bd tight"><div class="table-wrap">' +
       '<table class="table"><thead><tr><th>状态</th><th>买家</th><th>市场</th><th>分类</th>' +
       '<th>匹配商品</th><th class="num">数量</th><th class="num">利润</th><th></th></tr></thead>' +
-      '<tbody id="opp-body">' + (s.opportunities.length ? oppRows() : '<tr><td colspan="8"><div class="empty"><strong>还没有商机</strong>从右上角新建。</div></td></tr>') +
+      '<tbody id="opp-body">' + (C.visibleOpps(s, S.dataView).length ? oppRows() : '<tr><td colspan="8"><div class="empty"><strong>' + (S.dataView === 'demo' ? '还没有演示商机' : '还没有商机') + '</strong>' + (S.dataView === 'demo' ? '演示数据来自示例集，可在工作台点「先看一个例子」生成。' : '从右上角新建。') + '</div></td></tr>') +
       '</tbody></table></div></div></section>';
   }
   /* =========================================================
@@ -1507,12 +1519,13 @@
   function buyerProfile(opp) {
     var key = buyerKey(opp);
     var s = st();
-    var mine = (s.opportunities || []).filter(function (o) { return buyerKey(o) === key; });
+    /* 往来记录不跨隔离聚合：演示买家与真实买家同名也不合并 */
+    var mine = (s.opportunities || []).filter(function (o) { return buyerKey(o) === key && C.isDemoOpp(o) === C.isDemoOpp(opp); });
     var names = [buyerKey(opp), String((opp.buyer && opp.buyer.name) || '').trim().toLowerCase()]
       .filter(Boolean);
     var orders = (s.orders || []).filter(function (o) {
       var ob = String(o.buyer || '').trim().toLowerCase();
-      return ob && names.indexOf(ob) >= 0;
+      return ob && names.indexOf(ob) >= 0 && C.isDemoOrder(o) === C.isDemoOpp(opp);
     });
 
     var won = mine.filter(function (o) { return o.status === 'won'; });
@@ -1813,7 +1826,9 @@
       tabBtn('log', '操作记录', opp) +
       '</div><div class="card-bd" id="tab-body">' + tabBody(ctx) + '</div></section>';
 
-    return '<div class="stack">' + head + quoteBannerHtml(opp) + '<div data-pf="verdict">' + verdictHtml(ctx) + '</div>' +
+    return '<div class="stack">' + head +
+      (C.isDemoOpp(opp) ? '<div class="alert warn"><span class="ic">!</span><div><strong>演示数据</strong>：这条商机来自演示数据集，不是真实客户，不计入经营统计。在这里的编辑、跟进和报价演练都不会影响真实商机。</div></div>' : '') +
+      quoteBannerHtml(opp) + '<div data-pf="verdict">' + verdictHtml(ctx) + '</div>' +
       '<div data-pf="judge">' + (window.Judge ? window.Judge.render(ctx) : '') + '</div>' +
       oppScoreCard(opp) +
       '<div class="grid grid-2 top">' + left + right + '</div>' +
@@ -2138,7 +2153,7 @@
 
       return '<tr>' +
         '<td><span class="badge gray">' + esc(C.typeOfProduct(p) || '其他') + '</span></td>' +
-        '<td style="max-width:320px"><strong style="font-size:12px">' + esc(p.title) + '</strong>' +
+        '<td style="max-width:320px"><strong style="font-size:12px">' + esc(p.title) + '</strong>' + (C.isDemoProduct(p) ? ' <span class="badge amber">演示</span>' : '') +
         (p.costSource === 'auto'
           ? ' <span class="badge amber" title="' + esc(p.costNote || '') + '">自动</span>'
           : '') +
@@ -2558,7 +2573,7 @@
   function viewAnalytics() {
     var s = st();
     var kpi = C.stats();
-    var allOrders = (s.orders || []).slice().sort(function (a, b) {
+    var allOrders = (s.orders || []).filter(function (o) { return !C.isDemoOrder(o); }).slice().sort(function (a, b) {
       return String(b.date).localeCompare(String(a.date));
     });
     /* 订单多了以后只渲染最近 200 条，避免表格拖慢页面 */
@@ -2643,7 +2658,7 @@
       '</div>';
 
     /* 丢单 */
-    var lostRows = s.opportunities.filter(function (o) { return o.status === 'lost'; }).map(function (o) {
+    var lostRows = s.opportunities.filter(function (o) { return o.status === 'lost' && !C.isDemoOpp(o); }).map(function (o) {
       return '<tr><td>' + esc(o.buyer.name) + '</td><td>' + esc(o.buyer.country) + '</td>' +
         '<td>' + esc((o.deal && o.deal.reason) || '未记录') + '</td>' +
         '<td class="num" style="color:#8a919e">' + C.fmtDate(o.updatedAt) + '</td></tr>';
@@ -2877,6 +2892,7 @@
         '<button class="btn" data-action="export-json">导出备份 JSON</button>' +
         '<button class="btn" data-action="import-json">导入备份</button>' +
         '<button class="btn danger" data-action="reset-demo">重置为演示数据</button>' +
+        '<button class="btn" data-action="purge-demo">清除演示数据（保留真实数据）</button>' +
         '</div>' +
         storageBlock() +
         '<div class="card-sub">重置会清空你录入的所有商机和商品，先导出备份。</div>' +
@@ -3034,6 +3050,14 @@
       case 'follow-del': askFollowDelete(id, btn.getAttribute('data-rid')); break;
       case 'follow-del-confirm': doFollowDelete(id, btn.getAttribute('data-rid')); break;
       case 'toggle-todo': S.oppTodoOnly = !S.oppTodoOnly; render(); break;
+      case 'dataview': S.dataView = btn.getAttribute('data-view') === 'demo' ? 'demo' : 'real'; try { localStorage.setItem('ic_data_view', S.dataView); } catch (e) {} render(); break;
+      case 'purge-demo': {
+        if (!confirm('清除全部演示数据（演示商机 / 演示商品 / 演示订单）？真实数据不会受影响。')) break;
+        var pc = C.purgeDemo(st());
+        C.persist(); invalidate(); render();
+        toast('已清除演示数据：商机 ' + pc.opps + ' 条、商品 ' + pc.products + ' 个、订单 ' + pc.orders + ' 笔（真实数据未动）');
+        break;
+      }
       case 'toggle-overdue': S.oppOverdueOnly = !S.oppOverdueOnly; render(); break;
       case 'save-parsed': saveParsed(id); break;
       case 'copy-questions': {
@@ -3707,6 +3731,10 @@
 
   /* 一键体验：用你自己的第一个商品生成一条示例询盘，直接跳到结论页 */
   function runQuickDemo() {
+    /* 示例商机固定 id + 演示标记：重复点击只打开同一条，不再往真实商机里
+       不断塞无法识别的示例；清除演示数据后它也不会残留 */
+    var existing = oppById('opp_quick_demo');
+    if (existing) { location.hash = '#/opp/' + existing.id; render(); return; }
     var p = st().products[0];
     if (!p) { toast('先导入商品，才能演示'); return; }
 
@@ -3724,6 +3752,8 @@
 
     var parsed = M.parse(text);
     var opp = C.normalizeOpp({
+      id: 'opp_quick_demo',
+      demo: true,
       buyer: {
         name: 'Laura Gómez',
         company: 'Outdoor Life S.L.',

@@ -11,6 +11,14 @@
   var C = window.Core;
   var P = window.Pricing;
 
+  /* 演示隔离：工作台待办与经营汇总只统计真实商机（阶段六补充修复）。
+     演示商机的演练待办只在演示视图内由列表呈现，不进这里的计数。 */
+  function realOnly(list) {
+    return (list || []).filter(function (o) {
+      return !(C && C.isDemoOpp ? C.isDemoOpp(o) : (o && o.demo === true));
+    });
+  }
+
   var DAY = 86400000;
 
   function n(v, d) { return C.num(v, d === undefined ? 0 : d); }
@@ -201,7 +209,7 @@
     var settings = s.settings || {};
     var list = [];
 
-    var open = s.opportunities.filter(function (o) { return o.status === 'new' || o.status === 'matched'; });
+    var open = realOnly(s.opportunities).filter(function (o) { return o.status === 'new' || o.status === 'matched'; });
     if (open.length) {
       list.push({
         key: 'reply', label: '还没回的询盘', count: open.length,
@@ -210,7 +218,7 @@
       });
     }
 
-    var overdue = s.opportunities.filter(function (o) {
+    var overdue = realOnly(s.opportunities).filter(function (o) {
       if (o.status === 'won' || o.status === 'lost') return false;
       var f = followState(o, settings);
       return f.overdue;
@@ -259,7 +267,7 @@
   function weekSummary(state) {
     var s = state || C.get();
     var weekAgo = Date.now() - 7 * DAY;
-    var opps = s.opportunities || [];
+    var opps = realOnly(s.opportunities);
     /* 「本周」就得是本周：以前 quoted / won / lost 没带日期过滤，
        开单三年的话累计成交会一直挂在“本周成交”上，老板一算账就发现不对。 */
     function ts(o) {

@@ -662,6 +662,26 @@
       unitPriceUsd: opp.quote.unitPriceUsd
     });
 
+    /* 定价口径统一：全站只认 ctx.unity 这一份结果（来源仍是各自原算法，
+       本层只收拢命名与可报价判定，不改任何公式） */
+    var nego = null;
+    try {
+      nego = window.Workflow ? window.Workflow.negotiation({
+        product: p, qty: opp.quote.qty, settings: s,
+        unitPriceUsd: opp.quote.unitPriceUsd, buyerTargetUsd: a.parsed.targetPriceUsd
+      }) : null;
+    } catch (e) { nego = null; }
+    var selEntry = null;
+    (a.ordered || []).forEach(function (x) { if (x.product && x.product.id === opp.selectedProductId) selEntry = x; });
+    var unity = null;
+    try {
+      unity = window.PricingUnity ? window.PricingUnity.resolve({
+        evaluate: pricing, product: p, nego: nego,
+        unitUsd: pricing.unitPriceUsd,
+        hardFail: !!(selEntry && selEntry.match && selEntry.match.hardFail)
+      }) : null;
+    } catch (e) { unity = null; }
+
     return {
       opp: opp,
       product: p,
@@ -669,6 +689,8 @@
       parsed: a.parsed,
       matches: a.ordered,
       pricing: pricing,
+      nego: nego,
+      unity: unity,
 
       sellerName: s.sellerName
     };
@@ -1839,6 +1861,23 @@
         '<div class="v-sub">这一单总利润</div></div></div>';
     }
 
+    /* 统一口径判定：Pricing 自己的 canQuote 只看保本价；登记底价与关键冲突
+       也必须拦在这里，否则结论横幅会和报价底线打架 */
+    if (ctx.unity && !ctx.unity.quotable) {
+      var u = ctx.unity;
+      return '<div class="verdict bad">' +
+        '<div><div class="v-kicker">暂不可报</div>' +
+        '<div class="v-price">' + C.usd(u.unitUsd) + '</div>' +
+        '<div class="v-sub">' + esc(u.blockReasons.join('；')) + '</div></div>' +
+        '<div><div class="v-kicker">报价底线（统一口径）</div>' +
+        '<div class="v-net">' + C.usd(u.quoteFloorUsd) + '</div>' +
+        '<div class="v-sub">保本价 ' + C.usd(u.breakEvenUsd) + (u.businessFloorUsd > 0 ? ' · 登记底价 ' + C.usd(u.businessFloorUsd) : '') + '，取高者</div></div>' +
+        '<div><div class="v-kicker">参考售价</div>' +
+        '<div class="v-net" style="font-size:17px">' + C.usd(u.listUsd) + '</div>' +
+        '<div class="v-sub">橱窗挂牌价，不是底线</div></div>' +
+        '</div>';
+    }
+
     var isAuto = ctx.opp.quote && ctx.opp.quote.autoPrice !== false;
     return '<div class="verdict ok">' +
       '<div><div class="v-kicker">' + (isAuto ? '建议报价' : '当前报价') + '</div>' +
@@ -1865,7 +1904,30 @@
         '<div class="pl-val">—</div></div>';
     }
 
-    return '<div class="stack" style="gap:8px">' +
+    var uh = '';
+    if (ctx.unity) {
+      var uu = ctx.unity;
+      uh = '<div class="priceline ' + (uu.quotable ? 'suggest' : 'floor') + '"><div class="pl-label">' +
+        (uu.quotable ? '可报价（全站统一口径）' : '不可报价') +
+        '<small>' + (uu.quotable
+          ? '当前报价 ' + C.usd(uu.unitUsd) + ' ≥ 报价底线 ' + C.usd(uu.quoteFloorUsd) + ' · USD/pc · ' + uu.qty.toLocaleString() + ' pcs · 含平台佣金口径'
+          : esc(uu.blockReasons.join('；'))) + '</small></div>' +
+        '<div class="pl-val">' + (uu.quotable ? '可报' : '禁报') + '</div></div>' +
+        '<div class="priceline floor"><div class="pl-label">报价底线（统一口径）' +
+        '<small>保本价 ' + C.usd(uu.breakEvenUsd) + (uu.businessFloorUsd > 0 ? ' 与登记底价 ' + C.usd(uu.businessFloorUsd) : '') + ' 取高 · USD/pc</small></div>' +
+        '<div class="pl-val">' + C.usd(uu.quoteFloorUsd) + '</div></div>' +
+        (uu.businessFloorUsd > 0 ? '<div class="priceline ceiling"><div class="pl-label">商品登记底价' +
+          '<small>价格区间下限 · 让价红线，低于它报价需特批</small></div>' +
+          '<div class="pl-val">' + C.usd(uu.businessFloorUsd) + '</div></div>' : '') +
+        (uu.negoFloorUsd ? '<div class="priceline ceiling"><div class="pl-label">谈判底线（提示线）' +
+          '<small>含最低毛利' + (uu.minMarginPct != null ? ' ' + Math.round(uu.minMarginPct) + '%' : '') + '目标 · 不是保本硬线，别和报价底线混用</small></div>' +
+          '<div class="pl-val">' + C.usd(uu.negoFloorUsd) + '</div></div>' : '') +
+        uu.warnings.map(function (w) {
+          return '<div style="font-size:12px;color:#9a6a00;background:#fdf6e0;border:1px solid #f0dfae;border-radius:8px;padding:7px 10px">' + esc(w) + '</div>';
+        }).join('');
+    }
+
+    return '<div class="stack" style="gap:8px">' + uh +
       '<div class="priceline floor"><div class="pl-label">保本价（低于此价必亏）' +
       '<small>成本 ' + C.money(r.costUnitRmb) + '/件 ÷ ' + (1 - r.feeRate).toFixed(2) + ' ÷ ' + r.fx.toFixed(2) + '</small></div>' +
       '<div class="pl-val">' + C.usd(r.floorUsd) + '</div></div>' +
@@ -3911,7 +3973,7 @@
       '<div class="field full"><label>规格描述（中文）</label><input type="text" id="f-specs" value="' + esc(v('specs', '')) + '"></div>' +
       '<div class="field full"><label>规格描述（英文，写进英文回复和报价单）</label><input type="text" id="f-specsEn" value="' + esc(v('specsEn', '')) + '"></div>' +
       '<div class="field"><label>橱窗价（USD，按 MOQ 数量）</label><input type="number" id="f-priceUsd" step="0.01" value="' + v('priceUsd', 0) + '"></div>' +
-      '<div class="field"><label>价格区间下限（可选）</label><input type="number" id="f-priceFloorUsd" step="0.01" value="' + v('priceFloorUsd', 0) + '"></div>' +
+      '<div class="field"><label>价格区间下限 / 商品登记底价（可选，低于它报价需特批）</label><input type="number" id="f-priceFloorUsd" step="0.01" value="' + v('priceFloorUsd', 0) + '"></div>' +
       '<div class="field"><label>采购成本（元/件，1688 查的）</label><input type="number" id="f-costRmb" step="0.01" value="' + v('costRmb', 0) + '"></div>' +
       '<div class="field"><label>别家卖多少（元/件）</label><input type="number" id="f-marketPriceRmb" step="0.01" value="' + v('marketPriceRmb', 0) + '"></div>' +
       
@@ -4459,6 +4521,10 @@
 
     var head = '<div style="font-weight:650;font-size:12.5px;margin-bottom:8px">还价底线' +
       '<span style="color:#8a919e;font-weight:400;font-size:11.5px"> · 低于底线不如不接</span></div>';
+    if (ctx.unity && ctx.unity.negoFloorUsd) {
+      head += '<div style="font-size:11.5px;color:#8a919e;margin:-2px 0 8px">口径提醒：这里的「到底」指谈判底线（含最低毛利目标）；保本价 ' +
+        C.usd(ctx.unity.breakEvenUsd) + '、报价底线 ' + C.usd(ctx.unity.quoteFloorUsd) + ' 以定价卡的统一口径为准</div>';
+    }
 
     var line = '<div class="alert ' + (ng.roomUsd > 0 ? 'info' : 'warn') + '" style="margin:0">' +
       '<span class="ic">' + (ng.roomUsd > 0 ? 'i' : '!') + '</span><div>' + esc(W.negoHeadline(ng)) +

@@ -11,7 +11,7 @@
 <!-- CSP 第二道锁：即使被拖到 U 盘/本地打开（没有 Netlify 响应头），也不执行任何外来脚本。
      script-src 只留 'self' —— 页面里没有一行内联 JS，全部走 assets/*.js。 -->
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self' https: http://127.0.0.1:* http://localhost:*; media-src 'self' blob:; manifest-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
-<link rel="stylesheet" href="assets/styles.css?v=v10226001">
+<link rel="stylesheet" href="assets/styles.css?v=v10226002">
 </head>
 <body>
 
@@ -58,32 +58,33 @@
 <!-- 先装错误捕获，再加载脚本：任何一个 assets 文件语法错都能在页面上看见。
      这段原来是内联脚本，为了让 CSP 的 script-src 保持 'self'（不含 unsafe-inline）
      已搬到 assets/boot-error.js。 -->
-<script src="assets/boot-error.js?v=v10226001"></script>
+<script src="assets/boot-error.js?v=v10226002"></script>
 
-<script src="assets/seed-state.js?v=v10226001"></script>
-<script src="assets/core.js?v=v10226001"></script>
-<script src="assets/pricing.js?v=v10226001"></script>
-<script src="assets/workflow.js?v=v10226001"></script>
+<script src="assets/seed-state.js?v=v10226002"></script>
+<script src="assets/core.js?v=v10226002"></script>
+<script src="assets/pricing.js?v=v10226002"></script>
+  <script src="assets/pricing-unity.js?v=v10226002"></script>
+<script src="assets/workflow.js?v=v10226002"></script>
 <script src="assets/tr-endpoint.js?v=1"></script>
-<script src="assets/translate.js?v=v10226001"></script>
-<script src="assets/judge.js?v=v10226001"></script>
-<script src="assets/matching.js?v=v10226001"></script>
-<script src="assets/smart-match.js?v=v10226001"></script>
-<script src="assets/opp-score.js?v=v10226001"></script>
-<script src="assets/reply-assistant.js?v=v10226001"></script>
-<script src="assets/followup.js?v=v10226001"></script>
-<script src="assets/reply.js?v=v10226001"></script>
-<script src="assets/importer.js?v=v10226001"></script>
-<script src="assets/market-ref.js?v=v10226001"></script>
-<script src="assets/price-candidates.js?v=v10226001"></script>
-<script src="assets/p0-parse.js?v=v10226001"></script>
-<script src="assets/p0-match.js?v=v10226001"></script>
-<script src="assets/p0-quote.js?v=v10226001"></script>
-<script src="assets/p0-cost.js?v=v10226001"></script>
-<script src="assets/p0-cockpit.js?v=v10226001"></script>
-<script src="assets/p0-api.js?v=v10226001"></script>
-<script src="assets/app.js?v=v10226001"></script>
-<script src="assets/p0-ui.js?v=v10226001"></script>
+<script src="assets/translate.js?v=v10226002"></script>
+<script src="assets/judge.js?v=v10226002"></script>
+<script src="assets/matching.js?v=v10226002"></script>
+<script src="assets/smart-match.js?v=v10226002"></script>
+<script src="assets/opp-score.js?v=v10226002"></script>
+<script src="assets/reply-assistant.js?v=v10226002"></script>
+<script src="assets/followup.js?v=v10226002"></script>
+<script src="assets/reply.js?v=v10226002"></script>
+<script src="assets/importer.js?v=v10226002"></script>
+<script src="assets/market-ref.js?v=v10226002"></script>
+<script src="assets/price-candidates.js?v=v10226002"></script>
+<script src="assets/p0-parse.js?v=v10226002"></script>
+<script src="assets/p0-match.js?v=v10226002"></script>
+<script src="assets/p0-quote.js?v=v10226002"></script>
+<script src="assets/p0-cost.js?v=v10226002"></script>
+<script src="assets/p0-cockpit.js?v=v10226002"></script>
+<script src="assets/p0-api.js?v=v10226002"></script>
+<script src="assets/app.js?v=v10226002"></script>
+<script src="assets/p0-ui.js?v=v10226002"></script>
 
 <!-- 随时翻译：右下角悬浮按钮 + 面板 -->
 <button id="tr-fab" type="button" title="随时翻译（Ctrl+Shift+T）">译</button>

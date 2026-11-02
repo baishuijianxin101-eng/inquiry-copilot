@@ -627,6 +627,8 @@
         };
       }) : [],
       selectedProductId: o.selectedProductId ? String(o.selectedProductId).slice(0, 60) : null,
+      /* 型号不符拦截的人工放行标记：销售核对后显式放行才为 true，换商品时重置 */
+      matchOverride: !!o.matchOverride,
       quote: normalizeQuote(o.quote),
       quoteVersions: Array.isArray(o.quoteVersions) ? o.quoteVersions.filter(function (v) {
         return v && typeof v === 'object' && !Array.isArray(v);

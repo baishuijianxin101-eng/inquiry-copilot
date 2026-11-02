@@ -135,8 +135,14 @@
     var changed = false;
 
     if (!opp.selectedProductId && a.ordered.length) {
-      opp.selectedProductId = a.ordered[0].product.id;
-      changed = true;
+      /* 自动选品跳过硬性冲突（型号/品类不符、低于起订量）的商品；
+         全部冲突时宁可不选，也不能默认把错货设成报价对象 */
+      var firstOk = null;
+      a.ordered.forEach(function (x) { if (!firstOk && !x.match.hardFail) firstOk = x; });
+      if (firstOk) {
+        opp.selectedProductId = firstOk.product.id;
+        changed = true;
+      }
     }
 
     if (!opp.quote.qty) {
@@ -185,6 +191,66 @@
 
     if (changed) C.persist();
     return opp;
+  }
+
+  /* 报价拦截：所选商品与询盘硬性冲突时（型号/品类对不上，或数量低于起订量，
+     即 Matching 的 hardFail），禁止生成回复、报价单与标记已报价，
+     避免把错货的名字写进发给客户的材料。销售人工核对后可显式放行
+     （matchOverride，会记进操作记录；换商品自动失效）。 */
+  function quoteBlock(opp) {
+    if (!opp || opp.matchOverride || !opp.selectedProductId) return null;
+    var a = analyzeOpp(opp);
+    var sel = null;
+    a.ordered.forEach(function (x) { if (x.product.id === opp.selectedProductId) sel = x; });
+    if (!sel || !sel.match.hardFail) return null;
+    var reasons = [];
+    (sel.match.gaps || []).forEach(function (g) {
+      if (g.indexOf('起订量') === 0) reasons.push(g);
+    });
+    if (!sel.match.modelHit && a.parsed.models && a.parsed.models.length) {
+      reasons.push('客户询盘的型号（' + a.parsed.models.join('、') + '）在所选商品上对不上');
+    }
+    if (!sel.match.typeHit && a.parsed.types && a.parsed.types.length) {
+      reasons.push('客户询盘的品类与所选商品对不上');
+    }
+    if (!reasons.length) reasons.push('所选商品与客户需求存在硬性冲突');
+    return { product: sel.product, reasons: reasons };
+  }
+
+  function openQuoteBlock(opp) {
+    var b = quoteBlock(opp);
+    if (!b) return;
+    var html = modalHead('已拦截：所选商品对不上') +
+      '<div class="modal-bd">' +
+      '<div class="alert danger"><span class="ic">!</span><div>' +
+      '当前选中的商品 <strong>' + esc(b.product.title || b.product.sku || '') + '</strong> 与这条询盘硬性冲突：' +
+      '<br>· ' + b.reasons.map(esc).join('<br>· ') +
+      '<br>继续报价很可能把错货报给客户，所以「生成回复 / 报价单 / 标记已报价」已先拦下。' +
+      '</div></div>' +
+      '<div style="margin-top:12px;font-size:13px;color:var(--ink-2)">' +
+      '建议先在下方「橱窗匹配」里换一个对得上的商品，或到商品库补充正确货源。' +
+      '如果你已经人工核对过实物、确认就是这一款，可以放行一次（会记进操作记录）。</div>' +
+      '</div>' +
+      '<div class="modal-ft">' +
+      '<button class="btn ghost" data-action="close-modal">先不报，去换商品</button>' +
+      '<button class="btn danger" data-action="force-quote" data-id="' + opp.id + '">已人工核对，放行报价</button>' +
+      '</div>';
+    openModal(html);
+  }
+
+  function quoteBannerHtml(opp) {
+    var b = quoteBlock(opp);
+    if (b) {
+      return '<div class="alert danger"><span class="ic">!</span><div>' +
+        '<strong>报价已拦截：</strong>所选商品「' + esc(b.product.title || '') + '」与询盘对不上（' +
+        b.reasons.map(esc).join('；') +
+        '）。生成回复、报价单、标记已报价都已停用，先在下方「橱窗匹配」换商品，或点生成按钮时选择人工放行。</div></div>';
+    }
+    if (opp.matchOverride && opp.selectedProductId) {
+      return '<div class="alert warn"><span class="ic">!</span><div>' +
+        '<strong>已人工放行：</strong>所选商品与询盘存在硬性冲突，你已确认核对无误。发出前请再检查一遍商品名和规格。</div></div>';
+    }
+    return '';
   }
 
   function ctxFor(opp) {
@@ -1163,7 +1229,8 @@
         var tags = [];
         if (x.match.modelHit) tags.push('<span class="chip good">型号 ' + esc(x.match.model || '') + '</span>');
         else if (x.match.hardFail) tags.push('<span class="chip bad">型号不符</span>');
-        if (x.match.quotable) tags.push('<span class="chip good">可报价</span>');
+        if (x.match.hardFail) tags.push('<span class="chip bad">不可报价</span>');
+        else if (x.match.quotable) tags.push('<span class="chip good">可报价</span>');
         else tags.push('<span class="chip bad">待补成本</span>');
         x.match.gaps.forEach(function (g) { tags.push('<span class="chip bad">' + esc(g) + '</span>'); });
 
@@ -1203,7 +1270,7 @@
       tabBtn('log', '操作记录', opp) +
       '</div><div class="card-bd" id="tab-body">' + tabBody(ctx) + '</div></section>';
 
-    return '<div class="stack">' + head + '<div data-pf="verdict">' + verdictHtml(ctx) + '</div>' +
+    return '<div class="stack">' + head + quoteBannerHtml(opp) + '<div data-pf="verdict">' + verdictHtml(ctx) + '</div>' +
       '<div data-pf="judge">' + (window.Judge ? window.Judge.render(ctx) : '') + '</div>' +
       '<div class="grid grid-2 top">' + left + right + '</div>' +
       buyerCard(opp) + followCard(opp) + sandboxCard(ctx) + matchCard + extra + tabs + '</div>';
@@ -1406,6 +1473,11 @@
     }
 
     if (S.tab === 'quote') {
+      if (quoteBlock(opp)) {
+        return '<div class="alert danger"><span class="ic">!</span><div>' +
+          '<strong>报价单已拦截：</strong>所选商品与这条询盘对不上（型号/品类不符或低于起订量），' +
+          '先在「橱窗匹配」里换一个对得上的商品；确认无误需要放行时，点上方「报价单」按钮按提示操作。</div></div>';
+      }
       return '<div class="alert info" style="margin-bottom:12px"><span class="ic">i</span>' +
         '<div>下面是报价单预览。<strong>打印 / 存 PDF</strong> 会打开新窗口，选「另存为 PDF」即可发给客户。</div></div>' +
         '<div class="row" style="margin-bottom:12px">' +
@@ -2360,6 +2432,7 @@
         var opp = oppById(btn.getAttribute('data-opp'));
         if (!opp) return;
         opp.selectedProductId = id;
+        opp.matchOverride = false;
         opp.quote.autoPrice = true;
         opp.quote.unitPriceUsd = 0;
         C.addLog(opp, '切换匹配商品为 ' + (productById(id) || {}).sku);
@@ -2382,7 +2455,9 @@
         var o3 = oppById(id || (location.hash.match(/opp\/([^\/]+)/) || [])[1]);
         if (!o3) return;
         var lang = btn.getAttribute('data-lang') || 'en';
-        var ctx = ctxFor(prepareOpp(o3));
+        var o3p = prepareOpp(o3);
+        if (quoteBlock(o3p)) { openQuoteBlock(o3p); return; }
+        var ctx = ctxFor(o3p);
         o3.drafts = o3.drafts || {};
         o3.drafts[lang] = lang === 'en' ? R.replyEn(ctx) : R.replyZh(ctx);
         C.addLog(o3, '生成' + (lang === 'en' ? '英文' : '中文') + '回复草稿');
@@ -2408,7 +2483,9 @@
       case 'print-quote': {
         var o5 = oppById(id);
         if (!o5) return;
-        var doc = R.quoteDocument(ctxFor(prepareOpp(o5)));
+        var o5p = prepareOpp(o5);
+        if (quoteBlock(o5p)) { openQuoteBlock(o5p); return; }
+        var doc = R.quoteDocument(ctxFor(o5p));
         var w = window.open('', '_blank');
         if (!w) { toast('浏览器拦截了弹窗，请允许后重试'); return; }
         try { w.opener = null; } catch (err) { /* 同源新窗口才能置空，置不了也不影响打印 */ }
@@ -2422,12 +2499,24 @@
       case 'mark-quoted': {
         var o6 = oppById(id);
         if (!o6) return;
+        if (quoteBlock(o6)) { openQuoteBlock(o6); return; }
         o6.status = 'quoted';
         C.pushQuoteVersion(o6, o6.quote, '标记报价');
         W.startFollow(o6, st().settings);
         C.addLog(o6, '自动排跟进：' + C.fmtDate(o6.followUpAt, true));
         invalidate(); C.persist(); render();
         toast('已标记报价，' + C.num(st().settings.followUpDays, 3) + ' 天后提醒跟进');
+        break;
+      }
+
+      case 'force-quote': {
+        var o7 = oppById(id);
+        if (!o7) return;
+        o7.matchOverride = true;
+        C.addLog(o7, '人工核对后放行：所选商品与询盘硬性冲突，仍继续报价');
+        closeModal();
+        invalidate(); C.persist(); render();
+        toast('已放行，现在可以生成回复 / 报价单了');
         break;
       }
 

@@ -408,6 +408,18 @@
     if (name === 'quote') {
       var prod = findProduct(S.selectedSku);
       if (!prod) { S.notice = '先选一个候选商品。'; paint(); return; }
+      /* 与商机详情同一条拦截线：所选商品与询盘硬性冲突（型号/品类对不上、
+         或数量低于起订量，即 Matching 的 hardFail）时不许生成报价回复，
+         避免把错货报给客户；换一个候选商品即可继续。 */
+      var MM = root.Matching;
+      if (MM && S.text) {
+        var mRank = MM.rank({ rawText: S.text }, [prod]);
+        if (mRank.matches && mRank.matches[0] && mRank.matches[0].hardFail) {
+          S.notice = '已拦截：所选商品与询盘对不上（型号/品类不符或低于起订量），换一个候选商品再报价。';
+          S.reply = '';
+          paint(); return;
+        }
+      }
       var qty = S.qty || prod.moq || 100;
       try {
         var r = quoteFor(prod, qty, { unitPriceUsd: S.priceUsd });

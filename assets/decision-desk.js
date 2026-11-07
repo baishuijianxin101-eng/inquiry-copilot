@@ -7,9 +7,12 @@
    回复草稿（ReplyAssistant，只生成、永不发送）→ 下一步建议
    （规则引擎，基于缺失字段/匹配确定性/报价状态）。
 
-   数据边界：只读当前商品库（演示数据）与设置；不保存商机、
-   不写状态、不发消息。本页所有价格均为演示口径（DEMO）。
-   未知信息一律标记未知，不编造。
+   数据边界：只读当前商品库（演示数据）与设置；不发消息。
+   本页所有价格均为演示口径（DEMO）。未知信息一律标记未知，不编造。
+   P1-2 批次 1 起：分析成果可由用户人工点击「保存到商机」写入既有
+   商机记录（parseEdits / matches / selectedProductId / replyDrafts，
+   结构与商机详情页的保存路径完全一致），或先建档再保存；无任何
+   自动保存，写入一律走 Core.persist 并检查其返回值。
    ========================================================= */
 (function () {
   'use strict';
@@ -246,8 +249,271 @@
     return steps.slice(0, 5);
   }
 
+  /* ---------- 2.5 保存到商机（P1-2 批次 1） ----------
+     写入的四类字段与商机详情页既有保存路径同构：
+     - parseEdits：键名与 core.sanitizeParseEdits / app.saveParsed 一致
+       （型号存 modelsText、认证存 certsText），只写非空项；
+     - matches：{productId, score, reason}，与 normalizeOpp 的清洗口径一致；
+     - selectedProductId：仅在有可靠匹配时写，并同步 matchOverride=false
+       （与详情页人工选品语义一致）；无可靠匹配时不触碰这两个字段；
+     - replyDrafts：场景键必须落在 core 的 REPLY_SCENARIOS 白名单内，
+       草稿为空不写；人工改过草稿时保留商机上原有的中文稿，不拿空值覆盖。
+     parseEdits 的数量/交期同步写回 quote（与 saveParsed 相同，避免解析
+     口径与报价口径各说各话）；quoteVersions、followLog、deal 等一律不碰。 */
+  var REPLY_SCENARIOS = ['first', 'prequote', 'spec', 'moq', 'negotiation', 'sample', 'clarify'];
+
+  function buildSavePayload(result, effNow, draft, baseDraft) {
+    var e = effNow || (result && result.eff) || {};
+    var pe = {};
+    if (e.productName) pe.productName = String(e.productName).slice(0, 160);
+    if (e.models && e.models.length) pe.modelsText = e.models.join(', ').slice(0, 160);
+    if (num(e.qty) > 0) pe.qty = Math.round(num(e.qty));
+    if (num(e.targetPriceUsd) > 0) pe.targetPriceUsd = Math.round(num(e.targetPriceUsd) * 100) / 100;
+    if (e.country) pe.country = String(e.country).slice(0, 160);
+    if (e.destination) pe.destination = String(e.destination).slice(0, 160);
+    if (num(e.leadTimeDays) > 0) pe.leadTimeDays = Math.round(num(e.leadTimeDays));
+    if (e.incoterm) pe.incoterm = String(e.incoterm).slice(0, 160);
+    if (e.certs && e.certs.length) pe.certsText = e.certs.join(', ').slice(0, 160);
+    if (e.purpose) pe.purpose = String(e.purpose).slice(0, 160);
+    var matches = null, selectedProductId = null;
+    if (result && !result.noMatch && result.candidates && result.candidates.length) {
+      matches = result.candidates.map(function (c) {
+        return { productId: String((c.product && (c.product.id || c.product.sku)) || ''), score: Math.round(num(c.score)), reason: (c.hits || []).join('、').slice(0, 200) };
+      }).filter(function (m) { return m.productId; });
+      if (result.top && result.top.product) selectedProductId = String(result.top.product.id || result.top.product.sku || '') || null;
+      if (!matches.length) { matches = null; selectedProductId = null; }
+    }
+    var draftSlot = null;
+    var edited = draft != null && baseDraft != null && draft !== baseDraft;
+    if (draft && result && result.reply && REPLY_SCENARIOS.indexOf(result.reply.scenario) >= 0) {
+      draftSlot = { key: result.reply.scenario, en: String(draft), zh: edited ? null : (result.reply.zh || null), edited: edited };
+    }
+    return { parseEdits: pe, matches: matches, selectedProductId: selectedProductId, draftSlot: draftSlot };
+  }
+
+  function applySavePayload(opp, payload) {
+    var written = [];
+    opp.parseEdits = payload.parseEdits || {};
+    written.push('解析修正');
+    if (payload.parseEdits.qty) opp.quote.qty = payload.parseEdits.qty;
+    if (payload.parseEdits.leadTimeDays) opp.quote.leadTimeDays = payload.parseEdits.leadTimeDays;
+    if (payload.matches) { opp.matches = payload.matches; written.push('匹配结果'); }
+    if (payload.selectedProductId) {
+      opp.selectedProductId = payload.selectedProductId;
+      opp.matchOverride = false;
+      written.push('选品');
+    }
+    if (payload.draftSlot) {
+      opp.replyDrafts = opp.replyDrafts || {};
+      var prev = opp.replyDrafts[payload.draftSlot.key] || null;
+      opp.replyDrafts[payload.draftSlot.key] = {
+        en: payload.draftSlot.en,
+        zh: payload.draftSlot.zh != null ? payload.draftSlot.zh : (prev ? prev.zh || '' : ''),
+        edited: payload.draftSlot.edited,
+        at: root.Core && root.Core.nowIso ? root.Core.nowIso() : null
+      };
+      written.push('回复草稿');
+    }
+    return written;
+  }
+
+  function currentView() {
+    try {
+      var v = root.localStorage && root.localStorage.getItem('ic_data_view');
+      if (v === 'demo' || v === 'real') return v;
+    } catch (e) {}
+    var st = state();
+    var dv = st && st.uiState && st.uiState.dataView;
+    return (dv === 'demo' || dv === 'real') ? dv : 'real';
+  }
+
+  /* 商品池视图隔离（DEMO-PRODUCT-ISOLATION-01/02）：与 Core.visibleOpps
+     对商机的口径对称——演示视图只允许演示商品、真实视图只允许非演示
+     商品，唯一判据是 Core.isDemoProduct（demo 标记或内置演示 ID 集），
+     不用名称/价格/前缀猜测。过滤必须发生在匹配与报价计算之前：
+     runAnalysis 在调用 analyze 之前先过此函数。
+     Fail-closed（02 修复 01 的 fail-open）：判据不存在、不是函数、或对
+     任一商品调用时抛错，整个池判定失败并返回 { ok: false, products: [] }，
+     绝不返回未经分类的原始池、绝不跳过坏商品保留其余商品。 */
+  function poolForView(products, view) {
+    var list = Array.isArray(products) ? products : [];
+    if (!root.Core || typeof root.Core.isDemoProduct !== 'function') {
+      return { ok: false, products: [], reason: 'classifier_unavailable' };
+    }
+    var kept;
+    try {
+      kept = list.filter(function (p) {
+        var demo = !!root.Core.isDemoProduct(p);
+        return view === 'demo' ? demo : !demo;
+      });
+    } catch (e) {
+      return { ok: false, products: [], reason: 'classifier_error' };
+    }
+    return { ok: true, products: kept };
+  }
+
+  function visibleTargets() {
+    var st = state();
+    if (!st || !root.Core || !root.Core.visibleOpps) return [];
+    return root.Core.visibleOpps(st, currentView()).slice().sort(function (a, b) {
+      return String(b.createdAt || '').localeCompare(String(a.createdAt || ''));
+    });
+  }
+
+  function el(id) {
+    return (typeof document !== 'undefined' && document && document.getElementById) ? document.getElementById(id) : null;
+  }
+
+  /* 建档成功后就地刷新目标下拉：让选中项与已重绑的 S.targetOppId 一致，
+     避免界面仍显示「新建商机」而实际已绑定新商机（后续点击应走更新）。 */
+  function refreshTargetOptions() {
+    var tg = el('dd-target');
+    if (!tg) return;
+    var targets = visibleTargets();
+    tg.innerHTML = '<option value="">＋ 新建商机（保存时建档）</option>' + targets.map(function (o) {
+      var label = ((o.buyer && o.buyer.name) || '未知买家') + ' · ' + String(o.createdAt || '').slice(0, 10) + ' · ' + String(o.rawText || '').replace(/\s+/g, ' ').slice(0, 36);
+      return '<option value="' + esc(o.id) + '">' + esc(label) + '</option>';
+    }).join('');
+    tg.value = S.targetOppId || '';
+  }
+
+  var DUP_STATUS_LABEL = { new: '待处理', matched: '已匹配', quoted: '已报价', won: '已成交', lost: '已丢单' };
+
+  /* 疑似重复候选面板：逐条列出全部候选并可单独打开，或明确仍要新建。
+     查重只是提醒——措辞一律「疑似」，不冒充确定重复。 */
+  function renderDupPanel() {
+    var box = el('dd-dup');
+    if (!box) return;
+    var dups = S.dupCandidates || [];
+    if (!dups.length) { box.innerHTML = ''; return; }
+    box.innerHTML = '<div class="alert" style="margin-top:8px"><span class="ic">i</span><div>发现 <b>' + dups.length + '</b> 条与本次粘贴内容相同、买家相同的已有商机（<b>疑似重复</b>，不会自动合并）。打开已有商机继续处理，或确认是新询盘后仍要新建并保存。</div></div>' +
+      dups.map(function (d) {
+        return '<div style="display:flex;gap:8px;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid #eee">' +
+          '<div style="min-width:0"><b>' + esc(d.buyerName || '未知买家') + '</b> <span class="badge">' + esc(DUP_STATUS_LABEL[d.status] || d.status) + '</span> <span class="mute">' + esc(String(d.createdAt || '').slice(0, 10)) + '</span>' +
+          '<div class="mute" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:420px">' + esc(d.snippet) + '</div></div>' +
+          '<button class="btn sm" data-dd-open="' + esc(d.id) + '">打开已有商机</button></div>';
+      }).join('') +
+      '<div style="margin-top:8px"><button class="btn primary" id="dd-dup-force">仍要新建并保存</button></div>';
+    var opens = box.querySelectorAll('[data-dd-open]');
+    for (var i = 0; i < opens.length; i++) {
+      (function (btn) {
+        btn.addEventListener('click', function () {
+          S.dupCandidates = [];
+          switchTarget(btn.getAttribute('data-dd-open'), null);
+        });
+      })(opens[i]);
+    }
+    var force = el('dd-dup-force');
+    if (force) force.addEventListener('click', function () {
+      S.dupForce = true;
+      S.dupCandidates = [];
+      var b = el('dd-dup'); if (b) b.innerHTML = '';
+      saveToOpp();
+    });
+  }
+
+  function saveFeedback(kind, msg) {
+    var s = el('dd-save-status');
+    if (s) {
+      s.textContent = msg;
+      s.style.color = kind === 'error' ? '#b91c1c' : '#047857';
+    }
+    return msg;
+  }
+
+  /* 保存主流程。返回 {ok, stage, oppId, message}：
+     stage: 'update' 直接写入既有商机；'create' 先建档后写入；
+     建档成功但成果写入失败时 ok=false 且 stage='created-unsaved'，
+     此时目标已绑定到新商机，再次点击只补写成果、不会重复建档。 */
+  function saveToOpp() {
+    if (S.saving) return { ok: false, stage: 'busy', message: '正在保存，请勿重复点击' };
+    if (!S.result) return { ok: false, stage: 'no-result', message: '先完成一次分析再保存' };
+    var C = root.Core;
+    if (!C || !C.get || !C.persist) return { ok: false, stage: 'no-core', message: '数据模块未就绪，无法保存' };
+    var st = C.get();
+    if (!st) return { ok: false, stage: 'no-state', message: '数据未就绪，无法保存' };
+    S.saving = true;
+    var btn = el('dd-save');
+    if (btn) btn.disabled = true;
+    try {
+      var p0 = root.P0Parse ? root.P0Parse.extract(S.text) : null;
+      /* 保存时的解析修正取用户当前确认的字段值：浏览器里读七个字段输入框
+         （可能改了字段还没点重新分析）；无 DOM 的环境回退到最近一次分析的 eff */
+      var effNow = (typeof document !== 'undefined' && document && document.getElementById)
+        ? buildEff(p0, collectEdits()) : S.result.eff;
+      var payload = buildSavePayload(S.result, effNow, S.draft, S.baseDraft);
+      var view = currentView();
+      var targetId = S.targetOppId || '';
+      var opp = null;
+      var created = false;
+      if (targetId) {
+        var list = C.visibleOpps(st, view);
+        for (var i = 0; i < list.length; i++) { if (list[i].id === targetId) { opp = list[i]; break; } }
+        if (!opp) {
+          saveFeedback('error', '保存失败：目标商机不存在或不在当前视图，未写入任何数据');
+          return { ok: false, stage: 'target-missing', message: '目标商机不存在或不在当前视图' };
+        }
+      } else {
+        /* P1-2 批次 2：建档查重闸——与新建商机弹窗同一套 Core 查重，
+           命中先让用户裁决（打开已有 / 仍要新建），不自动合并或拒绝；
+           查重异常按无命中处理，绝不阻断保存。 */
+        var dups = [];
+        try { dups = C.findDuplicateOpps ? C.findDuplicateOpps(st, view, { name: '未知买家', company: '' }, S.text) : []; } catch (e) { dups = []; }
+        if (dups.length && !S.dupForce) {
+          S.dupCandidates = dups;
+          renderDupPanel();
+          saveFeedback('error', '发现 ' + dups.length + ' 条疑似重复询盘，请先在下方确认（只是提醒，不会自动合并）');
+          return { ok: false, stage: 'duplicate', oppId: '', message: '疑似重复，待用户确认' };
+        }
+        S.dupCandidates = [];
+        var settings = st.settings || {};
+        opp = C.normalizeOpp({
+          demo: view === 'demo',
+          buyer: { name: '未知买家', company: '', country: effNow.country || '', channel: '询盘' },
+          rawText: S.text,
+          quote: {
+            qty: effNow.qty || 100,
+            unitPriceUsd: 0,
+            incoterm: settings.defaultIncoterm,
+            leadTimeDays: effNow.leadTimeDays || settings.defaultLeadTimeDays,
+            validDays: settings.quoteValidDays
+          }
+        });
+        st.opportunities.unshift(opp);
+        if (C.addLog) C.addLog(opp, '决策台建档（粘贴询盘保存）');
+        if (!C.persist()) {
+          var ix = st.opportunities.indexOf(opp);
+          if (ix >= 0) st.opportunities.splice(ix, 1);
+          saveFeedback('error', '建档失败：本地写入被阻断或失败，未创建商机，请检查后重试');
+          return { ok: false, stage: 'create-failed', message: '建档落盘失败，已回滚' };
+        }
+        created = true;
+        S.targetOppId = opp.id;
+        targetId = opp.id;
+      }
+      var written = applySavePayload(opp, payload);
+      if (C.addLog) C.addLog(opp, '决策台保存分析成果：' + written.join('、'));
+      if (!C.persist()) {
+        if (created) {
+          saveFeedback('error', '已建档（商机已创建），但分析成果未保存成功，请再次点击保存补写');
+          return { ok: false, stage: 'created-unsaved', oppId: targetId, message: '已建档，分析成果未保存' };
+        }
+        saveFeedback('error', '保存失败：本地写入被阻断或失败，商机数据未变更');
+        return { ok: false, stage: 'persist-failed', oppId: targetId, message: '落盘失败' };
+      }
+      var who = (opp.buyer && opp.buyer.name) || '商机';
+      if (created) refreshTargetOptions();
+      saveFeedback('ok', (created ? '已建档并保存到新商机' : '已保存到商机') + '（' + who + '）：' + written.join('、'));
+      if (btn) btn.textContent = '已保存 ✓';
+      return { ok: true, stage: created ? 'create' : 'update', oppId: targetId, message: '保存成功' };
+    } finally {
+      S.saving = false;
+      if (btn) btn.disabled = false;
+    }
+  }
+
   /* ---------- 3. 页面 ---------- */
-  var S = { text: '', result: null, draft: '', baseDraft: '' };
+  var S = { text: '', result: null, draft: '', baseDraft: '', targetOppId: '', saving: false, dupForce: false, dupCandidates: [], poolError: null };
 
   /* 人工修改检测：当前草稿与最近一次 AI 生成的原稿内容不一致即视为已人工修改。
      按内容比较：删空、改字算修改；改回与原稿完全一致则不再算修改。 */
@@ -269,11 +535,28 @@
     var h = '<section class="card"><div class="card-hd"><div class="card-title">询盘处理决策台' +
       '<span class="card-sub">粘贴一条买家询盘，一次得到：需求、推荐商品与理由、能不能报价、回复草稿、下一步</span></div>' +
       '<span class="badge" style="background:#fef3c7;color:#92400e">演示数据 DEMO</span></div>' +
-      '<div class="alert" style="margin-bottom:10px"><span class="ic">i</span><div>本台只读当前演示商品库，价格为演示口径；草稿只供人工确认与复制，<b>永不自动发送</b>。未知信息会明确标为未知。</div></div>' +
+      '<div class="alert" style="margin-bottom:10px"><span class="ic">i</span><div>本台只读当前演示商品库，价格为演示口径；草稿<b>永不自动发送</b>。分析完成后可点第 6 区的「保存到商机」把成果存入商机，只有人工点击才会写入。未知信息会明确标为未知。</div></div>' +
       '<textarea id="dd-text" rows="6" style="width:100%" placeholder="粘贴买家询盘原文（中英文均可）">' + esc(S.text) + '</textarea>' +
       '<div style="margin-top:10px"><button class="btn primary" id="dd-analyze">开始分析</button></div></section>';
     var r = S.result;
-    if (!r) return h;
+    if (!r) {
+      /* 分类校验失败的专属提示（与空池提示文案不同，禁止伪装成空池） */
+      if (S.poolError) {
+        return h + '<section class="card"><div class="alert warn"><span class="ic">!</span><div>商品分类校验失败，已停止分析。请刷新页面或检查数据状态后重试；本提示不是「商品为空」，系统未使用任何未经分类的商品。</div></div></section>';
+      }
+      return h;
+    }
+
+    /* 视图已切换：旧商品池的候选、报价、成本与草稿一律不渲染，
+       避免演示/真实跨视图串数据（DEMO-PRODUCT-ISOLATION-01） */
+    if (r.poolView && r.poolView !== currentView()) {
+      return h + '<section class="card"><div class="alert warn"><span class="ic">!</span><div>视图已切换，请重新分析。上方输入保留，但之前的候选、报价与草稿来自' +
+        (r.poolView === 'demo' ? '演示' : '真实') + '视图的商品池，已停止显示。</div></div></section>';
+    }
+    if (r.poolEmpty) {
+      h += '<section class="card"><div class="alert warn"><span class="ic">!</span><div>当前视图没有可用商品，不会使用另一视图的商品。本次分析没有可用的' +
+        (r.poolView === 'demo' ? '演示' : '真实') + '商品可匹配，请先在对应视图准备商品数据。</div></div></section>';
+    }
 
     /* ① 买家需求（可修正） */
     var e = r.eff;
@@ -357,6 +640,26 @@
     h += '<section class="card"><div class="card-hd"><div class="card-title">5 · 下一步做什么</div></div><ol class="dd-steps">' +
       r.steps.map(function (s) { return '<li><b>' + esc(s.action) + '</b> <span class="mute">— ' + esc(s.why) + '</span></li>'; }).join('') +
       '</ol></section>';
+
+    /* ⑥ 保存到商机（P1-2 批次 1）：目标只能是当前视图内的商机，或新建。
+       写入内容：解析修正、匹配结果、选品、回复草稿；不改报价版本与跟进记录。 */
+    var targets = visibleTargets();
+    var targetStillValid = targets.some(function (o) { return o.id === S.targetOppId; });
+    if (S.targetOppId && !targetStillValid) S.targetOppId = '';
+    h += '<section class="card"><div class="card-hd"><div class="card-title">6 · 保存到商机' +
+      '<span class="card-sub">把本次分析成果存进商机，切换页面或刷新后不丢失；只有点保存才会写入</span></div></div>' +
+      '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">' +
+      '<label>保存到 <select id="dd-target" style="max-width:340px">' +
+      '<option value="">＋ 新建商机（保存时建档）</option>' +
+      targets.map(function (o) {
+        var label = ((o.buyer && o.buyer.name) || '未知买家') + ' · ' + String(o.createdAt || '').slice(0, 10) + ' · ' + String(o.rawText || '').replace(/\s+/g, ' ').slice(0, 36);
+        return '<option value="' + esc(o.id) + '"' + (o.id === S.targetOppId ? ' selected' : '') + '>' + esc(label) + '</option>';
+      }).join('') +
+      '</select></label>' +
+      '<button class="btn primary" id="dd-save">保存到商机</button>' +
+      '<span id="dd-save-status" style="font-size:13px"></span></div>' +
+      '<div id="dd-dup"></div>' +
+      '<div class="mute" style="margin-top:6px">保存内容：解析修正、匹配与选品、回复草稿（场景：' + esc(r.reply ? (r.reply.scenarioLabel || r.reply.scenario || '') : '无草稿') + '）。不会改动报价版本、跟进记录与成交信息。</div></section>';
     return h;
   }
 
@@ -368,9 +671,28 @@
       if (!ok) return false;
     }
     var st = state();
-    var products = (st && st.products) || [];
+    var poolView = currentView();
+    var pool = poolForView((st && st.products) || [], poolView);
+    if (!pool.ok) {
+      /* Fail-closed：分类校验失败 → 不调用 analyze、作废旧结果（含草稿），
+         显示与空池不同的失败提示，绝不放行未经分类的商品 */
+      S.result = null; S.draft = ''; S.baseDraft = '';
+      S.dupForce = false; S.dupCandidates = [];
+      S.poolError = pool.reason || 'classifier_unavailable';
+      var vf = document.getElementById('view');
+      if (vf) { vf.innerHTML = view(); mount(); }
+      if (root.App && root.App.toast) root.App.toast('商品分类校验失败，已停止分析');
+      return false;
+    }
+    S.poolError = null;
+    var products = pool.products;
     var settings = (st && st.settings) || {};
+    S.dupForce = false; S.dupCandidates = [];
     S.result = analyze(S.text, products, settings, edits || null);
+    /* 记录本次分析的商品池来源视图与空池状态：视图切换后 view()
+       据此拒绝渲染旧结果；空池时明确提示、绝不回退另一视图的商品 */
+    S.result.poolView = poolView;
+    S.result.poolEmpty = products.length === 0;
     S.draft = S.result.reply ? (S.result.reply.en || '') : '';
     S.baseDraft = S.draft;
     var v = document.getElementById('view');
@@ -409,7 +731,33 @@
     });
     var dr = document.getElementById('dd-draft');
     if (dr) dr.addEventListener('input', function () { S.draft = dr.value; });
+    var sv = document.getElementById('dd-save');
+    if (sv) sv.addEventListener('click', function () { saveToOpp(); });
+    var tg = document.getElementById('dd-target');
+    if (tg) tg.addEventListener('change', function () { switchTarget(tg.value, tg); });
+    if (S.dupCandidates && S.dupCandidates.length) renderDupPanel();
   }
 
-  root.DecisionDesk = { analyze: analyze, nextSteps: nextSteps, view: view, mount: mount, runAnalysis: runAnalysis, draftEdited: draftEdited, _state: S };
+  /* 切换保存目标：载入所选商机的原文并清空当前分析，避免把 A 的成果写进 B。
+     当前草稿有人工修改时先确认（与重新分析的草稿保护同一口径）。 */
+  function switchTarget(newId, selectEl) {
+    if (!newId || newId === S.targetOppId) { S.targetOppId = newId || ''; return; }
+    var list = visibleTargets();
+    var opp = null;
+    for (var i = 0; i < list.length; i++) { if (list[i].id === newId) { opp = list[i]; break; } }
+    if (!opp) { if (selectEl) selectEl.value = S.targetOppId || ''; return; }
+    if (S.result && draftEdited()) {
+      var ok = (typeof root.confirm === 'function') ? root.confirm('切换商机将载入所选商机的原文，当前草稿包含人工修改、切换后将清空，是否继续？') : false;
+      if (!ok) { if (selectEl) selectEl.value = S.targetOppId || ''; return; }
+    }
+    S.targetOppId = newId;
+    S.text = opp.rawText || '';
+    S.result = null;
+    S.draft = ''; S.baseDraft = '';
+    S.dupForce = false; S.dupCandidates = [];
+    var v = document.getElementById('view');
+    if (v) { v.innerHTML = view(); mount(); }
+  }
+
+  root.DecisionDesk = { analyze: analyze, nextSteps: nextSteps, view: view, mount: mount, runAnalysis: runAnalysis, draftEdited: draftEdited, buildSavePayload: buildSavePayload, applySavePayload: applySavePayload, saveToOpp: saveToOpp, poolForView: poolForView, _state: S };
 })();

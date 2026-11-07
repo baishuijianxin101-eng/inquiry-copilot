@@ -154,6 +154,42 @@
     };
   }
 
+  /* P1-2 批次 3：「待跟进」推导（纯计算、只读，绝不回写任何字段）。
+     入选条件：状态为已报价（quoted）；跟进状态未被标为已完成；
+     以「最近一次有效活动」为基准——最近跟进记录时间（followLog.at）
+     与最近报价时间（quoteVersions.at）取较晚者——距今超过 7 天。
+     时间字段全部缺失或非法时不入选（缺数据不等于超期）。 */
+  function maxValidMs(list, get) {
+    var best = 0;
+    (list || []).forEach(function (x) {
+      var t = Date.parse(get(x) || '');
+      if (isFinite(t) && t > best) best = t;
+    });
+    return best;
+  }
+  function staleQuotes(opps, nowMs) {
+    var out = [];
+    (opps || []).forEach(function (o) {
+      if (!o || o.status !== 'quoted') return;
+      if (deriveStatus(o) === 'done') return;
+      var lastFollowMs = maxValidMs(o.followLog, function (r) { return r && r.at; });
+      var quoteMs = maxValidMs(o.quoteVersions, function (v) { return v && v.at; });
+      var baseMs = Math.max(lastFollowMs, quoteMs);
+      if (!baseMs) return;
+      var ageMs = nowMs - baseMs;
+      if (ageMs > 7 * 86400000) {
+        out.push({
+          opp: o,
+          baseAt: new Date(baseMs).toISOString(),
+          lastFollowAt: lastFollowMs ? new Date(lastFollowMs).toISOString() : null,
+          quoteAt: quoteMs ? new Date(quoteMs).toISOString() : null,
+          days: Math.floor(ageMs / 86400000)
+        });
+      }
+    });
+    return out.sort(function (a, b) { return b.days - a.days; });
+  }
+
   FU.typeLabel = typeLabel;
   FU.statusLabel = statusLabel;
   FU.validType = validType;
@@ -167,6 +203,7 @@
   FU.dueState = dueState;
   FU.sortRank = sortRank;
   FU.draftRecordFields = draftRecordFields;
+  FU.staleQuotes = staleQuotes;
   FU.VERSION = '1.0.0';
   root.FollowUp = FU;
 })();

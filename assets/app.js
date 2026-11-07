@@ -1274,8 +1274,24 @@
         '<td>' + (it.due && it.due.state === 'overdue' ? '<span style="color:#b91c1c">已逾期</span>' : esc((it.due && it.due.label) || '—')) + '</td>' +
         '<td style="color:#667085">' + (last ? esc(String(last.at || '').slice(0, 10)) + ' ' + esc(String(last.note || '').slice(0, 40)) : '暂无跟进记录') + '</td></tr>';
     }).join('');
+    /* P1-2 批次 3：「待跟进」推导区——已报价且最近活动（跟进记录或
+       报价版本）超过 7 天的商机。纯推导展示，不回写商机任何字段。 */
+    var stale = window.FollowUp.staleQuotes ? window.FollowUp.staleQuotes(C.visibleOpps(s, S.dataView), Date.now()) : [];
+    var staleHtml = '';
+    if (stale.length) {
+      var srows = stale.map(function (it) {
+        return '<tr><td>' + fwOppLink(it.opp, (it.opp.buyer && it.opp.buyer.name) || '未知买家') + '</td>' +
+          '<td>' + (it.quoteAt ? esc(String(it.quoteAt).slice(0, 10)) : '—') + '</td>' +
+          '<td>' + (it.lastFollowAt ? esc(String(it.lastFollowAt).slice(0, 10)) : '暂无跟进记录') + '</td>' +
+          '<td><span style="color:#b91c1c">已 ' + it.days + ' 天无活动</span></td></tr>';
+      }).join('');
+      staleHtml = '<div style="padding:0 18px 6px"><h4 style="margin:8px 0 4px">待跟进（已报价超 7 天无活动）</h4>' +
+        '<p style="color:#667085;font-size:12.5px;margin:0 0 6px">由报价版本与跟进记录实时推导，只提示、不改变商机状态；在详情里补一条跟进记录后会自动移出。</p></div>' +
+        '<div class="table-wrap"><table class="tbl"><thead><tr><th>客户</th><th>最近报价</th><th>最近跟进</th><th>沉默时长</th></tr></thead><tbody>' + srows + '</tbody></table></div>';
+    }
     return '<section class="card"><div class="card-head"><h3>跟进管理</h3><span class="sub">跨询盘跟进清单</span></div>' +
       '<p style="padding:0 18px;color:#667085;font-size:13px">按跟进紧急度排序；记录与提醒的维护在各询盘详情内完成，本页只做聚合查看，不新增待办数据。</p>' +
+      staleHtml +
       (items.length ? '<div class="table-wrap"><table class="tbl"><thead><tr><th>客户</th><th>跟进状态</th><th>到期</th><th>最近记录</th></tr></thead><tbody>' + rows + '</tbody></table></div>'
         : '<div class="empty"><strong>暂无进行中的询盘</strong></div>') + '</section>';
   }
@@ -3859,6 +3875,8 @@
       }
 
       case 'save-opp': saveOpp(id); break;
+      case 'dup-open': S.pendingCreate = null; closeModal(); location.hash = '#/opp/' + id; render(); break;
+      case 'dup-create-anyway': { var pc = S.pendingCreate; S.pendingCreate = null; if (pc) doCreateOpp(pc); break; }
 
       default: break;
     }
@@ -4323,22 +4341,33 @@
       return;
     }
 
+    /* P1-2 批次 2：建档查重闸——命中疑似重复时先让用户裁决，
+       查重只是提醒：不自动合并、不自动拒绝、不改写旧商机；
+       查重本身异常时按无命中处理，绝不阻断正常建档。 */
+    var payload = { name: name, company: company, country: country, channel: channel, raw: raw, parsed: parsed };
+    var dups = [];
+    try { dups = C.findDuplicateOpps ? C.findDuplicateOpps(st(), S.dataView, { name: name, company: company }, raw) : []; } catch (e) { dups = []; }
+    if (dups.length) { S.pendingCreate = payload; openDupModal(dups); return; }
+    doCreateOpp(payload);
+  }
+
+  function doCreateOpp(p) {
     var fresh = C.normalizeOpp({
       buyer: {
-        name: name, company: company,
-        country: country || parsed.country || '',
-        channel: channel
+        name: p.name, company: p.company,
+        country: p.country || p.parsed.country || '',
+        channel: p.channel
       },
-      rawText: raw,
+      rawText: p.raw,
       quote: {
-        qty: parsed.qty || 100,
+        qty: p.parsed.qty || 100,
         unitPriceUsd: 0,
-        incoterm: parsed.incoterm ? (parsed.incoterm + ' ' + (st().settings.defaultIncoterm.split(' ')[1] || '')) : st().settings.defaultIncoterm,
-        leadTimeDays: parsed.leadTimeDays || st().settings.defaultLeadTimeDays,
+        incoterm: p.parsed.incoterm ? (p.parsed.incoterm + ' ' + (st().settings.defaultIncoterm.split(' ')[1] || '')) : st().settings.defaultIncoterm,
+        leadTimeDays: p.parsed.leadTimeDays || st().settings.defaultLeadTimeDays,
         validDays: st().settings.quoteValidDays
       }
     });
-    C.addLog(fresh, '商机创建（' + channel + '渠道）');
+    C.addLog(fresh, '商机创建（' + p.channel + '渠道）');
     st().opportunities.unshift(fresh);
 
     closeModal();
@@ -4346,6 +4375,30 @@
     location.hash = '#/opp/' + fresh.id;
     render();
     toast('已创建并完成匹配');
+  }
+
+  /* 疑似重复提示弹窗：逐条列出全部候选（日期/状态/买家/原文摘要），
+     每条可单独打开；或明确选择仍要新建。措辞一律「疑似」，不冒充确定。 */
+  function openDupModal(dups) {
+    var rows = dups.map(function (d) {
+      var stLabel = (STATUS[d.status] || {}).label || d.status;
+      return '<div style="display:flex;gap:8px;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid #eee">' +
+        '<div style="min-width:0"><div><b>' + esc(d.buyerName || '未知买家') + '</b>' +
+        (d.company ? ' <span class="mute">' + esc(d.company) + '</span>' : '') +
+        ' <span class="badge">' + esc(stLabel) + '</span> <span class="mute">' + esc(String(d.createdAt || '').slice(0, 10)) + '</span></div>' +
+        '<div class="mute" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:460px">' + esc(d.snippet) + '</div></div>' +
+        '<button class="btn sm" data-action="dup-open" data-id="' + safeActionId(d.id) + '">打开已有商机</button></div>';
+    }).join('');
+    var html = modalHead('疑似重复询盘') +
+      '<div class="modal-bd">' +
+      '<div class="alert" style="margin-bottom:8px"><span class="ic">i</span><div>发现 <b>' + dups.length + '</b> 条与本次粘贴内容相同、且买家相同的已有商机。这只是<b>疑似重复</b>提醒，系统不会自动合并或拒绝。你可以打开已有商机继续处理，或确认这是一条新询盘、仍要新建。</div></div>' +
+      rows +
+      '</div>' +
+      '<div class="modal-ft">' +
+      '<button class="btn ghost" data-action="close-modal">取消</button>' +
+      '<button class="btn primary" data-action="dup-create-anyway">仍要新建</button>' +
+      '</div>';
+    openModal(html, true);
   }
 
   /* =========================================================
@@ -5256,7 +5309,28 @@
     toast('跟进记录已删除');
   }
 
-  /* 阶段四草稿 → 跟进记录：必须人工勾选确认「已实际发送」，复制/生成不算发送 */
+  /* 本地日历日期工具（P1-2 批次 3）：一律用设备本地年月日运算，
+     setDate 做日历加减——跨月、跨年、夏令时都不会偏移一天；
+     禁止用 UTC 时间戳加 72 小时推日期。 */
+  function localDateStr(d) {
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  }
+  function localTodayPlusStr(days) {
+    var t = new Date();
+    t.setDate(t.getDate() + days);
+    return localDateStr(t);
+  }
+  function isRealLocalDateStr(s) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(s || '')) return false;
+    var p = s.split('-');
+    var y = +p[0], m = +p[1], d = +p[2];
+    var dt = new Date(y, m - 1, d);
+    return dt.getFullYear() === y && dt.getMonth() === m - 1 && dt.getDate() === d;
+  }
+
+  /* 阶段四草稿 → 跟进记录：必须人工勾选确认「已实际发送」，复制/生成不算发送。
+     P1-2 批次 3：确认同屏必须选定下一次动作日期（默认本地日期 +3 天），
+     日期写入跟进记录 plannedAt，并同步商机 nextActionAt / followUpAt。 */
   function openSentConfirm(id) {
     var o = oppById(id);
     if (!o) return;
@@ -5271,7 +5345,7 @@
       '<div style="font-size:12.5px">场景：' + esc(gen.scenarioLabel) + ' · 草稿保存于 ' + esc(C.fmtDate(saved.at, true)) + (saved.edited ? ' · 已人工编辑' : '') + '</div>' +
       '<label style="display:flex;gap:8px;align-items:flex-start;font-size:13px;line-height:1.6">' +
       '<input type="checkbox" id="ms-confirm" style="margin-top:3px">我确认这份回复已经实际发送给买家</label>' +
-      '<div class="field"><label>下次跟进日期（留空按设置自动算）</label><input type="date" id="ms-date"></div>' +
+      '<div class="field"><label>下次跟进日期（必选，默认 +3 天，可改）</label><input type="date" id="ms-date" value="' + localTodayPlusStr(3) + '"></div>' +
       '</div>' +
       '<div class="modal-ft"><button class="btn ghost" data-action="close-modal">取消</button>' +
       '<button class="btn primary" data-action="ra-sent-confirm" data-id="' + safeActionId(o.id) + '">确认并记录</button></div>';
@@ -5286,21 +5360,36 @@
     var ctx = analyzeOpp(o);
     var gen = replyGenFor(o, ctx);
     if (!gen) return;
+    var saved = (o.replyDrafts || {})[gen.scenario];
+    if (!saved) { toast('先生成并保存草稿，再记录发送'); return; }
+    /* 防重复确认：同一份已保存草稿（saved.at 未变）已生成过发送记录时，
+       再次确认视为重复操作，不再生成第二条记录。 */
+    var already = (o.followLog || []).some(function (r) {
+      return r && r.source === 'draft' && r.summary && r.summary.indexOf('（' + gen.scenarioLabel + '）') >= 0 &&
+        (!saved.at || !r.at || String(r.at) >= String(saved.at));
+    });
+    if (already) { toast('这份草稿已经记录为已发送，无需重复确认'); closeModal(); return; }
     var dateEl = document.getElementById('ms-date');
     var date = dateEl ? String(dateEl.value || '').trim() : '';
-    var d = date ? new Date(date + 'T09:00:00') : null;
-    var plannedIso = (d && !isNaN(d.getTime()))
-      ? d.toISOString()
-      : new Date(Date.now() + Math.max(1, C.num(st().settings.followUpDays, 3)) * 86400000).toISOString();
+    if (!date) { toast('请选择下次跟进日期（必选）'); return; }
+    if (!isRealLocalDateStr(date)) { toast('下次跟进日期不正确，请重新选择'); return; }
+    if (date < localDateStr(new Date())) { toast('下次跟进日期不能早于今天'); return; }
+    var plannedIso = new Date(date + 'T09:00:00').toISOString();
     var fields = window.FollowUp.draftRecordFields(gen.scenario, gen.scenarioLabel);
     fields.plannedAt = plannedIso;
     var rec = window.FollowUp.addRecord(o, fields, C.nowIso(), C.uid('fu'));
     if (!rec) { toast('记录失败'); return; }
     o.lastContactAt = C.nowIso();
+    o.lastTouchAt = o.lastContactAt;
     o.followCount = C.num(o.followCount, 0) + 1;
     o.followStatus = 'waiting';
+    /* 跟进记录 plannedAt、followUpAt（addRecord 已同步）与 nextActionAt
+       必须一致——工作台到期区读 followUpAt/nextActionAt，缺一不可 */
+    o.nextActionAt = plannedIso;
     C.addLog(o, '确认已发送回复（' + gen.scenarioLabel + '），已生成跟进记录');
-    invalidate(); C.persist(); closeModal(); render();
+    invalidate();
+    if (!C.persist()) { toast('保存失败：本地写入被阻断，本次记录未保存，请重试'); return; }
+    closeModal(); render();
     toast('已记录为已发送，下次跟进 ' + C.fmtDate(plannedIso));
   }
 

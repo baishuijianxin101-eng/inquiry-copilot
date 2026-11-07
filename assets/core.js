@@ -489,6 +489,48 @@
     });
   }
 
+  /* P1-2 批次 2：建档查重（只提示、不裁决）。
+     buyerKeyOf 与 app 层客户聚合的 buyerKey 完全同规（company 优先、
+     其次 name，去空白转小写），不得另立口径。 */
+  function buyerKeyOf(buyer) {
+    var b = buyer || {};
+    return String(b.company || b.name || '').trim().toLowerCase();
+  }
+
+  /* 询盘原文规范化指纹：统一换行、折叠一切空白、转小写后做 FNV-1a
+     并附规范化后长度。只消除排版差异，数字、单位、规格、型号、日期
+     等业务字符一字不动；指纹相等才算疑似重复，不做模糊相似判定，
+     避免把数量/规格不同的新需求误伤为重复。 */
+  function inquiryFingerprint(text) {
+    var s = String(text == null ? '' : text).replace(/\r\n?/g, '\n').toLowerCase().replace(/\s+/g, ' ').trim();
+    if (!s) return '';
+    var h = 0x811c9dc5;
+    for (var i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = (h * 0x01000193) >>> 0; }
+    return ('0000000' + h.toString(16)).slice(-8) + ':' + s.length;
+  }
+
+  /* 在指定数据视图内按 buyerKey + 指纹找疑似重复商机，只返回展示
+     所需字段。任何异常都返回空数组——查重失败不得阻断正常建档。 */
+  function findDuplicateOpps(state, view, buyer, rawText) {
+    try {
+      var fp = inquiryFingerprint(rawText);
+      var key = buyerKeyOf(buyer);
+      if (!fp || !key) return [];
+      return visibleOpps(state, view).filter(function (o) {
+        return buyerKeyOf(o.buyer) === key && inquiryFingerprint(o.rawText) === fp;
+      }).map(function (o) {
+        return {
+          id: o.id,
+          createdAt: o.createdAt || '',
+          status: o.status || 'new',
+          buyerName: (o.buyer && o.buyer.name) || '',
+          company: (o.buyer && o.buyer.company) || '',
+          snippet: String(o.rawText || '').replace(/\s+/g, ' ').slice(0, 80)
+        };
+      }).sort(function (a, b) { return String(b.createdAt).localeCompare(String(a.createdAt)); });
+    } catch (e) { return []; }
+  }
+
   /* 只清除演示数据（商机/订单/商品），真实数据一律不动。 */
   function purgeDemo(state) {
     var counts = { opps: 0, products: 0, orders: 0 };
@@ -1223,6 +1265,7 @@
     addLog: addLog, stats: stats,
     isDemoOpp: isDemoOpp, isDemoProduct: isDemoProduct, isDemoOrder: isDemoOrder,
     visibleOpps: visibleOpps, purgeDemo: purgeDemo,
+    buyerKeyOf: buyerKeyOf, inquiryFingerprint: inquiryFingerprint, findDuplicateOpps: findDuplicateOpps,
     // 规范化
     normalizeProduct: normalizeProduct, normalizeOpp: normalizeOpp, normalizeOrder: normalizeOrder,
     normalizeSettings: normalizeSettings, normalizeQuote: normalizeQuote, normalizeEndpoint: normalizeEndpoint,

@@ -56,6 +56,9 @@
     if (/[\u0590-\u05FF]/.test(s)) return 'he';
     if (/[\u0E00-\u0E7F]/.test(s)) return 'th';
     if (/[\u0900-\u097F]/.test(s)) return 'hi';
+    /* 拉丁语系兜底（P1-4-LANG）：西/法不再误判为 en，词表在 lang-pack */
+    var LP = (typeof window !== 'undefined' ? window : globalThis).LangPack;
+    if (LP && LP.hintLatin) { var h = LP.hintLatin(s); if (h) return h; }
     return 'en';
   }
 

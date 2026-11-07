@@ -27,7 +27,7 @@
     { key: 'quote', label: '明确要求报价', pts: 10, re: /\b(please\s+)?(quote|quotation|send\s+(?:me\s+)?(?:your\s+)?(?:best\s+)?price|price\s+list|your\s+best\s+(?:price|offer))\b|报价|询价/i },
     { key: 'order', label: '明确采购/下单意向', pts: 10, re: /\b(place\s+(?:an?\s+)?order|will\s+order|ready\s+to\s+(?:buy|order)|we\s+will\s+(?:buy|purchase)|want\s+to\s+(?:buy|order|purchase)|purchase\s+order)\b|下单|采购/i },
     { key: 'sample', label: '索要样品', pts: 6, re: /\bsamples?\b|样品/i },
-    { key: 'terms', label: '询问付款/合同细节', pts: 5, re: /\b(payment\s+terms?|proforma|pi\b|contract|deposit)\b|付款方式|定金/i },
+    { key: 'terms', label: '询问付款/合同细节', pts: 5, re: /\b(payment\s+terms?|proforma|pi\b(?![a-zA-Zà-ÿÀ-Ÿ])|contract|deposit)\b|付款方式|定金/i },
     { key: 'urgent', label: '时间紧迫', pts: 4, re: /\b(urgent|asap|as\s+soon\s+as\s+possible|immediately)\b|急|尽快/i },
     { key: 'details', label: '索要目录/详细资料', pts: 3, re: /\b(catalog|catalogue|more\s+details|detailed\s+specifications?|brochure)\b|目录|详细资料/i }
   ];
@@ -59,9 +59,21 @@
 
     /* ---- 2. 采购意向（25）：只认明说信号 ---- */
     var iGot = 3, iWhy = ['已主动发来询盘（+3）'], signals = [];
+    var matchedKeys = {};
     SIGNALS.forEach(function (s) {
-      if (s.re.test(raw)) { iGot += s.pts; signals.push(s.label); iWhy.push(s.label + '（+' + s.pts + '）'); }
+      if (s.re.test(raw)) { iGot += s.pts; signals.push(s.label); iWhy.push(s.label + '（+' + s.pts + '）'); matchedKeys[s.key] = 1; }
     });
+    /* 词汇包意向信号（西/法）：与内置信号同 key 同分值，按 key 去重，
+       同一信号不因多语言重复计分（如法语 urgent 与英文 urgent 同词） */
+    var LP = root.LangPack;
+    if (LP && LP.all) {
+      LP.all().forEach(function (pk) {
+        (pk.signals || []).forEach(function (s) {
+          if (matchedKeys[s.key]) return;
+          if (s.re.test(raw)) { iGot += s.pts; signals.push(s.label); iWhy.push(s.label + '（+' + s.pts + '）'); matchedKeys[s.key] = 1; }
+        });
+      });
+    }
     if (!signals.length) iWhy.push('未见明确采购信号：没提报价、下单、样品等动作');
     var intentScore = Math.min(25, iGot);
     dim('intent', '采购意向', 25, intentScore, iWhy);

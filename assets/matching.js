@@ -49,8 +49,15 @@
     if (!text) return out;
     var s = String(text).toLowerCase();
 
+    /* 拉丁字母通道先去重音（récepteur → recepteur、pièces → pieces），
+       否则重音会把单词劈成碎片；中文通道仍走原文，互不影响 */
+    var sLat = (typeof s.normalize === 'function')
+      ? s.normalize('NFD').replace(/[\u0300-\u036f]/g, '') : s;
+    /* 无 NFD 分解的字母补映射：土耳其 ı→i、越南 đ→d，否则会被劈词 */
+    sLat = sLat.replace(/ı/g, 'i').replace(/đ/g, 'd');
+
     // 英文/数字/型号：500ml、304、tws、usb-c
-    var en = s.match(/[a-z0-9][a-z0-9.\-]*/g) || [];
+    var en = sLat.match(/[a-z0-9][a-z0-9.\-]*/g) || [];
     en.forEach(function (t) {
       var tok = t.replace(/[.\-]+$/, '');
       if (tok.length < 2) return;
@@ -71,6 +78,16 @@
         out[bg] = (out[bg] || 0) + 1;
       }
     });
+
+    /* 词汇包词典：西/法品类词附加英文等价 token（receptor → receiver），
+       让非英语询盘能与英文商品库做名称重合；只增不删，原 token 全保留 */
+    var LP = (typeof window !== 'undefined' ? window : globalThis).LangPack;
+    if (LP && LP.gloss) {
+      Object.keys(out).forEach(function (t) {
+        var g = LP.gloss[t];
+        if (g && !out[g]) out[g] = out[t];
+      });
+    }
 
     return out;
   }
@@ -103,6 +120,15 @@
     var s = String(text || '');
     for (var i = 0; i < TYPES.length; i++) {
       if (TYPES[i][0].test(s) && out.indexOf(TYPES[i][1]) < 0) out.push(TYPES[i][1]);
+    }
+    /* 词汇包品类词（西/法）：与英文 TYPES 同一归一化品类口径 */
+    var LP = (typeof window !== 'undefined' ? window : globalThis).LangPack;
+    if (LP && LP.all) {
+      LP.all().forEach(function (pk) {
+        (pk.typeWords || []).forEach(function (tw) {
+          if (tw[0].test(s) && out.indexOf(tw[1]) < 0) out.push(tw[1]);
+        });
+      });
     }
     return out;
   }

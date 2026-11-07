@@ -251,6 +251,31 @@
       else unconfirmed.push('用途（' + eff.purpose + '）在该商品信息里无法确认，需人工判断适配性');
     }
 
+    /* ---- 语言覆盖护栏（P1-4-LANG P4） ----
+       原文主要文字尚无分词通道/词汇包（西里尔、阿拉伯、希伯来、
+       天城文、泰文、假名、谚文等），且关键需求字段几乎全未解析时，
+       型号/认证缩写等少数拉丁 token 不得单独支撑高分：封顶 49 并标
+       lowConfidence。这是「信息不足」而非「商品冲突」，不设 keyConflict。
+       英/中/西/法文字不触发本护栏，既有结果不变。 */
+    var lowConfidence = false;
+    var UNSUPPORTED_SCRIPT = /[\u0400-\u04FF\u0590-\u05FF\u0600-\u06FF\u0900-\u097F\u0E00-\u0E7F\u3040-\u30FF\uAC00-\uD7AF]/;
+    if (rawText && UNSUPPORTED_SCRIPT.test(rawText)) {
+      var coverage = 0;
+      if (eff.qty > 0) coverage++;
+      if (eff.productName) coverage++;
+      if ((eff.specs || []).length) coverage++;
+      if (eff.destination || eff.country) coverage++;
+      var typeHit = false;
+      try { typeHit = (M().typesOf(rawText) || []).length > 0; } catch (e) { typeHit = false; }
+      if (typeHit) coverage++;
+      if (coverage <= 1) {
+        lowConfidence = true;
+        cap = Math.min(cap, 49);
+        unconfirmed.push('询盘主要文字暂不支持自动解析（或关键信息过少），当前分数仅由型号/认证等少量可识别信息得出，置信度低，需人工确认需求');
+        questions.push('先人工确认买家需求（可借助翻译面板阅读原文），再决定报价商品');
+      }
+    }
+
     var score = applicable ? Math.round((earned / applicable) * 100) : 0;
     if (score > cap) score = cap;
     var level = keyConflict ? (score >= 50 ? '中' : '低') : (score >= 75 ? '高' : score >= 50 ? '中' : '低');
@@ -259,6 +284,7 @@
       score: score,
       level: level,
       keyConflict: keyConflict,
+      lowConfidence: lowConfidence,
       capped: cap < 100,
       dims: dims,
       hits: hits,

@@ -40,7 +40,17 @@
   function fold(s) {
     var out = str(s).replace(/[\uFF01-\uFF5E]/g, function (ch) {
       return String.fromCharCode(ch.charCodeAt(0) - 0xFEE0);
-    }).replace(/\u3000/g, ' ');
+    }).replace(/\u3000/g, ' ')
+    /* 本地数字归一（等长替换，不动字符偏移）：阿拉伯-印度数字、
+       东阿拉伯数字、天城文数字 → ASCII；阿语小数符 ٫ → .、千分符 ٬ → , */
+    .replace(/[\u0660-\u0669\u06F0-\u06F9\u0966-\u096F\u066B\u066C]/g, function (ch) {
+      var c = ch.charCodeAt(0);
+      if (c === 0x066B) return '.';
+      if (c === 0x066C) return ',';
+      if (c >= 0x0660 && c <= 0x0669) return String(c - 0x0660);
+      if (c >= 0x06F0 && c <= 0x06F9) return String(c - 0x06F0);
+      return String(c - 0x0966);
+    });
     return out;
   }
 
@@ -65,6 +75,56 @@
   }
 
   function num(v) { var n = parseFloat(String(v).replace(/,/g, '')); return isFinite(n) ? n : 0; }
+
+  /* 语言词汇包（lang-pack.js）：缺失时静默降级为英/中原行为 */
+  function lpPacks() {
+    var L = (typeof window !== 'undefined' ? window : globalThis).LangPack;
+    return (L && L.all) ? L.all() : [];
+  }
+  function lpCity(written) {
+    var L = (typeof window !== 'undefined' ? window : globalThis).LangPack;
+    return (L && L.cityOf) ? L.cityOf(written) : '';
+  }
+
+  /* 金额数字解析（P1-4-LANG P0 安全修复）：严格区分小数点、千分位
+     分隔符与小数逗号，返回 { value, certain }。
+     - 两种分隔符都在：最后一个是小数分隔（1.250,50 欧式 / 1,250.50 美式）
+     - 只有逗号：1,250 这类三位分组是千分位；3,50（逗号后 1–2 位）是小数逗号；
+       3,500 单逗号三位既可读千分位也可读小数，判歧义 certain=false
+     - 只有小数点：1.250 同样歧义（欧式千分位或 1.25），certain=false
+     certain=false 的金额只留痕、角色强制 UNKNOWN，永不写入目标价。 */
+  function parseMoney(s) {
+    s = String(s || '').replace(/\s+/g, '');
+    if (!/^\d[\d.,]*$/.test(s)) return { value: 0, certain: false };
+    var hasDot = s.indexOf('.') >= 0, hasComma = s.indexOf(',') >= 0, m;
+    if (hasDot && hasComma) {
+      if (s.lastIndexOf(',') > s.lastIndexOf('.')) {
+        return { value: parseFloat(s.replace(/\./g, '').replace(',', '.')), certain: true };
+      }
+      return { value: parseFloat(s.replace(/,/g, '')), certain: true };
+    }
+    if (hasComma) {
+      if (/^\d{1,3}(,\d{3}){2,}$/.test(s)) return { value: parseFloat(s.replace(/,/g, '')), certain: true };
+      m = /^(\d+),(\d{1,2})$/.exec(s);
+      if (m) return { value: parseFloat(m[1] + '.' + m[2]), certain: true };
+      if (/^\d{1,3},\d{3}$/.test(s)) return { value: parseFloat(s.replace(/,/g, '')), certain: false };
+      return { value: 0, certain: false };
+    }
+    if (hasDot) {
+      if (/^\d{1,3}(\.\d{3}){2,}$/.test(s)) return { value: parseFloat(s.replace(/\./g, '')), certain: true };
+      if (/^\d{1,3}\.\d{3}$/.test(s)) return { value: parseFloat(s), certain: false };
+      if (/^\d+\.\d+$/.test(s)) return { value: parseFloat(s), certain: true };
+      return { value: 0, certain: false };
+    }
+    return { value: parseFloat(s), certain: true };
+  }
+
+  /* 数量数字：词汇包路径专用（1.500 unidades 的点是千分位），英/中路径仍用 num() */
+  function qtyNum(s) {
+    s = String(s || '').replace(/\s+/g, '');
+    if (/^\d{1,3}(\.\d{3})+$/.test(s)) return parseFloat(s.replace(/\./g, ''));
+    return num(s);
+  }
 
   /* 型号：字母开头 + 至少两位数字，或纯数字串长度≥5 且带连字符 */
   function findModels(raw) {
@@ -139,6 +199,23 @@
         break;
       }
     }
+    /* 词汇包后备（西/法数量单位与动词句式）：英/中未命中才启用 */
+    if (!fields.qty) {
+      var qPacks = lpPacks();
+      for (var qp = 0; qp < qPacks.length && !fields.qty; qp++) {
+        var qRes = qPacks[qp].qtyPatterns || [];
+        for (var qr = 0; qr < qRes.length; qr++) {
+          m = qRes[qr].exec(spacedTxt);
+          if (m && qtyNum(m[1]) > 0) {
+            fields.qty = qtyNum(m[1]);
+            fields.qtyUnit = (m[2] || 'pcs').toLowerCase();
+            evidence.qty = snippet(spacedTxt, m.index, m[0].length);
+            confidence.qty = 0.85;
+            break;
+          }
+        }
+      }
+    }
     if (!fields.qty) confidence.qty = 0;
 
     /* 价格提及与角色（P1-17 修复 A）：全量提取文中价格，按所在句的局部语义定角色；
@@ -181,8 +258,12 @@
     }
     function curOf(w) {
       w = String(w || '').toLowerCase();
-      if (/eur|欧元/.test(w)) return 'EUR';
+      if (/руб/.test(w)) return 'RUB';
+      if (/eur|euro|€|欧元|يورو|евро/.test(w)) return 'EUR';
       if (/gbp|英镑/.test(w)) return 'GBP';
+      if (/रुप/.test(w)) return 'INR';
+      if (/reais/.test(w)) return 'BRL';
+      if (/rupiah/.test(w)) return 'IDR';
       return 'USD';
     }
     /* 角色判定（第三阶段修复 B）：全部线索限定在价格所在子句内，
@@ -209,11 +290,27 @@
         if (/budget|预算/.test(sentLow)) return 'CUSTOMER_BUDGET';
         if (/target|meet|accept|afford|can\s+(you\s+)?do|目标价|能接受/.test(sentLow)) return 'CUSTOMER_TARGET';
       }
+      /* 词汇包价格语义（西/法）：只在英/中规则全部未命中时兜底，
+         优先级与主规则一致——竞品 → 我方价 → 太贵（不作目标）→ 预算 → 目标价 */
+      var packs = lpPacks(), blob = clauseLow + ' ' + beforeClause, pi2;
+      var hit = function (kind) {
+        for (pi2 = 0; pi2 < packs.length; pi2++) {
+          var w = packs[pi2].priceWords;
+          if (w && w[kind] && w[kind].test(kind === 'tooHigh' ? (clauseLow + ' ' + afterClause) : blob)) return true;
+        }
+        return false;
+      };
+      if (hit('competitor')) return 'COMPETITOR_QUOTE';
+      if (hit('ourQuote')) return 'OUR_QUOTE';
+      if (hit('tooHigh')) return 'UNKNOWN_PRICE';
+      if (hit('budget')) return 'CUSTOMER_BUDGET';
+      if (hit('target')) return 'CUSTOMER_TARGET';
       return 'UNKNOWN_PRICE';
     }
     var rawMentions = [], seenMention = {};
-    function addMention(value, currency, idx, rawMatch) {
-      if (!(value > 0)) return;
+    function addMention(parsed, currency, idx, rawMatch) {
+      if (!parsed || !(parsed.value > 0)) return;
+      var value = parsed.value;
       var key = idx + ':' + value + ':' + currency;
       if (seenMention[key]) return;
       seenMention[key] = 1;
@@ -221,14 +318,21 @@
       var before = spacedTxt.slice(Math.max(0, idx - 12), idx);
       var isRange = /^\s*[-–~]\s*\d/.test(after) || /\d\s*[-–~]\s*$/.test(before);
       rawMentions.push({ value: value, currency: currency, text: rawMatch, range: !!isRange, index: idx,
+        certain: parsed.certain !== false,
         snippet: snippet(spacedTxt, idx, rawMatch.length) });
     }
-    var pmRe1 = /\$\s*(\d[\d,]*(?:\.\d+)?)/g;
-    while ((m = pmRe1.exec(spacedTxt))) addMention(num(m[1]), 'USD', m.index, m[0]);
-    var pmRe2 = /(usd|dollars?|eur|gbp|美金|美元|欧元|英镑)\s*(\d[\d,]*(?:\.\d+)?)/gi;
-    while ((m = pmRe2.exec(spacedTxt))) addMention(num(m[2]), curOf(m[1]), m.index, m[0]);
-    var pmRe3 = /(\d[\d,]*(?:\.\d+)?)\s*(usd|dollars?|eur|gbp|美金|美元|欧元|英镑)/gi;
-    while ((m = pmRe3.exec(spacedTxt))) addMention(num(m[1]), curOf(m[2]), m.index, m[0]);
+    /* 数字部分放宽到 [0-9.,] 全串，由 parseMoney 判定格式，禁止再用
+       「剥逗号」的旧口径（"3,50 dollars" 曾被读成 350）。 */
+    var NUMSRC = '(\\d[\\d.,]*\\d|\\d)';
+    var CURWORDS = 'usd|dollars?|dólares|dolares|dolar|euros?|eur|gbp|美金|美元|欧元|英镑|دولار|يورو|डॉलर|रुपये|रुपया|reais|rupiah|рублей|рубля|рубль|долларов|доллара|доллар|евро';
+    var pmRe1 = new RegExp('\\$\\s*' + NUMSRC, 'g');
+    while ((m = pmRe1.exec(spacedTxt))) addMention(parseMoney(m[1]), 'USD', m.index, m[0]);
+    var pmReE = new RegExp(NUMSRC + '\\s*€|€\\s*' + NUMSRC, 'g');
+    while ((m = pmReE.exec(spacedTxt))) addMention(parseMoney(m[1] || m[2]), 'EUR', m.index, m[0]);
+    var pmRe2 = new RegExp('(' + CURWORDS + ')\\s*' + NUMSRC, 'gi');
+    while ((m = pmRe2.exec(spacedTxt))) addMention(parseMoney(m[2]), curOf(m[1]), m.index, m[0]);
+    var pmRe3 = new RegExp(NUMSRC + '\\s*(' + CURWORDS + ')', 'gi');
+    while ((m = pmRe3.exec(spacedTxt))) addMention(parseMoney(m[1]), curOf(m[2]), m.index, m[0]);
     rawMentions.sort(function (a, b) { return a.index - b.index; });
     var sentCount = {};
     rawMentions.forEach(function (x) {
@@ -244,11 +348,15 @@
       var beforeClause = cl.text.slice(Math.max(0, posInClause - 45), posInClause).toLowerCase();
       var afterClause = cl.text.slice(posInClause + x.text.length, posInClause + x.text.length + 30).toLowerCase();
       return { value: x.value, currency: x.currency, text: x.text, snippet: x.snippet, range: x.range, index: x.index,
-        role: priceRole(sent.toLowerCase(), cl.text.toLowerCase(), beforeClause, afterClause, sentCount[x._sr.start] || 1) };
+        certain: x.certain !== false,
+        /* 格式有歧义的金额（certain=false）角色强制 UNKNOWN：只留痕供人工确认，
+           永不进入 targetPriceUsd 与正式报价计算 */
+        role: x.certain === false ? 'UNKNOWN_PRICE'
+          : priceRole(sent.toLowerCase(), cl.text.toLowerCase(), beforeClause, afterClause, sentCount[x._sr.start] || 1) };
     });
     mentions.sort(function (a, b) { return a.index - b.index; });
     fields.priceMentions = mentions.map(function (x) {
-      return { value: x.value, currency: x.currency, role: x.role, text: x.text, snippet: x.snippet, range: x.range };
+      return { value: x.value, currency: x.currency, role: x.role, text: x.text, snippet: x.snippet, range: x.range, uncertain: x.certain === false };
     });
     var targetVals = [];
     mentions.forEach(function (x) {
@@ -289,6 +397,22 @@
         break;
       }
     }
+    /* 词汇包后备（西/法交期表达：días / jours 等） */
+    if (!fields.deadlineDays) {
+      var dPacks = lpPacks();
+      for (var dp = 0; dp < dPacks.length && !fields.deadlineDays; dp++) {
+        var dRes = dPacks[dp].deadlinePatterns || [];
+        for (var dr = 0; dr < dRes.length; dr++) {
+          m = dRes[dr].exec(spacedTxt);
+          if (m && num(m[1]) > 0) {
+            fields.deadlineDays = Math.round(num(m[1]));
+            evidence.deadlineDays = snippet(spacedTxt, m.index, m[0].length);
+            confidence.deadlineDays = 0.85;
+            break;
+          }
+        }
+      }
+    }
     var dateM = /\b(?:by|before|deliver(?:y)?\s*(?:by|before)?)\s*([A-Z][a-z]+\s+\d{1,2}(?:,?\s*\d{4})?)/.exec(folded);
     if (dateM) {
       fields.deadlineText = dateM[1];
@@ -322,6 +446,31 @@
           fields.destination = cand;
           evidence.destination = snippet(folded, m.index, m[0].length);
           confidence.destination = DES[ei].conf;
+          break;
+        }
+      }
+    }
+    /* 词汇包后备（西/法目的地句式 + 地名归一：Hamburgo/Hambourg → Hamburg）。
+       归一表查不到时保留买家原文写法，不猜。 */
+    if (!fields.destination) {
+      var xPacks = lpPacks();
+      for (var xp = 0; xp < xPacks.length && !fields.destination; xp++) {
+        var xRes = xPacks[xp].destPatterns || [];
+        for (var xr = 0; xr < xRes.length; xr++) {
+          m = xRes[xr].exec(folded);
+          if (!m) continue;
+          var xc = m[1].replace(/\s+/g, ' ').trim()
+            .replace(/\s+(?:lo|la|el|los|las|le|les|de|du|des|en|a|y|con|para)$/i, '').trim();
+          if (xc.length < 2 || isLabelCand(xc)) continue;
+          /* 归一优先：全串命中最好；两词捕获的第二词可能是功能词
+             （如阿语 «دبي خلال» 的 خلال=「在…之内」），全串未命中时
+             再用首词查归一表，命中即用 canonical；仍未命中保留原样，
+             不猜（FIX-01） */
+          var canonDest = lpCity(xc);
+          if (!canonDest && xc.indexOf(' ') > 0) canonDest = lpCity(xc.split(' ')[0]);
+          fields.destination = canonDest || xc;
+          evidence.destination = snippet(folded, m.index, m[0].length);
+          confidence.destination = 0.75;
           break;
         }
       }
@@ -384,6 +533,17 @@
     function certCtxOf(low, sentLow) {
       var sLow = sentLow || low;
       if (/not\s+required|isn'?t\s+required|do\s+not\s+require|don'?t\s+require|not\s+a\s+requirement|no\s+(\w+\s+)?requirement|not\s+mandatory|not\s+needed|does\s+not\s+need|doesn'?t\s+need|doesn'?t\s+require|do\s+not\s+need|don'?t\s+need|unnecessary|optional|不需要|非强制|可选/.test(low)) return 'not-required';
+      /* 词汇包认证语境（西/法）：否定优先的顺序与主规则一致；
+         英/中文本不含这些词，命中不到，既有判定不受影响 */
+      var cPacks = lpPacks(), cKinds = ['notRequired', 'inquiry', 'mandatory', 'preference'], cki, cpk;
+      for (cki = 0; cki < cKinds.length; cki++) {
+        for (cpk = 0; cpk < cPacks.length; cpk++) {
+          var ccx = cPacks[cpk].certCtx;
+          if (ccx && ccx[cKinds[cki]] && ccx[cKinds[cki]].test(low)) {
+            return cKinds[cki] === 'notRequired' ? 'not-required' : cKinds[cki];
+          }
+        }
+      }
       var interrog = /^(can|could|do|does|is|are|would)\b/.test(low.trim())
         || /can\s+you|could\s+you|do\s+you|can\s+your|could\s+your|whether|能否|可否|是否/.test(low)
         || (/\?/.test(sLow) && /(provide|supply|meet|comply|available|have)\b/.test(low) && !/require|mandatory|must/.test(low));
@@ -529,6 +689,40 @@
         evidence.productName = snippet(folded, m.index, m[0].length);
         confidence.productName = ni === 0 ? 0.9 : 0.75;
         break;
+      }
+    }
+    /* 词汇包后备（西/法需求句式）：切掉数量短语、交期/交付/价格尾巴与
+       「de 2,4 GHz」这类规格尾巴，只留商品短语本身 */
+    if (!fields.productName) {
+      var nPacks = lpPacks();
+      for (var np = 0; np < nPacks.length && !fields.productName; np++) {
+        var nRes = nPacks[np].namePatterns || [];
+        for (var nr = 0; nr < nRes.length; nr++) {
+          m = nRes[nr].exec(folded);
+          if (!m) continue;
+          var nc = m[1]
+            .replace(/(\d),(\d)/g, '$1\u0001$2') /* 保护小数逗号，免被逗号切分误伤 */
+            .replace(/^\s*(?:de|del|du|des|de la)\s+/i, '')
+            .split(/[,;\n।]|\.\s/)[0]
+            .split(/\s+(?:cantidad|entrega|plazo|livraison|d[ée]lai|quantit[ée]|prix|para|ihtiyac)\b/i)[0]
+            .split(/\s+(?:de|du|des)\s+\d/i)[0]
+            .replace(/\s{2,}/g, ' ')
+            .replace(/\u0001/g, ',')
+            .trim()
+            /* 剥尾部无意义标点（句号/逗号/分号等），如 "XR4." → "XR4" */
+            .replace(/[\s.,;:!?。，、；：！？]+$/, '')
+            .trim();
+          /* 纯数量短语不是商品名：询盘在数量后没跟商品名时，捕获会只剩
+             「400 Stück」「100 قطعة」这类数量+单位，必须拒绝并留空，
+             不得拿数量冒充商品名（FIX-01） */
+          var QTY_ONLY = /^\d[\d.,]*\s*(?:unidades|unidad|piezas|pieza|uds?|ejemplares?|pi[èe]ces?|unit[ée]s?|exemplaires?|stück|einheiten|einheit|teile|exemplare|قطعة|قطع|وحدة|وحدات|حبة|حبات|पीस|नग|यूनिट|टुकड़े|pcs|pieces|units?|sets?|cartons?|boxes)?$/i;
+          if (nc.length >= 3 && nc.length <= 60 && !QTY_ONLY.test(nc)) {
+            fields.productName = nc;
+            evidence.productName = snippet(folded, m.index, m[0].length);
+            confidence.productName = 0.7;
+            break;
+          }
+        }
       }
     }
     if (!fields.productName) confidence.productName = 0;

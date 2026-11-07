@@ -446,6 +446,9 @@
       var targetId = S.targetOppId || '';
       var opp = null;
       var created = false;
+      /* 新一轮保存尝试开始：清掉上一次的成功跳转入口，避免失败后残留误导 */
+      S.lastSavedOppId = '';
+      var oo0 = el('dd-open-opp'); if (oo0) oo0.innerHTML = '';
       if (targetId) {
         var list = C.visibleOpps(st, view);
         for (var i = 0; i < list.length; i++) { if (list[i].id === targetId) { opp = list[i]; break; } }
@@ -454,11 +457,18 @@
           return { ok: false, stage: 'target-missing', message: '目标商机不存在或不在当前视图' };
         }
       } else {
+        /* P1-3A：建档买家身份——用户在第 6 区可选填写称呼/公司，口径与
+           商机页建档一致（company 优先的 buyerKey 归一化不改）；两项
+           都为空时与旧行为逐字一致（未知买家、空公司）。 */
+        var bn = String(S.buyerName || '').trim();
+        var bc = String(S.buyerCompany || '').trim();
+        var buyerForCreate = { name: bn || '未知买家', company: bc };
         /* P1-2 批次 2：建档查重闸——与新建商机弹窗同一套 Core 查重，
            命中先让用户裁决（打开已有 / 仍要新建），不自动合并或拒绝；
-           查重异常按无命中处理，绝不阻断保存。 */
+           查重异常按无命中处理，绝不阻断保存。买家桶用本次填写值
+           （都为空时与旧版固定未知买家完全相同）。 */
         var dups = [];
-        try { dups = C.findDuplicateOpps ? C.findDuplicateOpps(st, view, { name: '未知买家', company: '' }, S.text) : []; } catch (e) { dups = []; }
+        try { dups = C.findDuplicateOpps ? C.findDuplicateOpps(st, view, buyerForCreate, S.text) : []; } catch (e) { dups = []; }
         if (dups.length && !S.dupForce) {
           S.dupCandidates = dups;
           renderDupPanel();
@@ -469,7 +479,7 @@
         var settings = st.settings || {};
         opp = C.normalizeOpp({
           demo: view === 'demo',
-          buyer: { name: '未知买家', company: '', country: effNow.country || '', channel: '询盘' },
+          buyer: { name: buyerForCreate.name, company: buyerForCreate.company, country: effNow.country || '', channel: '询盘' },
           rawText: S.text,
           quote: {
             qty: effNow.qty || 100,
@@ -503,7 +513,14 @@
       }
       var who = (opp.buyer && opp.buyer.name) || '商机';
       if (created) refreshTargetOptions();
-      saveFeedback('ok', (created ? '已建档并保存到新商机' : '已保存到商机') + '（' + who + '）：' + written.join('、'));
+      saveFeedback('ok', (created ? '已建档并保存到新商机' : '已保存到商机') + '（' + who + '）：' + written.join('、') +
+        '。下一步：打开该商机核对回复草稿，确认发送时请设定下一次跟进日期。');
+      /* P1-3A：保存成功衔接——用本次保存的准确 ID 生成详情页入口
+         （现有 #/opp/<id> 路由），不推测、不经列表查找；失败路径已在
+         保存开始时清掉该入口，不会残留。 */
+      S.lastSavedOppId = targetId;
+      var oo = el('dd-open-opp');
+      if (oo) oo.innerHTML = '<a class="btn sm primary" href="#/opp/' + esc(targetId) + '">打开该商机 →</a>';
       if (btn) btn.textContent = '已保存 ✓';
       return { ok: true, stage: created ? 'create' : 'update', oppId: targetId, message: '保存成功' };
     } finally {
@@ -513,7 +530,7 @@
   }
 
   /* ---------- 3. 页面 ---------- */
-  var S = { text: '', result: null, draft: '', baseDraft: '', targetOppId: '', saving: false, dupForce: false, dupCandidates: [], poolError: null };
+  var S = { text: '', result: null, draft: '', baseDraft: '', targetOppId: '', saving: false, dupForce: false, dupCandidates: [], poolError: null, buyerName: '', buyerCompany: '', lastSavedOppId: '' };
 
   /* 人工修改检测：当前草稿与最近一次 AI 生成的原稿内容不一致即视为已人工修改。
      按内容比较：删空、改字算修改；改回与原稿完全一致则不再算修改。 */
@@ -657,7 +674,12 @@
       }).join('') +
       '</select></label>' +
       '<button class="btn primary" id="dd-save">保存到商机</button>' +
-      '<span id="dd-save-status" style="font-size:13px"></span></div>' +
+      '<span id="dd-save-status" style="font-size:13px"></span>' +
+      '<span id="dd-open-opp">' + (S.lastSavedOppId && S.lastSavedOppId === S.targetOppId ? '<a class="btn sm primary" href="#/opp/' + esc(S.lastSavedOppId) + '">打开该商机 →</a>' : '') + '</span></div>' +
+      '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">' +
+      '<label>买家称呼（新建时可选）<input type="text" id="dd-buyer-name" value="' + esc(S.buyerName) + '" placeholder="买家姓名或称呼" style="margin-left:6px"></label>' +
+      '<label>公司（新建时可选）<input type="text" id="dd-buyer-company" value="' + esc(S.buyerCompany) + '" placeholder="公司名称" style="margin-left:6px"></label>' +
+      '<span class="mute">仅在新建商机时写入买家信息；留空按「未知买家」建档，与商机页建档口径一致。</span></div>' +
       '<div id="dd-dup"></div>' +
       '<div class="mute" style="margin-top:6px">保存内容：解析修正、匹配与选品、回复草稿（场景：' + esc(r.reply ? (r.reply.scenarioLabel || r.reply.scenario || '') : '无草稿') + '）。不会改动报价版本、跟进记录与成交信息。</div></section>';
     return h;
@@ -693,6 +715,7 @@
        据此拒绝渲染旧结果；空池时明确提示、绝不回退另一视图的商品 */
     S.result.poolView = poolView;
     S.result.poolEmpty = products.length === 0;
+    S.lastSavedOppId = '';
     S.draft = S.result.reply ? (S.result.reply.en || '') : '';
     S.baseDraft = S.draft;
     var v = document.getElementById('view');
@@ -733,6 +756,10 @@
     if (dr) dr.addEventListener('input', function () { S.draft = dr.value; });
     var sv = document.getElementById('dd-save');
     if (sv) sv.addEventListener('click', function () { saveToOpp(); });
+    var bnEl = document.getElementById('dd-buyer-name');
+    if (bnEl) bnEl.addEventListener('input', function () { S.buyerName = bnEl.value; });
+    var bcEl = document.getElementById('dd-buyer-company');
+    if (bcEl) bcEl.addEventListener('input', function () { S.buyerCompany = bcEl.value; });
     var tg = document.getElementById('dd-target');
     if (tg) tg.addEventListener('change', function () { switchTarget(tg.value, tg); });
     if (S.dupCandidates && S.dupCandidates.length) renderDupPanel();
@@ -751,6 +778,7 @@
       if (!ok) { if (selectEl) selectEl.value = S.targetOppId || ''; return; }
     }
     S.targetOppId = newId;
+    S.lastSavedOppId = '';
     S.text = opp.rawText || '';
     S.result = null;
     S.draft = ''; S.baseDraft = '';

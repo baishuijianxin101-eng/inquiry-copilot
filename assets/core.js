@@ -791,6 +791,10 @@
       selectedProductId: o.selectedProductId ? String(o.selectedProductId).slice(0, 60) : null,
       /* 型号不符拦截的人工放行标记：销售核对后显式放行才为 true，换商品时重置 */
       matchOverride: !!o.matchOverride,
+      /* P1-3B-2 决策台选品来源：只认 auto/manual 两值，其余一律归 null 防污染；
+         selectionAt 只接受 ISO 日期时间字符串，其余归 null */
+      selectionSource: o.selectionSource === 'manual' ? 'manual' : (o.selectionSource === 'auto' ? 'auto' : null),
+      selectionAt: (typeof o.selectionAt === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(o.selectionAt)) ? o.selectionAt : null,
       parseEdits: sanitizeParseEdits(o.parseEdits),
       /* P1-22 员工销售判断修正：与 AI 分析分开保存，白名单清洗后保留 */
       salesReview: sanitizeSalesReview(o.salesReview),

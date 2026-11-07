@@ -128,6 +128,66 @@
     return { unity: unity, certGuard: computeCertGuard(eff, product) };
   }
 
+  /* 结论链（P1-3B-2）：把「护栏 → 就绪 → safePrice → 草稿 → draftPriced」
+     抽成按候选执行的 conclude。analyze 默认以第一名调用（ambiguous 用
+     原判定），人工选品以所选候选调用且 ambiguous=false——人工点选即
+     拍板，与详情页选品后按所选商品报价的既有模型一致；其余门禁
+     （quotable / certGuard / unitUsd / hardFail）全部原样保留。
+     entry 为 ranked 条目 {product, result}；noMatch 时 entry 仍传第一名
+     （仅供草稿 match 信息），商品传 null，与原实现逐字等价。 */
+  function conclude(entry, ctx) {
+    var eff = ctx.eff, settings = ctx.settings, text = ctx.text;
+    var unity = null, readiness, certGuard = null, reply = null, draftPriced = false;
+    if (ctx.noMatch) {
+      readiness = { key: 'not-suitable', label: '当前条件不适合报价', why: '没有可靠匹配的商品，禁止强行推荐报价' };
+      /* 认证护栏独立于匹配结果：noMatch 分支同样计算并保留（第三阶段修复 D） */
+      certGuard = computeCertGuard(eff, null);
+    } else {
+      var g = guardrailFor(entry, eff, settings);
+      unity = g.unity;
+      if (!unity) readiness = { key: 'need-verify', label: '需要人工核实', why: '报价模块未返回结果' };
+      /* 歧义优先展示：否则演示数据普遍缺成本时，第 3 区永远只显示缺成本，
+         用户看不到「先确认哪一款」这条更靠前的动作（P1-8 验收 3.2）。
+         缺成本信息不丢弃，附在 why 里；报价拦截不因此放松——
+         safePrice 在歧义或不可报价时本就为空，草稿不会带价。 */
+      else if (ctx.ambiguous) readiness = { key: 'need-verify', label: '需要人工核实', why: '多个商品匹配接近，先人工确认推荐哪一款' + (unity.noCost ? '；另：' + unity.blockReasons.join('；') : '') };
+      else if (unity.noCost) readiness = { key: 'missing-cost', label: '缺少成本或必要报价参数', why: unity.blockReasons.join('；') };
+      else if (unity.quotable) readiness = { key: 'can-quote', label: '可以进入报价', why: '成本、保本价与底价校验通过（演示数据口径）' };
+      else readiness = { key: 'need-verify', label: '需要人工核实', why: unity.blockReasons.join('；') || '报价条件未全部通过' };
+      /* 认证护栏：即使价格口径全部通过，强制认证未核实也不得进入报价 */
+      certGuard = g.certGuard;
+      if (certGuard && readiness.key === 'can-quote') {
+        readiness = { key: 'need-verify', label: '需要人工核实', why: certGuard.why };
+      }
+    }
+    /* 回复草稿（复用 ReplyAssistant；价格只在可报价时传入） */
+    try {
+      /* 价格进草稿的门禁：可报价之外还必须匹配无歧义——歧义时第一名
+         只是待确认候选，把它的价格写进草稿等于替用户拍板（P1-3 审查 P1-01）；
+         人工选品路径 ctx.ambiguous 已由点选置 false，不在此放松其他门禁。 */
+      var safePrice = (unity && unity.quotable && unity.unitUsd > 0 && !ctx.ambiguous && !certGuard)
+        ? { unit: unity.unitUsd, floor: unity.quoteFloorUsd, breakEven: unity.breakEvenUsd > 0 ? unity.breakEvenUsd : null } : null;
+      reply = root.ReplyAssistant ? root.ReplyAssistant.generate({
+        opp: { rawText: text, buyer: { country: eff.country || '' }, quote: { qty: eff.qty || 0 }, status: 'new', followCount: 0 },
+        eff: eff,
+        product: ctx.noMatch ? null : entry.product,
+        match: entry ? { score: entry.result.score, keyConflict: entry.result.keyConflict, conflicts: entry.result.conflicts } : null,
+        price: safePrice,
+        sellerName: (settings && settings.sellerName) || '',
+        scenario: 'auto'
+      }) : null;
+      /* 工作报价展示门控（方案 1）：只有草稿的完整报价行确实采用了
+         safePrice.unit 时，才允许在第 3 区标注「工作报价（草稿采用）」。
+         ReplyAssistant 的 usedPrice 只表示价格曾传入（澄清稿也为真），
+         不能作依据；这里对报价行原文做严格整行匹配。无法确认即不标注。 */
+      if (safePrice && reply && reply.en) {
+        var amt = safePrice.unit.toFixed(2).replace(/\./g, '\\.');
+        draftPriced = new RegExp('^(?:For (?:\\d+|the quoted) pcs, our price is \\$' + amt + ' per piece(?: \\([^)]*\\))?|Our current best price is \\$' + amt + ' per piece, based on the listed specifications(?: and certifications \\([^)]*\\))?|The best I can offer for the current specification is \\$' + amt + ' per piece)\\.$', 'm').test(reply.en);
+      }
+    } catch (e) { reply = null; draftPriced = false; }
+    return { unity: unity, certGuard: certGuard, readiness: readiness, reply: reply, draftPriced: draftPriced };
+  }
+
   function analyze(text, products, settings, edits) {
     text = String(text || '');
     var p0 = root.P0Parse ? root.P0Parse.extract(text) : null;
@@ -152,34 +212,14 @@
       return {
         product: r.product, score: r.result.score,
         keyConflict: !!r.result.keyConflict,
-        hits: ds.hits, issues: ds.issues
+        hits: ds.hits, issues: ds.issues,
+        assess: r.result
       };
     });
 
     /* 报价条件判断（复用 Pricing.evaluate + PricingUnity.resolve，不自创口径） */
-    var unity = null, readiness, certGuard = null;
-    if (noMatch) {
-      readiness = { key: 'not-suitable', label: '当前条件不适合报价', why: '没有可靠匹配的商品，禁止强行推荐报价' };
-      /* 认证护栏独立于匹配结果：noMatch 分支同样计算并保留（第三阶段修复 D） */
-      certGuard = computeCertGuard(eff, null);
-    } else {
-      var gTop = guardrailFor(top, eff, settings);
-      unity = gTop.unity;
-      if (!unity) readiness = { key: 'need-verify', label: '需要人工核实', why: '报价模块未返回结果' };
-      /* 歧义优先展示：否则演示数据普遍缺成本时，第 3 区永远只显示缺成本，
-         用户看不到「先确认哪一款」这条更靠前的动作（P1-8 验收 3.2）。
-         缺成本信息不丢弃，附在 why 里；报价拦截不因此放松——
-         safePrice 在歧义或不可报价时本就为空，草稿不会带价。 */
-      else if (ambiguous) readiness = { key: 'need-verify', label: '需要人工核实', why: '多个商品匹配接近，先人工确认推荐哪一款' + (unity.noCost ? '；另：' + unity.blockReasons.join('；') : '') };
-      else if (unity.noCost) readiness = { key: 'missing-cost', label: '缺少成本或必要报价参数', why: unity.blockReasons.join('；') };
-      else if (unity.quotable) readiness = { key: 'can-quote', label: '可以进入报价', why: '成本、保本价与底价校验通过（演示数据口径）' };
-      else readiness = { key: 'need-verify', label: '需要人工核实', why: unity.blockReasons.join('；') || '报价条件未全部通过' };
-      /* 认证护栏：即使价格口径全部通过，强制认证未核实也不得进入报价 */
-      certGuard = gTop.certGuard;
-      if (certGuard && readiness.key === 'can-quote') {
-        readiness = { key: 'need-verify', label: '需要人工核实', why: certGuard.why };
-      }
-    }
+    var concl = conclude(top, { eff: eff, settings: settings, text: text, ambiguous: ambiguous, noMatch: noMatch });
+    var unity = concl.unity, readiness = concl.readiness, certGuard = concl.certGuard;
 
     /* P1-3B-1：第二名独立护栏——仅供第 2 区对比展示。入选条件与第一名
        同一条可信线（真实存在、与第一名不同 id、分数 ≥ 40、无关键
@@ -194,36 +234,7 @@
       }
     }
 
-    /* 回复草稿（复用 ReplyAssistant；价格只在可报价时传入） */
-    var reply = null;
-    try {
-      /* 价格进草稿的门禁：可报价之外还必须匹配无歧义——歧义时第一名
-         只是待确认候选，把它的价格写进草稿等于替用户拍板（P1-3 审查 P1-01） */
-      var safePrice = (unity && unity.quotable && unity.unitUsd > 0 && !ambiguous && !certGuard)
-        ? { unit: unity.unitUsd, floor: unity.quoteFloorUsd, breakEven: unity.breakEvenUsd > 0 ? unity.breakEvenUsd : null } : null;
-      reply = root.ReplyAssistant ? root.ReplyAssistant.generate({
-        opp: { rawText: text, buyer: { country: eff.country || '' }, quote: { qty: eff.qty || 0 }, status: 'new', followCount: 0 },
-        eff: eff,
-        product: noMatch ? null : top.product,
-        match: top ? { score: top.result.score, keyConflict: top.result.keyConflict, conflicts: top.result.conflicts } : null,
-        price: safePrice,
-        sellerName: (settings && settings.sellerName) || '',
-        scenario: 'auto'
-      }) : null;
-    } catch (e) { reply = null; }
-
-    /* 工作报价展示门控（方案 1）：只有草稿的完整报价行确实采用了
-       safePrice.unit 时，才允许在第 3 区标注「工作报价（草稿采用）」。
-       ReplyAssistant 的 usedPrice 只表示价格曾传入（澄清稿也为真），
-       不能作依据；这里对报价行原文做严格整行匹配：金额必须是
-       money() 的两位小数形态，且只认三类报价句（首次报价行 /
-       谈判「当前最优价」/ 谈判「能给到的最优价」），其他文字里
-       出现的相同金额（如商品标题）不算采用。无法确认即不标注。 */
-    var draftPriced = false;
-    if (safePrice && reply && reply.en) {
-      var amt = safePrice.unit.toFixed(2).replace(/\./g, '\\.');
-      draftPriced = new RegExp('^(?:For (?:\\d+|the quoted) pcs, our price is \\$' + amt + ' per piece(?: \\([^)]*\\))?|Our current best price is \\$' + amt + ' per piece, based on the listed specifications(?: and certifications \\([^)]*\\))?|The best I can offer for the current specification is \\$' + amt + ' per piece)\\.$', 'm').test(reply.en);
-    }
+    var reply = concl.reply, draftPriced = concl.draftPriced;
 
     /* 摘要按最终 eff（人工修正后）重算，与字段/匹配/报价同源；
        原 p0.summary 来自原文初次解析，改数量后标题会与字段不一致（P1-8 验收 2.9）。
@@ -241,6 +252,8 @@
       needsReview: p0 ? p0.needsReview : [],
       eff: eff, missing: missing,
       candidates: candidates, top: noMatch ? null : candidates[0],
+      selected: noMatch ? null : candidates[0],
+      selectionSource: 'auto', selectionAt: null,
       ambiguous: ambiguous, noMatch: noMatch,
       unity: unity, readiness: readiness, certGuard: certGuard,
       reply: reply, draftPriced: draftPriced,
@@ -288,6 +301,61 @@
      口径与报价口径各说各话）；quoteVersions、followLog、deal 等一律不碰。 */
   var REPLY_SCENARIOS = ['first', 'prequote', 'spec', 'moq', 'negotiation', 'sample', 'clarify'];
 
+  /* 人工选品（P1-3B-2）：在前二候选内切换最终商品，并以所选候选重新
+     执行正式 conclude。第一名恒可选；第二名须满足 B-1 可信条件且自身
+     护栏已取得（unity 非空），否则拒绝。草稿已被人工编辑时先确认。
+     conclude 抛错时进入安全态：清空旧结论、旧就绪与旧草稿，按所选商品
+     重新生成无价草稿，绝不保留旧商品的价格与报价状态；本函数不做任何
+     持久化写入，保存仍只经 saveToOpp 的既有路径。 */
+  function applySelection(productId) {
+    var r = S.result;
+    if (!r || r.noMatch || !r.candidates || !r.candidates.length) return false;
+    var idx = -1, cand = null;
+    for (var i = 0; i < r.candidates.length && i < 2; i++) {
+      if (String(r.candidates[i].product.id) === String(productId)) { idx = i; cand = r.candidates[i]; break; }
+    }
+    if (!cand) return false;
+    if (idx === 1 && !(('guardrail' in cand) && cand.guardrail && cand.guardrail.unity)) return false;
+    if (r.selected && String(r.selected.product.id) === String(productId)) return true;
+    if (draftEdited()) {
+      var ok = (typeof root.confirm === 'function') ? root.confirm('切换最终商品会按新商品重新生成报价结论与回复草稿，当前草稿的人工修改将丢失，是否继续？') : false;
+      if (!ok) return false;
+    }
+    var settings = {};
+    try { settings = (state() && state().settings) || {}; } catch (e) { settings = {}; }
+    /* 切回第一名 = 撤销人工拍板、完整恢复默认结论：conclude 重新启用
+       原歧义判定，来源标记同步回到 auto；选第二名才是人工拍板。 */
+    var isTop = idx === 0;
+    var concl = null;
+    try {
+      concl = conclude({ product: cand.product, result: cand.assess }, { eff: r.eff, settings: settings, text: S.text, ambiguous: isTop ? r.ambiguous : false, noMatch: false });
+    } catch (e) { concl = null; }
+    if (concl) {
+      r.unity = concl.unity; r.certGuard = concl.certGuard; r.readiness = concl.readiness;
+      r.reply = concl.reply; r.draftPriced = concl.draftPriced;
+    } else {
+      r.unity = null; r.certGuard = null; r.draftPriced = false;
+      r.readiness = { key: 'need-verify', label: '需要人工核实', why: '所选商品报价计算失败，已清除旧报价与草稿，请核实后重新分析' };
+      r.reply = null;
+      try {
+        r.reply = root.ReplyAssistant ? root.ReplyAssistant.generate({
+          opp: { rawText: S.text, buyer: { country: r.eff.country || '' }, quote: { qty: r.eff.qty || 0 }, status: 'new', followCount: 0 },
+          eff: r.eff, product: cand.product,
+          match: { score: cand.score, keyConflict: cand.keyConflict, conflicts: (cand.assess && cand.assess.conflicts) || [] },
+          price: null, sellerName: settings.sellerName || '', scenario: 'auto'
+        }) : null;
+      } catch (e) { r.reply = null; }
+    }
+    r.selected = cand;
+    r.selectionSource = isTop ? 'auto' : 'manual';
+    r.selectionAt = isTop ? null : ((root.Core && root.Core.nowIso) ? root.Core.nowIso() : null);
+    r.steps = nextSteps(r);
+    S.draft = r.reply ? (r.reply.en || '') : '';
+    S.baseDraft = S.draft;
+    S.lastSavedOppId = '';
+    return true;
+  }
+
   function buildSavePayload(result, effNow, draft, baseDraft) {
     var e = effNow || (result && result.eff) || {};
     var pe = {};
@@ -306,7 +374,8 @@
       matches = result.candidates.map(function (c) {
         return { productId: String((c.product && (c.product.id || c.product.sku)) || ''), score: Math.round(num(c.score)), reason: (c.hits || []).join('、').slice(0, 200) };
       }).filter(function (m) { return m.productId; });
-      if (result.top && result.top.product) selectedProductId = String(result.top.product.id || result.top.product.sku || '') || null;
+      var selP = (result.selected && result.selected.product) || (result.top && result.top.product);
+      if (selP) selectedProductId = String(selP.id || selP.sku || '') || null;
       if (!matches.length) { matches = null; selectedProductId = null; }
     }
     var draftSlot = null;
@@ -314,7 +383,9 @@
     if (draft && result && result.reply && REPLY_SCENARIOS.indexOf(result.reply.scenario) >= 0) {
       draftSlot = { key: result.reply.scenario, en: String(draft), zh: edited ? null : (result.reply.zh || null), edited: edited };
     }
-    return { parseEdits: pe, matches: matches, selectedProductId: selectedProductId, draftSlot: draftSlot };
+    return { parseEdits: pe, matches: matches, selectedProductId: selectedProductId, draftSlot: draftSlot,
+      selectionSource: (result && result.selectionSource) || 'auto',
+      selectionAt: (result && result.selectionAt) || null };
   }
 
   function applySavePayload(opp, payload) {
@@ -328,6 +399,10 @@
       opp.selectedProductId = payload.selectedProductId;
       opp.matchOverride = false;
       written.push('选品');
+    }
+    if (payload.selectionSource) {
+      opp.selectionSource = payload.selectionSource;
+      opp.selectionAt = payload.selectionAt || null;
     }
     if (payload.draftSlot) {
       opp.replyDrafts = opp.replyDrafts || {};
@@ -574,6 +649,18 @@
       '<input id="dd-f-' + name + '" value="' + esc(value == null ? '' : value) + '" placeholder="未知（请勿编造）"></label>';
   }
 
+  /* 选品入口（P1-3B-2）：候选卡与对比表共用。当前选中显示徽标；第二名
+     护栏未取得结果时明确不可选；第三名及以后不渲染入口。 */
+  function pickHtml(c, i, r) {
+    if (r.noMatch || i > 1) return '';
+    var sel = r.selected && String(r.selected.product.id) === String(c.product.id);
+    if (sel) return '<div style="margin-top:6px"><span class="badge" style="background:#dcfce7;color:#166534">当前选中 · ' + (r.selectionSource === 'manual' ? '人工选择' : '系统推荐') + '</span></div>';
+    if (i === 1 && !(('guardrail' in c) && c.guardrail && c.guardrail.unity)) {
+      return '<div class="mute" style="margin-top:6px">该候选护栏未取得结果，暂不能选为最终商品</div>';
+    }
+    return '<div style="margin-top:6px"><button class="btn sm" data-dd-pick="' + esc(String(c.product.id)) + '">选为最终商品</button></div>';
+  }
+
   /* 对比区单个候选的护栏结论（P1-3B-1，只读展示口径）：只给结论与
      原因，不显示保本价/报价底线/成本数字（数字只留在第 3 区第一名
      处），不把匹配分数表述为成交概率。 */
@@ -623,7 +710,7 @@
       row('商品', a.name, b.name) + row('匹配分', a.score, b.score) + row('核心理由', a.hits, b.hits) +
       row('商品规格', a.specs, b.specs) + row('问题与缺失', a.issues, b.issues) + row('MOQ', a.moq, b.moq) +
       row('交期', a.lead, b.lead) + row('挂牌价', a.price, b.price) + row('护栏结论', esc(a.verdict), esc(b.verdict)) +
-      row('认证情况', esc(a.cert), esc(b.cert)) + '</table>';
+      row('认证情况', esc(a.cert), esc(b.cert)) + row('最终选品', pickHtml(c1, 0, r), pickHtml(c2, 1, r)) + '</table>';
   }
 
   function view() {
@@ -696,6 +783,7 @@
         (c.keyConflict ? ' <span class="badge" style="background:#fee2e2;color:#991b1b">关键冲突</span>' : '') + '</div>' +
         (c.hits.length ? '<div class="sm-list"><span class="sm-list-t">依据：</span>' + c.hits.map(esc).join('、') + '</div>' : '') +
         (c.issues.length ? '<div class="sm-list mute"><span class="sm-list-t">问题：</span>' + c.issues.map(esc).join('、') + '</div>' : '') +
+        pickHtml(c, i, r) +
         '</div>';
     });
     if (r.ambiguous) h += '<div class="alert"><span class="ic">i</span><div>前两名候选分数接近，系统不替你拍板，请人工确认选哪一款。</div></div>';
@@ -705,6 +793,7 @@
     /* ③ 报价状态 */
     var u = r.unity;
     h += '<section class="card"><div class="card-hd"><div class="card-title">3 · 现在能不能报价</div></div>' +
+      (r.selected ? '<div class="mute" style="margin-bottom:6px">当前结论基于：<b>' + esc(r.selected.product.title || r.selected.product.titleEn || r.selected.product.sku || '') + '</b>（' + (r.selectionSource === 'manual' ? '人工选择' : '系统推荐') + '）</div>' : '') +
       '<div style="font-size:16px"><b>' + esc(r.readiness.label) + '</b></div><div class="mute">' + esc(r.readiness.why) + '</div>';
     if (u) {
       h += '<div class="dd-grid" style="margin-top:8px">' +
@@ -841,6 +930,17 @@
     if (bcEl) bcEl.addEventListener('input', function () { S.buyerCompany = bcEl.value; });
     var tg = document.getElementById('dd-target');
     if (tg) tg.addEventListener('change', function () { switchTarget(tg.value, tg); });
+    var picks = (typeof document.querySelectorAll === 'function') ? document.querySelectorAll('[data-dd-pick]') : [];
+    for (var pi = 0; pi < picks.length; pi++) {
+      (function (btn) {
+        btn.addEventListener('click', function () {
+          if (applySelection(btn.getAttribute('data-dd-pick'))) {
+            var v = document.getElementById('view');
+            if (v) { v.innerHTML = view(); mount(); }
+          }
+        });
+      })(picks[pi]);
+    }
     if (S.dupCandidates && S.dupCandidates.length) renderDupPanel();
   }
 
@@ -866,5 +966,5 @@
     if (v) { v.innerHTML = view(); mount(); }
   }
 
-  root.DecisionDesk = { analyze: analyze, guardrailFor: guardrailFor, nextSteps: nextSteps, view: view, mount: mount, runAnalysis: runAnalysis, draftEdited: draftEdited, buildSavePayload: buildSavePayload, applySavePayload: applySavePayload, saveToOpp: saveToOpp, poolForView: poolForView, _state: S };
+  root.DecisionDesk = { analyze: analyze, guardrailFor: guardrailFor, conclude: conclude, applySelection: applySelection, nextSteps: nextSteps, view: view, mount: mount, runAnalysis: runAnalysis, draftEdited: draftEdited, buildSavePayload: buildSavePayload, applySavePayload: applySavePayload, saveToOpp: saveToOpp, poolForView: poolForView, _state: S };
 })();

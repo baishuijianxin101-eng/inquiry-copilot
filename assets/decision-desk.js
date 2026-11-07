@@ -102,6 +102,32 @@
     return null;
   }
 
+  /* 单个候选的报价护栏（P1-3B-1）：第一名原有的护栏计算原样抽出并按
+     候选参数化——evaluate → negotiation → unitUsd 回退链 → resolve 的
+     顺序、表达式与 hardFail 组成逐字保持，任一步失败 unity=null（与
+     第一名原 try/catch 同义）。纯计算：不写状态、不写存储；结果只供
+     就绪结论（第一名）与对比展示（第二名），第二名结果不进入草稿链。 */
+  function guardrailFor(entry, eff, settings) {
+    var product = entry.product;
+    var unity = null;
+    try {
+      var ev = root.Pricing ? root.Pricing.evaluate({ product: product, qty: eff.qty || product.moq || 1, settings: settings || {} }) : null;
+      var nego = null;
+      try { nego = root.Workflow ? root.Workflow.negotiation({ product: product, qty: eff.qty || product.moq || 1, settings: settings || {}, unitPriceUsd: ev ? ev.unitPriceUsd : 0, buyerTargetUsd: eff.targetPriceUsd }) : null; } catch (e) { nego = null; }
+      var belowMoq = eff.qty > 0 && (product.moq || 0) > eff.qty;
+      /* 决策台尚无人工报价，工作报价取挂牌价（新询盘的默认报价口径，
+         与商机详情里卖家已填报价同位）；系统建议价只作对照展示。 */
+      var unitForUnity = ev ? (num(ev.listUsd) > 0 ? num(ev.listUsd) : num(product.priceUsd)) : 0;
+      if (!(unitForUnity > 0) && ev) unitForUnity = num(ev.unitPriceUsd);
+      unity = root.PricingUnity ? root.PricingUnity.resolve({
+        evaluate: ev, product: product, nego: nego,
+        unitUsd: unitForUnity,
+        hardFail: !!entry.result.keyConflict || belowMoq
+      }) : null;
+    } catch (e) { unity = null; }
+    return { unity: unity, certGuard: computeCertGuard(eff, product) };
+  }
+
   function analyze(text, products, settings, edits) {
     text = String(text || '');
     var p0 = root.P0Parse ? root.P0Parse.extract(text) : null;
@@ -137,21 +163,8 @@
       /* 认证护栏独立于匹配结果：noMatch 分支同样计算并保留（第三阶段修复 D） */
       certGuard = computeCertGuard(eff, null);
     } else {
-      try {
-        var ev = root.Pricing ? root.Pricing.evaluate({ product: top.product, qty: eff.qty || top.product.moq || 1, settings: settings || {} }) : null;
-        var nego = null;
-        try { nego = root.Workflow ? root.Workflow.negotiation({ product: top.product, qty: eff.qty || top.product.moq || 1, settings: settings || {}, unitPriceUsd: ev ? ev.unitPriceUsd : 0, buyerTargetUsd: eff.targetPriceUsd }) : null; } catch (e) { nego = null; }
-        var belowMoq = eff.qty > 0 && (top.product.moq || 0) > eff.qty;
-        /* 决策台尚无人工报价，工作报价取挂牌价（新询盘的默认报价口径，
-           与商机详情里卖家已填报价同位）；系统建议价只作对照展示。 */
-        var unitForUnity = ev ? (num(ev.listUsd) > 0 ? num(ev.listUsd) : num(top.product.priceUsd)) : 0;
-        if (!(unitForUnity > 0) && ev) unitForUnity = num(ev.unitPriceUsd);
-        unity = root.PricingUnity ? root.PricingUnity.resolve({
-          evaluate: ev, product: top.product, nego: nego,
-          unitUsd: unitForUnity,
-          hardFail: !!top.result.keyConflict || belowMoq
-        }) : null;
-      } catch (e) { unity = null; }
+      var gTop = guardrailFor(top, eff, settings);
+      unity = gTop.unity;
       if (!unity) readiness = { key: 'need-verify', label: '需要人工核实', why: '报价模块未返回结果' };
       /* 歧义优先展示：否则演示数据普遍缺成本时，第 3 区永远只显示缺成本，
          用户看不到「先确认哪一款」这条更靠前的动作（P1-8 验收 3.2）。
@@ -162,9 +175,22 @@
       else if (unity.quotable) readiness = { key: 'can-quote', label: '可以进入报价', why: '成本、保本价与底价校验通过（演示数据口径）' };
       else readiness = { key: 'need-verify', label: '需要人工核实', why: unity.blockReasons.join('；') || '报价条件未全部通过' };
       /* 认证护栏：即使价格口径全部通过，强制认证未核实也不得进入报价 */
-      certGuard = computeCertGuard(eff, top.product);
+      certGuard = gTop.certGuard;
       if (certGuard && readiness.key === 'can-quote') {
         readiness = { key: 'need-verify', label: '需要人工核实', why: certGuard.why };
+      }
+    }
+
+    /* P1-3B-1：第二名独立护栏——仅供第 2 区对比展示。入选条件与第一名
+       同一条可信线（真实存在、与第一名不同 id、分数 ≥ 40、无关键
+       冲突），不满足不凑数。计算全程隔离：异常只让第二名标记为未取得
+       结果（guardrail=null），不改 unity/readiness/草稿任何第一名产物。 */
+    if (!noMatch && second && top && second.product.id !== top.product.id &&
+        second.result.score >= 40 && !second.result.keyConflict) {
+      var g2 = null;
+      try { g2 = guardrailFor(second, eff, settings); } catch (e) { g2 = null; }
+      for (var ci = 0; ci < candidates.length; ci++) {
+        if (candidates[ci].product.id === second.product.id) { candidates[ci].guardrail = g2; break; }
       }
     }
 
@@ -548,6 +574,58 @@
       '<input id="dd-f-' + name + '" value="' + esc(value == null ? '' : value) + '" placeholder="未知（请勿编造）"></label>';
   }
 
+  /* 对比区单个候选的护栏结论（P1-3B-1，只读展示口径）：只给结论与
+     原因，不显示保本价/报价底线/成本数字（数字只留在第 3 区第一名
+     处），不把匹配分数表述为成交概率。 */
+  function compareVerdict(unity, certGuard) {
+    if (!unity) return '护栏未取得结果（按未核实处理）';
+    if (unity.quotable && !certGuard) return '可进入报价（候选自身护栏结论，最终以第 3 区就绪结论为准）';
+    var rs = (unity.blockReasons || []).slice();
+    if (certGuard) rs.push(certGuard.why);
+    return '暂不可报价：' + (rs.join('；') || '报价条件未全部通过');
+  }
+  function certStatusText(certGuard, eff, guardrailMissing) {
+    if (guardrailMissing) return '未核实（护栏未取得结果）';
+    if (certGuard) return '未核实：' + certGuard.why;
+    if (eff && eff.certs && eff.certs.length) return '买家要求的认证已登记';
+    return '买家未提出需核实的认证要求';
+  }
+  function compareHtml(r) {
+    if (r.noMatch || !r.candidates.length) return '';
+    var c1 = r.candidates[0];
+    var c2 = r.candidates[1] || null;
+    if (!c2 || !('guardrail' in c2)) {
+      return '<div class="mute" style="margin-top:8px">暂无第二个可信候选（其余候选分数不足、存在关键冲突或与第一名为同一商品，不凑数展示）。</div>';
+    }
+    function val(x, suffix) { return x > 0 ? String(x) + (suffix || '') : '未提供'; }
+    function cell(c, top) {
+      var p = c.product;
+      var g = top ? { unity: r.unity, certGuard: r.certGuard } : c.guardrail;
+      return {
+        name: esc(p.title || p.titleEn || p.sku || '未提供') + (p.sku ? '<br><span class="mute">SKU ' + esc(p.sku) + '</span>' : ''),
+        score: Math.round(c.score) + ' 分',
+        hits: c.hits.length ? c.hits.map(esc).join('、') : '未提供',
+        specs: esc(p.specs || p.specsEn || '未提供'),
+        issues: c.issues.length ? c.issues.map(esc).join('、') : '未发现',
+        moq: val(p.moq),
+        lead: val(p.leadTimeDays, ' 天'),
+        price: p.priceUsd > 0 ? '$' + p.priceUsd : '未提供',
+        verdict: g ? compareVerdict(g.unity, g.certGuard) : '护栏未取得结果（按未核实处理）',
+        cert: certStatusText(g ? g.certGuard : null, r.eff, !g)
+      };
+    }
+    var a = cell(c1, true), b = cell(c2, false);
+    function row(label, x, y) { return '<tr><th style="white-space:nowrap">' + label + '</th><td>' + x + '</td><td>' + y + '</td></tr>'; }
+    var demand = (r.eff.models || []).concat(r.eff.specs || []).join('、');
+    return '<div style="margin-top:10px"><b>前二候选对比</b> <span class="mute">买家需求：数量 ' + (r.eff.qty || '未提供') +
+      '；型号/规格：' + esc(demand || '未提供') + '。护栏结论为候选自身口径，最终报价以第 3 区为准。</span></div>' +
+      '<table class="tbl"><tr><th></th><th>第一候选</th><th>第二候选</th></tr>' +
+      row('商品', a.name, b.name) + row('匹配分', a.score, b.score) + row('核心理由', a.hits, b.hits) +
+      row('商品规格', a.specs, b.specs) + row('问题与缺失', a.issues, b.issues) + row('MOQ', a.moq, b.moq) +
+      row('交期', a.lead, b.lead) + row('挂牌价', a.price, b.price) + row('护栏结论', esc(a.verdict), esc(b.verdict)) +
+      row('认证情况', esc(a.cert), esc(b.cert)) + '</table>';
+  }
+
   function view() {
     var h = '<section class="card"><div class="card-hd"><div class="card-title">询盘处理决策台' +
       '<span class="card-sub">粘贴一条买家询盘，一次得到：需求、推荐商品与理由、能不能报价、回复草稿、下一步</span></div>' +
@@ -621,6 +699,7 @@
         '</div>';
     });
     if (r.ambiguous) h += '<div class="alert"><span class="ic">i</span><div>前两名候选分数接近，系统不替你拍板，请人工确认选哪一款。</div></div>';
+    h += compareHtml(r);
     h += '</section>';
 
     /* ③ 报价状态 */
@@ -787,5 +866,5 @@
     if (v) { v.innerHTML = view(); mount(); }
   }
 
-  root.DecisionDesk = { analyze: analyze, nextSteps: nextSteps, view: view, mount: mount, runAnalysis: runAnalysis, draftEdited: draftEdited, buildSavePayload: buildSavePayload, applySavePayload: applySavePayload, saveToOpp: saveToOpp, poolForView: poolForView, _state: S };
+  root.DecisionDesk = { analyze: analyze, guardrailFor: guardrailFor, nextSteps: nextSteps, view: view, mount: mount, runAnalysis: runAnalysis, draftEdited: draftEdited, buildSavePayload: buildSavePayload, applySavePayload: applySavePayload, saveToOpp: saveToOpp, poolForView: poolForView, _state: S };
 })();

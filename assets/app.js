@@ -1885,6 +1885,17 @@
   }
 
   function buyerCard(opp) {
+    /* P1-3C：买家未识别隔离。聚合键为空或字面「未知买家」时不聚合——
+       所有未命名商机共用同一个键，聚合会把它们捏成一个虚假回头客
+       （客户中心 R3-07 已避开此合并，详情卡在此对齐）。 */
+    var bKey = buyerKey(opp);
+    if (!bKey || bKey === '未知买家') {
+      return '<section class="card"><div class="card-hd">' +
+        '<div class="card-title">这个买家<span class="card-sub">买家未识别</span></div></div>' +
+        '<div class="card-bd"><div style="font-size:12.5px;color:#6b7280">' +
+        '这条商机还没有填写买家称呼或公司，无法关联同一买家的历史询盘。补填买家称呼或公司后，才能按买家聚合其历史询盘、成交与利润。' +
+        '</div></div></section>';
+    }
     var p = buyerProfile(opp);
     if (p.inquiries <= 1 && p.orders === 0) {
       return '<section class="card"><div class="card-hd">' +
@@ -1897,7 +1908,14 @@
     var rows = p.list.map(function (o) {
       var qty = (o.quote && o.quote.qty) || 0;
       var price = (o.quote && o.quote.unitPriceUsd) || 0;
+      /* P1-3C：历史行补商品名，商品名即链接（fwOppLink 跳该行商机本身）。
+         商品名只认该行商机自己的 selectedProductId 在实时目录中的记录；
+         未选或商品已删除时显示占位「未记录商品」，绝不回退其他候选，
+         以免在历史里显示错误商品。 */
+      var prod = o.selectedProductId ? productById(o.selectedProductId) : null;
+      var prodName = prod ? (prod.title || prod.titleEn || prod.sku || '未记录商品') : '未记录商品';
       return '<tr><td style="color:#8a919e;font-size:11px">' + esc(C.fmtDate(o.createdAt)) + '</td>' +
+        '<td>' + fwOppLink(o, prodName) + '</td>' +
         '<td>' + esc((o.quote && o.quote.incoterm) || '') + ' ' +
         (price ? C.usd(price) : '—') + '</td>' +
         '<td class="num">' + (qty ? qty.toLocaleString() : '—') + '</td>' +
@@ -1916,8 +1934,9 @@
       C.money(p.profit) + '</div></div>' +
       '</div>' +
       (rows ? '<div class="table-wrap" style="margin-top:14px"><table class="table">' +
-        '<thead><tr><th>时间</th><th>报价</th><th class="num">数量</th><th>状态</th></tr></thead>' +
+        '<thead><tr><th>时间</th><th>商品</th><th>报价</th><th class="num">数量</th><th>状态</th></tr></thead>' +
         '<tbody>' + rows + '</tbody></table></div>' : '') +
+      '<div style="margin-top:10px;font-size:11px;color:#8a919e">按买家公司/称呼聚合：同名不同人可能混在一组，同一人改名可能被拆开；正式客户档案将在接入稳定标识后启用。</div>' +
       '</div></section>';
   }
 

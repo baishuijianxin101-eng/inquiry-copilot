@@ -11,7 +11,7 @@
 <!-- CSP 第二道锁：即使被拖到 U 盘/本地打开（没有 Netlify 响应头），也不执行任何外来脚本。
      script-src 只留 'self' —— 页面里没有一行内联 JS，全部走 assets/*.js。 -->
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self' https: http://127.0.0.1:* http://localhost:*; media-src 'self' blob:; manifest-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
-<link rel="stylesheet" href="assets/styles.css?v=v10226003">
+<link rel="stylesheet" href="assets/styles.css?v=v10226014">
 </head>
 <body>
 
@@ -41,7 +41,7 @@
 <span class="bridge-dot" id="bridge-dot"></span>
 <span id="bridge-text">阿里：未连接</span></span>
       <div class="topbar-actions">
-        <a class="btn ghost" href="#/settings" title="备份、导入导出、清空演示数据都在这里">数据与安全</a>
+        <a class="btn ghost" href="#/settings" data-action="goto-settings" title="备份、导入导出、清空演示数据都在这里">数据与安全</a>
       </div>
     </header>
 
@@ -61,30 +61,35 @@
 <script src="assets/boot-error.js?v=v10226003"></script>
 
 <script src="assets/seed-state.js?v=v10226003"></script>
-<script src="assets/core.js?v=v10226003"></script>
-<script src="assets/pricing.js?v=v10226003"></script>
+<script src="assets/core.js?v=v10226020"></script>
+<script src="assets/pricing.js?v=v10226004"></script>
   <script src="assets/pricing-unity.js?v=v10226003"></script>
 <script src="assets/workflow.js?v=v10226003"></script>
 <script src="assets/tr-endpoint.js?v=1"></script>
 <script src="assets/translate.js?v=v10226003"></script>
 <script src="assets/judge.js?v=v10226003"></script>
-<script src="assets/matching.js?v=v10226003"></script>
+<script src="assets/matching.js?v=v10226004"></script>
 <script src="assets/smart-match.js?v=v10226003"></script>
 <script src="assets/opp-score.js?v=v10226003"></script>
-<script src="assets/reply-assistant.js?v=v10226003"></script>
+<script src="assets/reply-assistant.js?v=v10226011"></script>
+<script src="assets/sales-analysis.js?v=v10226013"></script>
 <script src="assets/followup.js?v=v10226003"></script>
 <script src="assets/reply.js?v=v10226003"></script>
 <script src="assets/importer.js?v=v10226003"></script>
 <script src="assets/market-ref.js?v=v10226003"></script>
 <script src="assets/price-candidates.js?v=v10226003"></script>
-<script src="assets/p0-parse.js?v=v10226003"></script>
+<script src="assets/p0-parse.js?v=v10226011"></script>
 <script src="assets/p0-match.js?v=v10226003"></script>
 <script src="assets/p0-quote.js?v=v10226003"></script>
 <script src="assets/p0-cost.js?v=v10226003"></script>
 <script src="assets/p0-cockpit.js?v=v10226003"></script>
 <script src="assets/p0-api.js?v=v10226003"></script>
-<script src="assets/app.js?v=v10226003"></script>
-<script src="assets/p0-ui.js?v=v10226003"></script>
+<script src="assets/decision-desk.js?v=v10226010"></script>
+<script src="assets/identity.js?v=v10226048"></script>
+<script src="assets/identity-migration.js?v=v10226035"></script>
+<script src="assets/identity-txn.js?v=v10226038"></script>
+<script src="assets/app.js?v=v10226035"></script>
+<script src="assets/p0-ui.js?v=v10226004"></script>
 
 <!-- 随时翻译：右下角悬浮按钮 + 面板 -->
 <button id="tr-fab" type="button" title="随时翻译（Ctrl+Shift+T）">译</button>
@@ -102,6 +107,6 @@
     <span id="tr-engine"></span>
   </div>
 </div>
-<script src="assets/tr-panel.js?v=1"></script>
+<script src="assets/tr-panel.js?v=v10226013"></script>
 </body>
 </html>

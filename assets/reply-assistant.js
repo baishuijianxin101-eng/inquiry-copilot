@@ -139,16 +139,29 @@
         en.push('To move closer to your target, the realistic levers are a larger quantity or more flexible delivery terms. If you can adjust either one, I will re-check the price for you right away.');
         zh.push('我们当前能给的最优价是每件 ' + money(price.unit) + '，依据是商品已登记的规格' + (certs ? '与认证（' + certs + '）' : '') + '。');
         zh.push('想更接近您的目标价，现实的办法是增加数量或放宽交期。您若能调整其中一项，我马上帮您重新核价。');
-      } else {
+      } else if (price.breakEven > 0 && target < price.breakEven) {
+        /* 只有目标价确实低于保本价时才允许成本措辞（P1-17 修复 C：原实现按
+           「低于底价」触发却写「低于生产成本」，保本与底价之间的区间会陈述失实） */
         strategyLabel = '守底价，给替代方案';
-        strategy = '目标价低于我方底价：礼貌拒绝目标价、说明成本原因，给出当前最优价或调整规格的方向，绝不承诺按目标价成交。';
+        strategy = '目标价低于保本价：礼貌拒绝目标价、说明成本原因，给出当前最优价或调整规格的方向，绝不承诺按目标价成交。';
         en.push('I checked carefully, and I have to be honest: ' + money(target) + ' is below our production cost for this specification, so I cannot accept it without changing the product itself.');
         en.push(price ? 'The best I can offer for the current specification is ' + money(price.unit) + ' per piece.' : 'I will confirm our best possible price for the current specification shortly.');
         en.push('If the budget is fixed, we can look at adjusting the specification or packaging to get closer — please tell me which matters more to you, the spec or the price.');
         zh.push('我认真核算过，必须坦诚说明：' + money(target) + ' 低于我们按此规格的生产成本，所以不改变商品本身的话我无法接受。');
         zh.push(price ? '当前规格我们能给到的最优价是每件 ' + money(price.unit) + '。' : '当前规格能给到的最优价格我确认后马上告诉您。');
         zh.push('如果预算是固定的，我们可以考虑调整规格或包装来靠近——请告诉我您更看重规格还是价格。');
-        warnings.push('买家目标价 ' + money(target) + ' 低于我方底价 ' + money(price.floor) + '，已按守底价策略生成，未承诺接受。');
+        warnings.push('买家目标价 ' + money(target) + ' 低于保本价 ' + money(price.breakEven) + '，已按守底价策略生成，未承诺接受。');
+      } else {
+        /* 目标价低于报价底线但不低于保本价（或保本价未知）：只说底线，不声称成本原因 */
+        strategyLabel = '守底价，给替代方案';
+        strategy = '目标价低于报价底线' + (price.breakEven > 0 ? '（但不低于保本价）' : '（保本价未知）') + '：只说明低于当前可接受的报价底线，不声称低于成本，给出当前最优价或调整规格的方向，绝不承诺按目标价成交。';
+        en.push('I checked carefully, and I have to be honest: ' + money(target) + ' is below the lowest price we can accept for this specification, so I cannot accept it as it stands.');
+        en.push(price ? 'The best I can offer for the current specification is ' + money(price.unit) + ' per piece.' : 'I will confirm our best possible price for the current specification shortly.');
+        en.push('If the budget is fixed, we can look at adjusting the specification or packaging to get closer — please tell me which matters more to you, the spec or the price.');
+        zh.push('我认真核算过，必须坦诚说明：' + money(target) + ' 低于我们对该规格能接受的报价底线，所以目前无法按这个价格确认。');
+        zh.push(price ? '当前规格我们能给到的最优价是每件 ' + money(price.unit) + '。' : '当前规格能给到的最优价格我确认后马上告诉您。');
+        zh.push('如果预算是固定的，我们可以考虑调整规格或包装来靠近——请告诉我您更看重规格还是价格。');
+        warnings.push('买家目标价 ' + money(target) + ' 低于报价底线 ' + money(price.floor) + (price.breakEven > 0 ? '（高于保本价 ' + money(price.breakEven) + '，文案未使用成本理由）' : '（保本价未知，文案未使用成本理由）') + '，已按守底价策略生成，未承诺接受。');
       }
     } else if (scenario === 'moq') {
       purpose = '解释起订量并给出可行路径，避免直接流失小单买家';
@@ -218,11 +231,13 @@
       strategy = '明确列出待确认问题并说明原因（数量、目的地决定价格与运费），给买家低压力的回复路径。';
       en.push(greetEn, '', 'Thanks for your inquiry' + (eff.productName ? ' about the ' + eff.productName : '') + (product ? ' — the closest model in our range is the ' + pRefEn + '.' : '.'));
       en.push('So I can quote accurately instead of guessing, could you confirm a few points?');
-      askLines(miss);
-      en.push('Once I have these, I will send you a firm quotation rather than a rough estimate.');
       zh.push(greetZh, '', '感谢您的询盘' + (eff.productName ? '（' + eff.productName + '）' : '') + (product ? '，我们产品线里最接近的是 ' + pRefEn + '。' : '。'));
       zh.push('为了给您准确报价而不是估个大概，请您确认几点：');
+      /* askLines 一次调用同时写 en 与 zh 两个数组，本分支只能调用一次：
+         曾分英文段/中文段各调用一次，导致双语草稿的问题清单各重复一遍，
+         且中文第一份问题被写到了问候语之前（P1-20 / I-1）。 */
       askLines(miss);
+      en.push('Once I have these, I will send you a firm quotation rather than a rough estimate.');
       zh.push('信息齐了之后，我给您一份确定的报价，而不是粗略估算。');
     } else { /* first */
       purpose = '首次响应：确认需求、给出已能确认的信息、留好下一步';

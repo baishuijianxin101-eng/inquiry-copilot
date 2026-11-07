@@ -25,6 +25,8 @@
     priceUsd: 0,
     result: null,
     reply: '',
+    replyKind: '',
+    replyNotes: [],
     notice: '',
     server: { state: 'idle', count: 0, message: '' }
   };
@@ -155,6 +157,40 @@
       rawText: (parsed && parsed.raw) || ''
     };
     return R.replyEn({ opp: opp, product: product, pricing: pricing, settings: s, parsed: parsed });
+  }
+
+  /* P1-FIX-02：护栏未通过（缺成本/低于保本/低于底价等）时的无价谈判草稿。
+     与决策台、商机详情回复助手共用同一 ReplyAssistant 引擎与同一套
+     状态口径：price 恒为 null，草稿绝不出现任何价格；「正式报价尚未
+     形成（缺成本或未过报价护栏），回复未写任何价格」由引擎统一给出。
+     护栏通过后的正式报价草稿仍走 replyFor，两者在界面上明确分开标题。 */
+  function noPriceReplyFor(product, parsed) {
+    var RA = root.ReplyAssistant;
+    if (!RA || !product) return null;
+    var f = (parsed && parsed.fields) || {};
+    var eff = {
+      productName: f.productName || '', purpose: f.purpose || '',
+      qty: f.qty || 0, targetPriceUsd: f.targetPriceUsd || 0,
+      country: f.country || '', destination: f.destination || '',
+      leadTimeDays: f.deadlineDays || 0, deadlineText: f.deadlineText || '',
+      certs: f.certs || [], incoterm: f.incoterm || '',
+      models: f.models || [], specs: f.specs || []
+    };
+    var s = state().settings || {};
+    var out = RA.generate({
+      opp: {
+        buyer: { name: f.buyerName || '', country: f.country || '' },
+        rawText: (parsed && parsed.raw) || '',
+        followCount: 0, status: 'new'
+      },
+      eff: eff,
+      product: product,
+      price: null,
+      scenario: 'auto',
+      sellerName: s.sellerName || ''
+    });
+    if (!out || out.usedPrice) return null;
+    return out;
   }
 
   function makeOpp(payload) {
@@ -312,12 +348,24 @@
           if (S.result.warnings && S.result.warnings.length) {
             h += '<div class="p0-review">' + S.result.warnings.map(esc).join('；') + '</div>';
           }
-          h += '<div class="p0-sec-title">英文回复草稿 <span class="p0-mute">逐句可改，发之前自己再读一遍</span></div>' +
+          h += '<div class="p0-sec-title">英文回复草稿 · 正式报价 <span class="p0-mute">逐句可改，发之前自己再读一遍</span></div>' +
             '<textarea id="p0-reply" rows="9">' + esc(S.reply) + '</textarea>' +
             '<div class="row" style="gap:8px;margin-top:8px">' +
             '<button class="btn primary" data-p0="save">保存处理记录</button>' +
             '<button class="btn" data-p0="copy">复制英文回复</button>' +
             '<span class="p0-hint">保存后出现在商机列表和今日行动里</span></div>';
+        }
+        if (S.result && !S.result.ok && S.replyKind === 'noprice' && S.reply) {
+          /* P1-FIX-02：无价谈判草稿与正式报价明确分开：独立标题、统一
+             未确认提示、不出现保存为报价记录的入口，只有复制。 */
+          h += '<div class="p0-sec-title">英文回复草稿 · 无价谈判草稿（未形成正式报价）</div>' +
+            (S.replyNotes && S.replyNotes.length
+              ? '<div class="p0-review">尚未确认（草稿中不会编造）：' + S.replyNotes.map(esc).join('；') + '</div>'
+              : '') +
+            '<textarea id="p0-reply" rows="9">' + esc(S.reply) + '</textarea>' +
+            '<div class="row" style="gap:8px;margin-top:8px">' +
+            '<button class="btn" data-p0="copy">复制英文回复</button>' +
+            '<span class="p0-hint">此草稿不含任何价格；报价护栏通过后才能保存为报价记录</span></div>';
         }
         h += '</div>';
       }
@@ -400,7 +448,7 @@
         S.match = out.match;
         S.selectedSku = out.match.matches.length ? out.match.matches[0].sku : '';
         S.qty = out.parsed.fields.qty || (S.selectedSku && findProduct(S.selectedSku) ? findProduct(S.selectedSku).moq : 100);
-        S.result = null; S.reply = ''; S.notice = '';
+        S.result = null; S.reply = ''; S.replyKind = ''; S.replyNotes = []; S.notice = '';
       } catch (e) {
         S.notice = '解析失败：' + (e && e.message ? e.message : e);
       }
@@ -409,7 +457,7 @@
     if (name === 'pick') {
       var el = root.document.activeElement;
       S.selectedSku = el && el.value ? el.value : S.selectedSku;
-      S.result = null; S.reply = '';
+      S.result = null; S.reply = ''; S.replyKind = ''; S.replyNotes = [];
       paint(); return;
     }
     if (name === 'quote') {
@@ -433,10 +481,25 @@
         S.result = r;
         if (r.ok) {
           S.reply = replyFor(prod, r, S.parsed, {});
+          S.replyKind = 'quote';
+          S.replyNotes = [];
           S.notice = '';
         } else {
+          /* P1-FIX-02：护栏未通过时与决策台/回复助手统一——给无价谈判
+             草稿（ReplyAssistant、price 恒 null），不再只剩一句警告。
+             保存为报价记录仍被下方 save 分支的结果校验挡住，不受影响。 */
           S.notice = r.message || '这个价格不能报';
-          S.reply = '';
+          var np = null;
+          try { np = noPriceReplyFor(prod, S.parsed); } catch (e2) { np = null; }
+          if (np) {
+            S.reply = np.en;
+            S.replyKind = 'noprice';
+            S.replyNotes = np.unconfirmed || [];
+          } else {
+            S.reply = '';
+            S.replyKind = '';
+            S.replyNotes = [];
+          }
         }
       } catch (e) {
         S.notice = '算价失败：' + (e && e.message ? e.message : e);
@@ -615,6 +678,7 @@
     preview: preview,
     quoteFor: quoteFor,
     replyFor: replyFor,
+    noPriceReplyFor: noPriceReplyFor,
     makeOpp: makeOpp,
     publicQuote: publicQuote,
     actionHtml: actionHtml

@@ -12,13 +12,19 @@
 
   var esc = C.esc;
 
+  /* P1-23 全站框架导航：八大模块。desk=询盘中心内的决策台、review=商品与报价内的补成本、
+     settings=同步与设置内的系统设置，均保留原路由与功能，仅调整归属呈现。 */
   var NAV = [
     { key: 'dashboard', label: '工作台', icon: '◱' },
-    { key: 'opps', label: '商机', icon: '✉' },
-    { key: 'catalog', label: '商品库', icon: '▤' },
+    { key: 'opps', label: '询盘中心', icon: '✉' },
+    { key: 'desk', label: '决策台', icon: '🧭' },
+    { key: 'customers', label: '客户中心', icon: '☷' },
+    { key: 'analysis', label: '销售分析', icon: '◎' },
+    { key: 'catalog', label: '商品与报价', icon: '▤' },
     { key: 'review', label: '补成本', icon: '¥' },
-    { key: 'analytics', label: '复盘', icon: '◔' },
-    { key: 'settings', label: '设置', icon: '⚙' }
+    { key: 'followups', label: '跟进管理', icon: '↻' },
+    { key: 'analytics', label: '经营分析', icon: '◔' },
+    { key: 'sync', label: '同步与设置', icon: '⚙' }
   ];
 
   var STATUS = {
@@ -231,7 +237,7 @@
             (x.must ? '必问' : '可选') + '</span><div><div>' + esc(x.zh) + '</div>' +
             '<div class="pv-q-en">' + esc(x.en) + '</div></div></div>';
         }).join('') +
-        '<div class="row" style="margin-top:10px"><button class="btn sm" data-action="copy-questions" data-id="' + opp.id + '">复制全部问题（英文）</button>' +
+        '<div class="row" style="margin-top:10px"><button class="btn sm" data-action="copy-questions" data-id="' + safeActionId(opp.id) + '">复制全部问题（英文）</button>' +
         '<span class="card-sub">复制后由你粘贴到阿里后台发送，系统不会自动发消息</span></div></div>';
     } else {
       qHtml = '<div class="pv-questions"><span class="badge green">信息完整</span> <span style="font-size:12px;color:var(--ink-2)">关键字段都识别到了，没有必须向买家补问的项。</span></div>';
@@ -239,7 +245,7 @@
 
     return '<section class="card"><div class="card-hd">' +
       '<div class="card-title">解析结果<span class="card-sub">自动识别 + 原文证据，识别错了可以修正</span></div>' +
-      '<button class="btn sm" data-action="edit-parsed" data-id="' + opp.id + '">修正解析</button></div>' +
+      '<button class="btn sm" data-action="edit-parsed" data-id="' + safeActionId(opp.id) + '">修正解析</button></div>' +
       '<div class="card-bd"><div class="pv-grid">' + rows + '</div>' + qHtml + '</div></section>';
   }
 
@@ -277,7 +283,7 @@
       '</div></div>' +
       '<div class="modal-ft">' +
       '<button class="btn ghost" data-action="close-modal">取消</button>' +
-      '<button class="btn primary" data-action="save-parsed" data-id="' + opp.id + '">保存修正</button>' +
+      '<button class="btn primary" data-action="save-parsed" data-id="' + safeActionId(opp.id) + '">保存修正</button>' +
       '</div>';
     openModal(html, true);
   }
@@ -311,6 +317,151 @@
     C.persist();
     render();
     toast(Object.keys(ed).length ? '解析修正已保存' : '已恢复自动识别');
+  }
+
+  /* =========================================================
+     P1-22 第一阶段：客户销售判断（SalesAnalysis）
+     分析 = 规则型结构化分析（原文+有效解析+系统记录），实时重算不落库；
+     人工修正只写 opp.salesReview 覆盖层，与 AI 结果分开保存、互不覆盖。
+     ========================================================= */
+
+  function salesInputFor(opp, a, effP) {
+    var p0 = null;
+    try { p0 = window.P0Parse ? window.P0Parse.extract(opp.rawText || '') : null; } catch (e) { p0 = null; }
+    var mentions = (p0 && p0.fields && p0.fields.certMentions) || [];
+    var conflict = mentions.filter(function (m) { return m.conflict; })[0] || null;
+    var top = (a && a.ordered && a.ordered[0]) ? a.ordered[0].product : null;
+    var all = st().opps || [];
+    var sameBuyer = (opp.buyer && opp.buyer.name) ? all.filter(function (o) { return o.id !== opp.id && o.buyer && o.buyer.name && o.buyer.name.toLowerCase() === opp.buyer.name.toLowerCase(); }).length : 0;
+    var eff = Object.assign({}, effP, { unrecognizedCerts: (p0 && p0.fields && p0.fields.unrecognizedCertMentions || []).map(function (m) { return m.name; }) });
+    return {
+      rawText: opp.rawText || '', eff: eff,
+      buyerName: (opp.buyer && opp.buyer.name) || '',
+      isRepeat: sameBuyer > 0,
+      hasPriorOrders: ((st().orders || []).filter(function (o) { return o.oppId === opp.id; }).length > 0),
+      certConflict: !!conflict, certConflictText: conflict ? conflict.evidence.map(function (e2) { return e2.snippet; }).join(' ／ ') : '',
+      productName: top ? (top.name || top.title || '') : null,
+      productCerts: top && Array.isArray(top.certs) ? top.certs : null,
+      productMoq: top ? (top.moq || 0) : 0
+    };
+  }
+
+  function saChip(status) {
+    var map = { stated: ['明确', '#0f9d58'], inferred: ['推断', '#b07d10'], missing: ['未提供', '#9aa0a6'], conflict: ['冲突', '#d93025'], confirmed: ['人工确认', '#7b1fa2'] };
+    var m = map[status] || [status, '#666'];
+    return '<span style="font-size:11px;color:#fff;background:' + m[1] + ';border-radius:8px;padding:1px 7px;white-space:nowrap">' + m[0] + '</span>';
+  }
+  function saLevelChip(level) {
+    var c = level === '明确关注' ? '#d93025' : (level === '可能关注' ? '#b07d10' : '#9aa0a6');
+    return '<span style="font-size:11px;color:#fff;background:' + c + ';border-radius:8px;padding:1px 7px;white-space:nowrap">' + level + '</span>';
+  }
+
+  function salesCard(opp, a, effP) {
+    if (!window.SalesAnalysis) return '';
+    var disp = window.SalesAnalysis.applyReview(window.SalesAnalysis.analyze(salesInputFor(opp, a, effP)), opp.salesReview);
+    var needRows = disp.needs.map(function (n) {
+      return '<tr><td style="white-space:nowrap;color:#5f6368">' + esc(n.label) + '</td>' +
+        '<td>' + (n.value ? esc(n.value) : '<span style="color:#9aa0a6">尚未提供</span>') +
+        (n.flagged ? ' <span style="color:#d93025;font-size:11px">（员工标记不准确）</span>' : '') +
+        (n.evidence ? '<div style="font-size:11.5px;color:#8a919e">依据：' + esc(n.evidence) + '</div>' : '') + '</td>' +
+        '<td>' + saChip(n.status) + '</td></tr>';
+    }).join('');
+    var concernRows = disp.concerns.map(function (c) {
+      return '<div class="row" style="gap:8px;align-items:flex-start"><span style="min-width:74px;color:#5f6368">' + esc(c.topic) + '</span>' + saLevelChip(c.level) +
+        '<span style="font-size:12.5px">' + esc(c.evidence) + '</span></div>';
+    }).join('');
+    var stepRows = disp.steps.map(function (s, i) {
+      return '<div style="margin-bottom:6px"><b>' + (i + 1) + '.</b> ' + esc(s.action) + '<div style="font-size:12px;color:#8a919e">为什么：' + esc(s.why) + '</div></div>';
+    }).join('');
+    var body = '<div class="stack" style="gap:12px">' +
+      '<div style="background:#f6f9ff;border:1px solid #d7e3fc;border-radius:10px;padding:10px 12px">' +
+      '<div style="font-size:15px"><b>采购阶段：' + esc(disp.stage.label) + '</b>' + (disp.stage.confirmed ? ' ' + saChip('confirmed') : '') + (disp.stage.flagged ? ' <span style="color:#d93025;font-size:11px">员工标记不准确</span>' : '') + '</div>' +
+      (disp.stage.evidence.length ? '<div style="font-size:12.5px;color:#5f6368;margin-top:4px">证据：' + disp.stage.evidence.map(esc).join('；') + '</div>' : '') +
+      '<div style="font-size:12.5px;color:#b07d10;margin-top:2px">不确定性：' + esc(disp.stage.uncertainty) + '</div></div>' +
+      '<div><div style="font-weight:600;margin-bottom:6px">客户需求理解</div><table class="table"><tbody>' + needRows + '</tbody></table></div>' +
+      '<div><div style="font-weight:600;margin-bottom:6px">客户关注点与潜在顾虑</div><div class="stack" style="gap:6px">' + concernRows + '</div></div>' +
+      '<div><div style="font-weight:600;margin-bottom:6px">下一步销售建议</div>' + stepRows + '</div>' +
+      '<div style="font-size:11.5px;color:#8a919e">' + esc(disp.capabilityNote) + (disp.hasReview ? ' 本页含员工人工确认内容（紫色标记），与系统分析分开保存。' : '') + '</div>' +
+      '</div>';
+    var sid = safeActionId(opp.id);
+    return card('客户销售判断', '帮你快速看懂客户要什么、在哪一步、下一步做什么', body,
+      sid ? '<button class="btn sm ghost" data-action="sales-edit" data-id="' + sid + '">修正判断</button>'
+        : '<span style="font-size:12px;color:#b91c1c">商机 ID 异常，已禁用修正入口</span>');
+  }
+
+  function openSalesEdit(id) {
+    var opp = oppById(id);
+    if (!opp || !window.SalesAnalysis) return;
+    var a = analyzeOpp(opp);
+    var base = window.SalesAnalysis.analyze(salesInputFor(opp, a, effectiveParsed(opp, a)));
+    var r = opp.salesReview || {};
+    var needFields = [['product', '产品'], ['specs', '规格参数'], ['qty', '数量'], ['purpose', '用途'], ['certs', '认证要求'], ['delivery', '交货时间'], ['destination', '目的地'], ['targetPrice', '目标价']];
+    var byKey = {}; base.needs.forEach(function (n) { byKey[n.key] = n; });
+    var rows = needFields.map(function (f) {
+      var fix = (r.needFix || {})[f[0]];
+      return '<tr><td style="white-space:nowrap">' + f[1] + '</td>' +
+        '<td><input id="sa-n-' + f[0] + '" value="' + esc(fix ? fix.value : '') + '" placeholder="' + esc(byKey[f[0]] ? (byKey[f[0]].value || '（未识别）') : '') + '" style="width:100%"></td>' +
+        '<td><label style="font-size:12px"><input type="checkbox" id="sa-f-' + f[0] + '"' + ((r.flagged || []).indexOf('need:' + f[0]) >= 0 ? ' checked' : '') + '> 标记不准确</label></td></tr>';
+    }).join('');
+    var stageOpts = [''].concat(window.SalesAnalysis.STAGES).map(function (s) {
+      return '<option value="' + esc(s) + '"' + ((r.stageFix || '') === s ? ' selected' : '') + '>' + (s || '（保持系统判断）') + '</option>';
+    }).join('');
+    var concernRows = base.concerns.map(function (c, i) {
+      var f = (r.concernFix || {})[c.topic] || '';
+      return '<tr><td>' + esc(c.topic) + '（系统：' + esc(c.level) + '）</td><td><select id="sa-c-' + i + '" data-topic="' + esc(c.topic) + '">' +
+        '<option value=""' + (!f ? ' selected' : '') + '>保持系统判断</option>' +
+        '<option value="confirmed"' + (f === 'confirmed' ? ' selected' : '') + '>确认：客户确实关注</option>' +
+        '<option value="dismissed"' + (f === 'dismissed' ? ' selected' : '') + '>客户并不关注</option></select></td></tr>';
+    }).join('');
+    openModal(modalHead('修正客户销售判断') +
+      '<div class="stack" style="gap:10px"><div style="font-size:12.5px;color:#8a919e">这里保存的是员工人工确认，与系统分析分开存放、互不覆盖；留空表示沿用系统判断。</div>' +
+      '<table class="table"><tbody>' + rows + '</tbody></table>' +
+      '<table class="table"><tbody>' + concernRows + '</tbody></table>' +
+      '<div class="row" style="gap:10px;align-items:center"><span>采购阶段</span><select id="sa-stage">' + stageOpts + '</select>' +
+      '<label style="font-size:12px"><input type="checkbox" id="sa-f-stage"' + ((r.flagged || []).indexOf('stage') >= 0 ? ' checked' : '') + '> 标记阶段判断不准确</label></div>' +
+      '<div class="row">' + (safeActionId(opp.id)
+        ? '<button class="btn primary" data-action="sales-save" data-id="' + safeActionId(opp.id) + '">保存人工确认</button>'
+        : '<span style="font-size:12px;color:#b91c1c">商机 ID 异常，已禁用保存</span>') +
+      '<button class="btn ghost" data-action="close-modal">取消</button></div></div>', true);
+  }
+
+  function saveSalesEdit(id) {
+    var opp = oppById(id);
+    if (!opp) return;
+    function v(i) { var el = document.getElementById(i); return el ? String(el.value || '').trim() : ''; }
+    function ck(i) { var el = document.getElementById(i); return !!(el && el.checked); }
+    var needFix = {}, flagged = [];
+    ['product', 'specs', 'qty', 'purpose', 'certs', 'delivery', 'destination', 'targetPrice'].forEach(function (k) {
+      if (v('sa-n-' + k)) needFix[k] = { value: v('sa-n-' + k), at: new Date().toISOString().slice(0, 10) };
+      if (ck('sa-f-' + k)) flagged.push('need:' + k);
+    });
+    if (ck('sa-f-stage')) flagged.push('stage');
+    var concernFix = {};
+    var a = analyzeOpp(opp);
+    var base = window.SalesAnalysis.analyze(salesInputFor(opp, a, effectiveParsed(opp, a)));
+    base.concerns.forEach(function (c, i) {
+      var sel = document.getElementById('sa-c-' + i);
+      if (sel && sel.value) concernFix[c.topic] = sel.value;
+    });
+    var review = {};
+    if (Object.keys(needFix).length) review.needFix = needFix;
+    if (v('sa-stage')) review.stageFix = v('sa-stage');
+    if (Object.keys(concernFix).length) review.concernFix = concernFix;
+    if (flagged.length) review.flagged = flagged;
+    if (Object.keys(review).length) { review.at = new Date().toISOString().slice(0, 10); opp.salesReview = review; }
+    else delete opp.salesReview;
+    C.addLog(opp, '人工修正客户销售判断' + (Object.keys(review).length ? '' : '（已清空，恢复系统判断）'));
+    closeModal();
+    C.persist();
+    /* R3-08（第五节）：成功提示必须在落盘确认之后。落盘失败时 Core 已回滚内存，
+       这里只给失败提示并按真实状态重渲染，绝不显示成功。 */
+    if (C.persistOk && !C.persistOk()) {
+      invalidate(); render();
+      toast('保存失败：人工修正未能写入，已回滚到上次保存的状态');
+      return;
+    }
+    render();
+    toast(Object.keys(review).length ? '人工确认已保存（与系统分析分开）' : '已恢复系统判断');
   }
 
   /* =========================================================
@@ -402,7 +553,7 @@
           ({ focus: '重点跟进', normal: '正常跟进', defer: '暂时搁置' })[v] + '</option>';
       }).join('') + '</select>' +
       '<input type="text" id="vn-note" style="flex:1;min-width:140px" maxlength="200" placeholder="备注：为什么这样判断（可选）" value="' + esc(vn.note || '') + '">' +
-      '<button class="btn sm" data-action="save-value-note" data-id="' + opp.id + '">保存判断</button>' +
+      '<button class="btn sm" data-action="save-value-note" data-id="' + safeActionId(opp.id) + '">保存判断</button>' +
       '</div>' + vnText +
       '<div style="font-size:11px;color:var(--ink-3);margin-top:8px">评分按当前解析与匹配结果实时计算 · 更新于 ' + C.fmtDate(res.computedAt, true) + '；商机状态仍用页面顶部按钮调整（标记已报价 / 成交 / 丢单）。</div>' +
       '</div></div></section>';
@@ -431,13 +582,24 @@
      opp.replyDrafts，人工编辑后刷新保留；本卡只生成草稿，永不发送。
      ========================================================= */
 
-  function replyGenFor(opp, ctx) {
+  function replyGenFor(opp, ctx, forceNoPrice) {
     if (!window.ReplyAssistant) return null;
     var res = scoreForOpp(opp);
     var pick = res && res.pick;
     var pr = ctx && ctx.pricing;
-    var price = (pr && pr.unitPriceUsd > 0 && pr.floorUsd > 0 && pr.unitPriceUsd >= pr.floorUsd)
-      ? { unit: pr.unitPriceUsd, floor: pr.floorUsd } : null;
+    /* forceNoPrice：调用方已按统一护栏（PricingUnity）判定不可报价时，
+       强制不传价——回复助手据此只产出无价谈判草稿，绝不写任何价格。
+       P1-FIX-03：传价判定改用全站统一护栏——优先 ctx.unity.quotable
+       （含登记底价与特批规则），unity 不可用时按既有兼容规则回退
+       ctx.pricing.flags.canQuote；不再自行只比保本价（旧实现下导入
+       旧数据的报价落在保本价与登记底价之间时会漏过带价）。传给回复
+       助手的 floor 同步用统一报价底线 quoteFloorUsd（保本与登记取高）。 */
+    var quotable = ctx && ctx.unity ? !!ctx.unity.quotable
+      : !!(pr && pr.flags && pr.flags.canQuote);
+    var quoteFloor = (ctx && ctx.unity && ctx.unity.quoteFloorUsd > 0)
+      ? ctx.unity.quoteFloorUsd : (pr ? pr.floorUsd : 0);
+    var price = (!forceNoPrice && quotable && pr && pr.unitPriceUsd > 0 && quoteFloor > 0 && pr.unitPriceUsd >= quoteFloor)
+      ? { unit: pr.unitPriceUsd, floor: quoteFloor } : null;
     return window.ReplyAssistant.generate({
       opp: opp,
       eff: res ? res.eff : effectiveParsed(opp, ctx),
@@ -485,10 +647,10 @@
       '<label style="margin-top:10px">中文对照（只给你看，不发送）</label>' +
       '<textarea id="ra-zh" style="min-height:150px">' + esc(zh) + '</textarea>' +
       '<div class="row" style="gap:8px;margin-top:12px">' +
-      '<button class="btn primary" data-action="ra-generate" data-id="' + opp.id + '">' + (saved ? '重新生成' : '生成并保存') + '</button>' +
-      '<button class="btn" data-action="ra-save" data-id="' + opp.id + '">保存编辑</button>' +
-      '<button class="btn" data-action="ra-copy" data-id="' + opp.id + '">复制英文</button>' +
-      (saved ? '<button class="btn" data-action="ra-sent-open" data-id="' + opp.id + '">记为已发送跟进</button>' : '') +
+      '<button class="btn primary" data-action="ra-generate" data-id="' + safeActionId(opp.id) + '">' + (saved ? '重新生成' : '生成并保存') + '</button>' +
+      '<button class="btn" data-action="ra-save" data-id="' + safeActionId(opp.id) + '">保存编辑</button>' +
+      '<button class="btn" data-action="ra-copy" data-id="' + safeActionId(opp.id) + '">复制英文</button>' +
+      (saved ? '<button class="btn" data-action="ra-sent-open" data-id="' + safeActionId(opp.id) + '">记为已发送跟进</button>' : '') +
       '<span style="font-size:11.5px;color:var(--ink-3)">复制后到阿里后台粘贴发送，发送动作始终由你完成；发完回来点「记为已发送跟进」留痕</span>' +
       '</div></div></section>';
   }
@@ -630,7 +792,7 @@
       '</div>' +
       '<div class="modal-ft">' +
       '<button class="btn ghost" data-action="close-modal">先不报，去换商品</button>' +
-      '<button class="btn danger" data-action="force-quote" data-id="' + opp.id + '">已人工核对，放行报价</button>' +
+      '<button class="btn danger" data-action="force-quote" data-id="' + safeActionId(opp.id) + '">已人工核对，放行报价</button>' +
       '</div>';
     openModal(html);
   }
@@ -781,6 +943,13 @@
       return out;
     }
 
+    if (r.flags.noPrice) {
+      out += '<div class="alert danger"><span class="ic">✕</span><div><strong>无法报价：</strong>' +
+        '当前没有有效报价（报价必须大于 0）。请先填写有效报价，再进行保本校验。' +
+        '</div></div>';
+      return out;
+    }
+
     if (r.flags.belowCost) {
       out += '<div class="alert danger"><span class="ic">✕</span><div><strong>这个价要亏：</strong>' +
         '成本 ' + C.money(r.costUnitRmb) + '/件，平台扣 ' + C.pct(r.feeRate) +
@@ -839,33 +1008,42 @@
     var page = seg[0] || 'dashboard';
     var id = seg[1] || null;
 
-    var VIEWS = ['dashboard', 'opps', 'catalog', 'analytics', 'settings', 'opp', 'review'];
+    var VIEWS = ['dashboard', 'desk', 'opps', 'catalog', 'analytics', 'settings', 'opp', 'review', 'customers', 'analysis', 'followups', 'sync'];
     if (VIEWS.indexOf(page) < 0) page = 'dashboard';
 
     var html = '';
     var crumb = '';
 
     if (page === 'dashboard') { html = viewDashboard(); crumb = '工作台'; }
-    else if (page === 'opps') { html = viewOpps(); crumb = '商机'; }
-    else if (page === 'catalog') { html = viewCatalog(); crumb = '商品库'; }
+    else if (page === 'desk') {
+      html = window.DecisionDesk ? window.DecisionDesk.view() : '<section class="card">决策台模块未加载</section>';
+      crumb = '询盘决策台';
+      setTimeout(function () { if (window.DecisionDesk) window.DecisionDesk.mount(); }, 30);
+    }
+    else if (page === 'opps') { html = viewOpps(); crumb = '询盘中心'; }
+    else if (page === 'catalog') { html = viewCatalog(); crumb = '商品与报价'; }
     else if (page === 'review') { html = viewReview(); crumb = '补成本'; }
     else if (page === 'analytics') {
       html = viewAnalytics();
-      crumb = '复盘';
+      crumb = '经营分析';
       setTimeout(function () {
         var o = document.getElementById('fx-shock-out');
         var i = document.getElementById('fx-shock');
         if (o && i && !o.innerHTML) o.innerHTML = fxShockResult(C.num(i.value, 7.1));
       }, 60);
     }
-    else if (page === 'settings') { html = viewSettings(); crumb = '设置'; }
+    else if (page === 'settings') { html = viewSettings(); crumb = '系统设置'; }
+    else if (page === 'customers') { html = viewCustomers(); crumb = '客户中心'; }
+    else if (page === 'analysis') { html = viewAnalysis(); crumb = '销售分析'; }
+    else if (page === 'followups') { html = viewFollowups(); crumb = '跟进管理'; }
+    else if (page === 'sync') { html = viewSync(); crumb = '数据同步与系统设置'; }
     else if (page === 'opp') {
       html = viewOppDetail(id);
       crumb = '商机详情';
       setTimeout(function () { ensureTranslation(oppById(id)); initSandbox(id); }, 80);
     }
 
-    renderNav(page === 'opp' ? 'opps' : page);
+    renderNav(page === 'opp' ? 'opps' : (page === 'settings' ? 'sync' : page));
     document.getElementById('crumb').textContent = crumb;
     document.getElementById('view').innerHTML = html;
 
@@ -988,6 +1166,151 @@
   }
 
   /* =========================================================
+     P1-23 全站框架新视图（只读聚合，不新增数据结构，不改旧逻辑）
+     ========================================================= */
+
+  /* 链接边界校验：id 只允许与 safeId 同字符集的安全串进入 href 属性；
+     异常 id（未经规范化的内存对象等）安全降级为纯文本，宁可不跳也不拼错链接。 */
+  function fwOppLink(o, text) {
+    var id = o && o.id != null ? String(o.id) : '';
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) return esc(text);
+    return '<a href="#/opp/' + id + '" style="color:#2563eb;text-decoration:none">' + esc(text) + '</a>';
+  }
+
+  /* R3-06：写入 HTML 属性的操作 ID 必须先过全站统一的安全 ID 校验
+     （与 fwOppLink / safeId 同字符集）。非法 ID 返回 null，调用方不得
+     生成可触发编辑/保存的按钮——不清洗后继续用（防不同原始 ID 清洗成
+     同一 ID 的身份冲突），也不靠转义掩盖。 */
+  function safeActionId(id) {
+    var s = id != null ? String(id) : '';
+    /* R5 第五项修正：不合规时返回空串而非 null。R4 版返回 null，
+       字符串拼接后属性值变成字面量 "null"——它恰好通过字符集校验，
+       点击后以 id='null' 进入业务分发：saveOpp 靠查无此人兜底，
+       saveProduct 则会对 undefined 执行 Object.assign 抛错，且新
+       建商品的保存按钮同样中招（data-id="null" 使新建流程误入
+       编辑分支）。返回空串后：属性为空、守卫可区分「属性存在但
+       被收口为空」与「属性缺失」、双用途保存回到空 id 语义。 */
+    return /^[A-Za-z0-9_-]{1,64}$/.test(s) ? s : '';
+  }
+
+  /* 最近一条跟进记录：followLog 写入为追加序，但导入数据不保证顺序，
+     故按有效时间字段取最大；无有效时间时回退数组最后一项（不改原始数据）。 */
+  function fwLastFollow(opp) {
+    var log = (opp && opp.followLog) || [];
+    var best = null, bestT = -Infinity;
+    for (var i = 0; i < log.length; i++) {
+      var t = Date.parse(log[i] && log[i].at);
+      if (!isNaN(t) && t >= bestT) { bestT = t; best = log[i]; }
+    }
+    return best || log[log.length - 1] || null;
+  }
+
+  /* 客户中心：按买家聚合当前可见商机。无稳定平台 ID 时只按 名称+公司 分组并明示需人工确认，不自动合并。 */
+  function viewCustomers() {
+    var s = st();
+    var opps = C.visibleOpps(s, S.dataView).slice().sort(function (a, b) { return String(b.createdAt || '').localeCompare(String(a.createdAt || '')); });
+    var groups = {}, order = [];
+    opps.forEach(function (o) {
+      /* R3-07：分组键改结构化复合键（JSON 编码二元组），杜绝 name/company
+         内容含分隔符时的拼接碰撞（如 name="A|B",company="C" 与
+         name="A",company="B|C"）。显示名仍用原始字段，空名显示「未知买家」，
+         但分组按原始空值区分，不与字面「未知买家」合并。 */
+      var gName = String((o.buyer && o.buyer.name) || '');
+      var gCompany = String((o.buyer && o.buyer.company) || '');
+      var key = JSON.stringify([gName, gCompany]);
+      if (!groups[key]) { groups[key] = { buyer: o.buyer || {}, list: [] }; order.push(key); }
+      groups[key].list.push(o);
+    });
+    var rows = order.map(function (key) {
+      var g = groups[key], latest = g.list[0];
+      var open = g.list.filter(function (o) { return o.status !== 'won' && o.status !== 'lost'; }).length;
+      return '<tr><td><strong>' + esc(g.buyer.name || '未知买家') + '</strong><div style="color:#8a919e;font-size:12px">' +
+        esc(g.buyer.company || '') + (g.buyer.country ? ' · ' + esc(g.buyer.country) : '') + '</div></td>' +
+        '<td>' + g.list.length + ' 条（进行中 ' + open + ')</td>' +
+        '<td>' + esc(String(latest.createdAt || '').slice(0, 10)) + '</td>' +
+        '<td>' + fwOppLink(latest, '查看最近询盘') + '</td></tr>';
+    }).join('');
+    return '<section class="card"><div class="card-head"><h3>客户中心</h3><span class="sub">同一买家的历史询盘聚合</span></div>' +
+      '<div class="alert warn" style="margin:0 18px 12px"><span class="ic">!</span><div>当前按「买家名称 + 公司」聚合：系统尚无阿里买家稳定 ID，同名不同人可能被分到一组、同一人改名可能被拆开。正式客户档案与人工确认合并将在接入稳定标识后启用，本页不自动合并、不改动任何商机数据。</div></div>' +
+      (order.length ? '<div class="table-wrap"><table class="tbl"><thead><tr><th>客户</th><th>询盘</th><th>最近询盘</th><th></th></tr></thead><tbody>' + rows + '</tbody></table></div>'
+        : '<div class="empty"><strong>还没有客户</strong>询盘进入后会在这里按买家聚合。</div>') + '</section>';
+  }
+
+  /* 销售分析：对当前可见商机批量运行 P1-22 规则分析，给出阶段与缺口总览（只读，点击进详情修正）。 */
+  function viewAnalysis() {
+    var s = st();
+    if (!window.SalesAnalysis) return '<section class="card"><div class="empty"><strong>销售分析模块未加载</strong></div></section>';
+    var opps = C.visibleOpps(s, S.dataView).filter(function (o) { return o.rawText; });
+    var rows = opps.map(function (o) {
+      var a = analyzeOpp(o);
+      var disp = window.SalesAnalysis.applyReview(window.SalesAnalysis.analyze(salesInputFor(o, a, effectiveParsed(o, a))), o.salesReview);
+      var missing = disp.needs.filter(function (n) { return n.status === 'missing'; }).map(function (n) { return n.label; });
+      var hasConflict = disp.needs.some(function (n) { return n.status === 'conflict'; });
+      return '<tr><td>' + fwOppLink(o, (o.buyer && o.buyer.name) || '未知买家') + '</td>' +
+        '<td>' + esc(disp.stage.label) + (disp.stage.confirmed ? ' <span class="badge" style="background:#eef4ff;color:#2563eb">人工确认</span>' : '') + '</td>' +
+        '<td>' + (hasConflict ? '<span style="color:#b91c1c">有冲突待核实</span>' : (missing.length ? '缺：' + esc(missing.slice(0, 3).join('、')) : '信息较完整')) + '</td>' +
+        '<td>' + esc(String(o.createdAt || '').slice(0, 10)) + '</td></tr>';
+    }).join('');
+    return '<section class="card"><div class="card-head"><h3>销售分析</h3><span class="sub">规则分析总览 · 非大模型</span></div>' +
+      '<p style="padding:0 18px;color:#667085;font-size:13px">以下判断由规则引擎基于询盘原文与系统记录生成，均可在询盘详情的「客户销售判断」卡中查看证据并人工修正；这里不产生新的分析数据。</p>' +
+      (opps.length ? '<div class="table-wrap"><table class="tbl"><thead><tr><th>客户</th><th>采购阶段</th><th>缺口 / 冲突</th><th>询盘日期</th></tr></thead><tbody>' + rows + '</tbody></table></div>'
+        : '<div class="empty"><strong>暂无可分析的询盘</strong>有原文的询盘会出现在这里。</div>') + '</section>';
+  }
+
+  /* 跟进管理：聚合 FollowUp 的状态与到期信息，形成跨询盘跟进清单（只读）。 */
+  function viewFollowups() {
+    var s = st();
+    if (!window.FollowUp) return '<section class="card"><div class="empty"><strong>跟进模块未加载</strong></div></section>';
+    var opps = C.visibleOpps(s, S.dataView).filter(function (o) { return o.status !== 'won' && o.status !== 'lost'; });
+    var items = opps.map(function (o) {
+      var fuSt = window.FollowUp.deriveStatus(o);
+      var fuDue = window.FollowUp.dueState(o, Date.now());
+      return { o: o, rank: window.FollowUp.sortRank(o, Date.now()), label: window.FollowUp.statusLabel(fuSt), due: fuDue };
+    }).sort(function (a, b) { return a.rank - b.rank; });
+    var rows = items.map(function (it) {
+      var last = fwLastFollow(it.o);
+      return '<tr><td>' + fwOppLink(it.o, (it.o.buyer && it.o.buyer.name) || '未知买家') + '</td>' +
+        '<td>' + esc(it.label) + '</td>' +
+        '<td>' + (it.due && it.due.state === 'overdue' ? '<span style="color:#b91c1c">已逾期</span>' : esc((it.due && it.due.label) || '—')) + '</td>' +
+        '<td style="color:#667085">' + (last ? esc(String(last.at || '').slice(0, 10)) + ' ' + esc(String(last.note || '').slice(0, 40)) : '暂无跟进记录') + '</td></tr>';
+    }).join('');
+    return '<section class="card"><div class="card-head"><h3>跟进管理</h3><span class="sub">跨询盘跟进清单</span></div>' +
+      '<p style="padding:0 18px;color:#667085;font-size:13px">按跟进紧急度排序；记录与提醒的维护在各询盘详情内完成，本页只做聚合查看，不新增待办数据。</p>' +
+      (items.length ? '<div class="table-wrap"><table class="tbl"><thead><tr><th>客户</th><th>跟进状态</th><th>到期</th><th>最近记录</th></tr></thead><tbody>' + rows + '</tbody></table></div>'
+        : '<div class="empty"><strong>暂无进行中的询盘</strong></div>') + '</section>';
+  }
+
+  /* 同步与设置：阿里官方同步的真实能力状态 + 现有手动导入导出入口。不伪造连接状态。 */
+  function viewSync() {
+    var s = st();
+    var capRow = function (name, state, note) {
+      return '<tr><td>' + esc(name) + '</td><td>' + state + '</td><td style="color:#667085">' + esc(note) + '</td></tr>';
+    };
+    return '<section class="card"><div class="card-head"><h3>数据同步与系统设置</h3><span class="sub">阿里国际站官方连接</span></div>' +
+      '<div class="alert warn" style="margin:0 18px 12px"><span class="ic">!</span><div><strong>阿里官方接口尚未连接。</strong>本系统未取得阿里开放平台 ISV 应用与卖家授权，当前所有数据来自手动录入与文件导入。下方为官方文档核查结论，不代表已开通能力。</div></div>' +
+      (window.IdentityTxn && window.IdentityTxn.isLocked() ? '<div class="alert warn" style="margin:0 18px 12px"><span class="ic">!</span><div><strong>身份数据待恢复：写入已阻断。</strong>检测到未完成的身份导入事务（批次 ' + esc(String((window.IdentityTxn.lockReason() || {}).batchId || '')) + '）。恢复将按事务日志回滚该批次，完成后自动解除阻断。<div style="margin-top:8px"><button class="btn sm" data-action="identity-recover">执行恢复并校验</button></div></div></div>' : '') +
+      (window.IdentityTxn && window.IdentityTxn.readLegacyPending(window.localStorage) ? '<div class="alert warn" style="margin:0 18px 12px"><span class="ic">!</span><div><strong>旧格式备份待迁移：</strong>最近恢复的备份不含身份注册表。在完成存量身份回填前，身份层导入会被拒绝（不会静默创建新注册表）。</div></div>' : '') +
+      '<div class="hint" style="margin:0 18px 12px">运行前提：本系统按<strong>单标签页</strong>设计，多标签页同时操作不受支持（检测到其他标签页改动身份数据时，本页会立即阻断写入）。</div>' +
+      '<div class="table-wrap"><table class="tbl"><thead><tr><th>能力</th><th>官方状态</th><th>说明</th></tr></thead><tbody>' +
+      capRow('账号授权（OAuth / session)', '官方已确认存在', '淘宝开放平台（TOP）承载国际站 ICBU API，需 ISV 应用 AppKey + 卖家授权换取 session；本系统尚未申请') +
+      capRow('商品读取', '官方已确认存在', 'alibaba.icbu.product.list / get 等，需授权；可用于商品库同步') +
+      capRow('订单读取', '官方已确认存在', 'alibaba.seller.order.list / get，需授权') +
+      capRow('订单变更通知', '官方已确认存在', '消息服务 TMC 的 icbu_trade_OrderNotify，需另行申请消息权限') +
+      capRow('买家基础信息', '官方已确认存在（收费）', 'alibaba.buyer.companyprofile.find 等为收费 API，且不等同于询盘买家数据') +
+      capRow('RFQ 查询与详情读取', '官方文档已确认存在 · 本项目未授权未调用', 'alibaba.icbu.rfq.search / rfqdetail.get 等可按 ID 逐条读取 RFQ；仅覆盖 RFQ 渠道，不等于全部询盘') +
+      capRow('非 RFQ 商品页询盘读取', '公开资料尚未确认', '商品详情页发起的询盘，在官方公开 API 列表中尚未找到逐条读取接口，不能确认存在，也未证实不存在') +
+      capRow('TM 站内消息读取', '公开资料尚未确认', '尚未找到聊天消息内容读取接口；订单变更通知（icbu_trade_OrderNotify）是订单事件消息，不是询盘消息') +
+      capRow('TM 站内消息发送', '公开资料尚未确认', '尚未找到卖家消息发送接口；且对外沟通由员工在阿里卖家后台人工完成，不属于本产品自动执行范围') +
+      capRow('RFQ 报价提交', '官方文档已确认存在 · 本项目未授权未调用', 'alibaba.icbu.quotation.post 是向 RFQ 提交报价的接口，不是站内消息发送；本产品不自动提交，报价一律人工确认') +
+      '</tbody></table></div>' +
+      '<div style="padding:14px 18px;display:flex;gap:8px;flex-wrap:wrap">' +
+      '<button class="btn sm" data-action="export-json">导出数据备份（JSON)</button>' +
+      '<button class="btn sm" data-action="import-json">导入数据（JSON)</button>' +
+      '<a class="btn sm" href="#/settings" style="text-decoration:none">打开系统设置</a></div>' +
+      '<p style="padding:0 18px 14px;color:#667085;font-size:13px">同步日志：暂无记录（从未执行官方同步）。手动导入的数据与未来接口数据将走同一套标准化与去重流程，员工人工修正受同步保护、不会被覆盖（设计见数据架构文档）。当前商机 ' + s.opportunities.length + ' 条、商品 ' + s.products.length + ' 个，均为本地数据。</p></section>';
+  }
+
+  /* =========================================================
      视图：工作台
      ========================================================= */
 
@@ -1080,7 +1403,7 @@
         unitPriceUsd: o.quote.unitPriceUsd,
         buyerTargetUsd: a.parsed.targetPriceUsd
       });
-      return '<tr class="clickable" data-action="open-opp" data-id="' + o.id + '">' +
+      return '<tr class="clickable" data-action="open-opp" data-id="' + safeActionId(o.id) + '">' +
         '<td><strong>' + esc(o.buyer.name) + '</strong><br><span style="color:#8a919e;font-size:11px">' +
         esc(o.buyer.country) + ' · ' + esc(o.buyer.channel) + '</span></td>' +
         '<td>' + (p ? esc(p.title) : '<span style="color:#d92d20">没匹配到商品</span>') + '</td>' +
@@ -1088,7 +1411,7 @@
         '<td class="num">' + (pr.unitPriceUsd ? C.usd(pr.unitPriceUsd) : '—') + '</td>' +
         '<td class="num">' + (pr.flags.noPrice ? '<span style="color:#d97706">无挂牌价</span>' : C.money(pr.netRmb)) + '</td>' +
         '<td>' + (pr.flags.canQuote ? '<span class="badge green">可报</span>' : '<span class="badge red">不能报</span>') + '</td>' +
-        '<td class="actions"><button class="btn sm" data-action="open-opp" data-id="' + o.id + '">打开</button></td>' +
+        '<td class="actions"><button class="btn sm" data-action="open-opp" data-id="' + safeActionId(o.id) + '">打开</button></td>' +
         '</tr>';
     }).join('');
 
@@ -1273,7 +1596,7 @@
           : '<span style="color:#d92d20">无匹配</span>') + '</td>' +
         '<td class="num">' + (c.qty ? c.qty.toLocaleString() : '—') + '</td>' +
         '<td class="num">' + (o.deal && o.deal.netRmb ? C.money(o.deal.netRmb) : '—') + '</td>' +
-        '<td class="actions"><button class="btn sm" data-action="open-opp" data-id="' + o.id + '">打开</button></td>' +
+        '<td class="actions"><button class="btn sm" data-action="open-opp" data-id="' + safeActionId(o.id) + '">打开</button></td>' +
         '</tr>';
     }).join('');
   }
@@ -1462,11 +1785,11 @@
       '<div><label style="font-size:11.5px;color:#8a919e">单价 USD <b id="sb-price-out" style="color:#111">' +
       C.usd(curP) + '</b></label>' +
       '<input type="range" id="sb-price" min="' + minP + '" max="' + maxP + '" step="0.01" value="' + curP +
-      '" style="width:100%" data-opp="' + ctx.opp.id + '"></div>' +
+      '" style="width:100%" data-opp="' + safeActionId(ctx.opp.id) + '"></div>' +
       '<div><label style="font-size:11.5px;color:#8a919e">数量 <b id="sb-qty-out" style="color:#111">' +
       qty.toLocaleString() + '</b></label>' +
       '<input type="range" id="sb-qty" min="1" max="' + Math.max(qty * 3, 100) + '" step="1" value="' + qty +
-      '" style="width:100%" data-opp="' + ctx.opp.id + '"></div>' +
+      '" style="width:100%" data-opp="' + safeActionId(ctx.opp.id) + '"></div>' +
       '</div>' +
       '<div id="sb-result" style="margin-top:16px"></div>' +
       '<div style="font-size:11px;color:#8a919e;margin-top:10px">保本价 ' + C.usd(floor) +
@@ -1647,13 +1970,13 @@
       '<div class="row">' +
       '<button class="btn" data-action="gen-reply" data-lang="zh">生成中文回复</button>' +
       '<button class="btn" data-action="gen-reply" data-lang="en">生成英文回复</button>' +
-      '<button class="btn" data-action="print-quote" data-id="' + opp.id + '">报价单</button>' +
-      '<button class="btn" data-action="open-follow" data-id="' + opp.id + '">记录跟进</button>' +
+      '<button class="btn" data-action="print-quote" data-id="' + safeActionId(opp.id) + '">报价单</button>' +
+      '<button class="btn" data-action="open-follow" data-id="' + safeActionId(opp.id) + '">记录跟进</button>' +
       (opp.status !== 'quoted' && opp.status !== 'won'
-        ? '<button class="btn primary" data-action="mark-quoted" data-id="' + opp.id + '">标记已报价</button>' : '') +
-      '<button class="btn" data-action="open-settle" data-id="' + opp.id + '">成交</button>' +
-      '<button class="btn danger" data-action="open-lose" data-id="' + opp.id + '">丢单</button>' +
-      '<button class="icon-btn" data-action="delete-opp" data-id="' + opp.id + '" title="删除">×</button>' +
+        ? '<button class="btn primary" data-action="mark-quoted" data-id="' + safeActionId(opp.id) + '">标记已报价</button>' : '') +
+      '<button class="btn" data-action="open-settle" data-id="' + safeActionId(opp.id) + '">成交</button>' +
+      '<button class="btn danger" data-action="open-lose" data-id="' + safeActionId(opp.id) + '">丢单</button>' +
+      '<button class="icon-btn" data-action="delete-opp" data-id="' + safeActionId(opp.id) + '" title="删除">×</button>' +
       '</div></div></div></section>';
 
     /* ---- 左：原文 + 解析 ---- */
@@ -1676,32 +1999,32 @@
       '<div class="rawtext" id="raw-block">' +
       esc(S.oppLang === 'zh' && S.oppTextZh ? S.oppTextZh : opp.rawText) + '</div>' +
       '<div class="chips" style="margin-top:12px">' + parsedChips.join('') + '</div>',
-      '<button class="btn sm ghost" data-action="edit-opp" data-id="' + opp.id + '">编辑原文</button>');
+      '<button class="btn sm ghost" data-action="edit-opp" data-id="' + safeActionId(opp.id) + '">编辑原文</button>');
 
     /* ---- 右：定价面板 ---- */
     var right = '<section class="card" id="pricing-card">' +
       '<div class="card-hd"><div class="card-title">定价测算' +
       '<span class="card-sub">' + (p ? esc(p.sku) : '未选品') + '</span></div>' +
-      '<button class="btn sm ghost" data-action="apply-recommend" data-id="' + opp.id + '">用建议价</button></div>' +
+      '<button class="btn sm ghost" data-action="apply-recommend" data-id="' + safeActionId(opp.id) + '">用建议价</button></div>' +
       '<div class="card-bd stack">' +
       '<div class="row" style="gap:8px;flex-wrap:wrap">' +
       '<span style="font-size:12px;color:var(--ink-3)">去别的平台比价：</span>' + searchLinks(ctx) + '</div>' +
       marketLine(p, r) +
       '<div class="form-grid">' +
       '<div class="field"><label>数量 (pcs)</label>' +
-      '<input type="number" min="1" step="1" value="' + opp.quote.qty + '" data-opp="' + opp.id + '" data-field="qty"></div>' +
+      '<input type="number" min="1" step="1" value="' + opp.quote.qty + '" data-opp="' + safeActionId(opp.id) + '" data-field="qty"></div>' +
       '<div class="field"><label>你的报价 (USD)</label>' +
-      '<input type="number" min="0" step="0.01" value="' + C.round(r.unitPriceUsd, 2) + '" data-opp="' + opp.id + '" data-field="unitPriceUsd"></div>' +
+      '<input type="number" min="0" step="0.01" value="' + C.round(r.unitPriceUsd, 2) + '" data-opp="' + safeActionId(opp.id) + '" data-field="unitPriceUsd"></div>' +
       '<div class="field"><label>采购成本（元/件，1688 查的）</label>' +
-      '<input type="number" min="0" step="0.01" value="' + (C.num(opp.quote.costRmb) || '') + '" data-opp="' + opp.id + '" data-field="costRmb"></div>' +
+      '<input type="number" min="0" step="0.01" value="' + (C.num(opp.quote.costRmb) || '') + '" data-opp="' + safeActionId(opp.id) + '" data-field="costRmb"></div>' +
       '<div class="field"><label>别家卖多少（元/件）</label>' +
-      '<input type="number" min="0" step="0.01" value="' + (C.num(p && p.marketPriceRmb) || '') + '" data-opp="' + opp.id + '" data-field="marketPriceRmb"></div>' +
+      '<input type="number" min="0" step="0.01" value="' + (C.num(p && p.marketPriceRmb) || '') + '" data-opp="' + safeActionId(opp.id) + '" data-field="marketPriceRmb"></div>' +
       '<div class="field"><label>国内运费（元/件）</label>' +
-      '<input type="number" min="0" step="0.01" value="' + (C.num(opp.quote.shippingRmb) || 0) + '" data-opp="' + opp.id + '" data-field="shippingRmb"></div>' +
+      '<input type="number" min="0" step="0.01" value="' + (C.num(opp.quote.shippingRmb) || 0) + '" data-opp="' + safeActionId(opp.id) + '" data-field="shippingRmb"></div>' +
       '<div class="field"><label>贸易术语</label>' +
-      '<input type="text" value="' + esc(opp.quote.incoterm || '') + '" data-opp="' + opp.id + '" data-field="incoterm"></div>' +
+      '<input type="text" value="' + esc(opp.quote.incoterm || '') + '" data-opp="' + safeActionId(opp.id) + '" data-field="incoterm"></div>' +
       '<div class="field"><label>交期（天，0 = 待确认）</label>' +
-      '<input type="number" min="1" value="' + (opp.quote.leadTimeDays || 0) + '" data-opp="' + opp.id + '" data-field="leadTimeDays"></div>' +
+      '<input type="number" min="1" value="' + (opp.quote.leadTimeDays || 0) + '" data-opp="' + safeActionId(opp.id) + '" data-field="leadTimeDays"></div>' +
       '</div>' +
       '<div data-pf="split">' + rangeBarHtml(ctx) + '</div>' +
       '<div data-pf="floors">' + floorsHtml(ctx) + '</div>' +
@@ -1765,7 +2088,7 @@
         if (sel) tags.push('<span class="chip good">已选为报价商品</span>');
         if (r.keyConflict) tags.push('<span class="chip bad">关键冲突</span>');
         return '<div class="match-item' + (sel ? ' selected' : '') + '" data-action="select-product" data-id="' +
-          p.id + '" data-opp="' + opp.id + '" title="点击选为报价商品">' +
+          safeActionId(p.id) + '" data-opp="' + safeActionId(opp.id) + '" title="点击选为报价商品">' +
           '<div class="match-score ' + cls + '">' + r.score + '</div>' +
           '<div class="match-body">' +
           '<div class="match-name">' + esc(p.title) +
@@ -1806,7 +2129,7 @@
     var matchCard = '<section class="card"><div class="card-hd">' +
       '<div class="card-title">智能匹配<span class="card-sub">规则匹配度，不是成交概率；点任意候选即选为报价商品</span></div>' +
       '<span class="row" style="gap:8px"><span class="badge gray">' + visibleRanked.length + ' 个候选</span>' +
-      '<button class="btn sm" data-action="rematch" data-id="' + opp.id + '">重新匹配</button></span></div>' +
+      '<button class="btn sm" data-action="rematch" data-id="' + safeActionId(opp.id) + '">重新匹配</button></span></div>' +
       (srcBits.length ? '<div style="padding:10px 14px 0;font-size:11.5px;color:var(--ink-3)">匹配依据：' +
         srcBits.map(esc).join(' · ') + '；原始询盘文本作辅助依据</div>' : '') +
       selWarn +
@@ -1833,6 +2156,7 @@
       oppScoreCard(opp) +
       '<div class="grid grid-2 top">' + left + right + '</div>' +
       parseCard(opp, a, effP) +
+      salesCard(opp, a, effP) +
       buyerCard(opp) + followCard(opp) + sandboxCard(ctx) + matchCard + extra + replyAssistantCard(opp, ctx) + tabs + '</div>';
   }
 
@@ -2042,7 +2366,7 @@
   }
   function tabBtn(key, label, opp) {
     return '<button class="tab' + (S.tab === key ? ' active' : '') + '" data-action="tab" data-tab="' + key +
-      '" data-id="' + opp.id + '">' + label + '</button>';
+      '" data-id="' + safeActionId(opp.id) + '">' + label + '</button>';
   }
 
   function tabBody(ctx) {
@@ -2055,10 +2379,10 @@
           (S.tab === 'en' ? '英文' : '中文') + '回复」，系统会按当前报价和买家需求自动起草。</div>';
       }
       return '<div class="field"><label>可直接编辑后再复制到阿里后台 / 邮箱</label>' +
-        '<textarea class="draft" data-draft="' + S.tab + '" data-id="' + opp.id + '">' + esc(text) + '</textarea></div>' +
+        '<textarea class="draft" data-draft="' + S.tab + '" data-id="' + safeActionId(opp.id) + '">' + esc(text) + '</textarea></div>' +
         '<div class="row" style="margin-top:10px">' +
-        '<button class="btn sm primary" data-action="copy-draft" data-lang="' + S.tab + '" data-id="' + opp.id + '">复制全文</button>' +
-        '<button class="btn sm ghost" data-action="gen-reply" data-lang="' + S.tab + '" data-id="' + opp.id + '">重新生成</button>' +
+        '<button class="btn sm primary" data-action="copy-draft" data-lang="' + S.tab + '" data-id="' + safeActionId(opp.id) + '">复制全文</button>' +
+        '<button class="btn sm ghost" data-action="gen-reply" data-lang="' + S.tab + '" data-id="' + safeActionId(opp.id) + '">重新生成</button>' +
         '<span class="card-sub">提示：生成后改价不会自动同步，重新生成即可</span>' +
         '</div>';
     }
@@ -2081,7 +2405,7 @@
       return '<div class="alert info" style="margin-bottom:12px"><span class="ic">i</span>' +
         '<div>下面是报价单预览。<strong>打印 / 存 PDF</strong> 会打开新窗口，选「另存为 PDF」即可发给客户。</div></div>' +
         '<div class="row" style="margin-bottom:12px">' +
-        '<button class="btn sm primary" data-action="print-quote" data-id="' + opp.id + '">打印 / 存 PDF</button>' +
+        '<button class="btn sm primary" data-action="print-quote" data-id="' + safeActionId(opp.id) + '">打印 / 存 PDF</button>' +
         '</div>' +
         '<div style="border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;height:460px;background:#fff">' +
         '<iframe id="quote-frame" style="width:100%;height:100%;border:0" sandbox="" srcdoc="' +
@@ -2146,7 +2470,7 @@
       function cell(field, val, ph) {
         return '<td class="num"><input type="number" min="0" step="0.01" ' +
           'value="' + (C.num(val) > 0 ? C.num(val) : '') + '" placeholder="' + ph + '" ' +
-          'data-prod="' + p.id + '" data-pfield="' + field + '" ' +
+          'data-prod="' + safeActionId(p.id) + '" data-pfield="' + field + '" ' +
           'style="width:82px;height:28px;text-align:right;font-family:var(--mono)' +
           (C.num(val) > 0 ? '' : ';border-color:#f0b429') + '"></td>';
       }
@@ -2178,7 +2502,7 @@
         '<td class="num" style="font-weight:600">' + (be.hasCost ? C.usd(be.recommendUsd) : '—') + '</td>' +
         '<td>' + verdict +
         '<br><span style="color:#a0a6b0;font-size:10px">费率 ' + C.pct(C.feeRateFor(p, s.settings)) + '</span></td>' +
-        '<td class="actions"><button class="btn sm ghost" data-action="edit-product" data-id="' + p.id + '">编辑</button></td>' +
+        '<td class="actions"><button class="btn sm ghost" data-action="edit-product" data-id="' + safeActionId(p.id) + '">编辑</button></td>' +
         '</tr>';
     }).join('');
   }
@@ -2357,7 +2681,7 @@
         candHtml = '<div class="row" style="gap:6px">' + good.map(function (x) {
           var tt = String(x.title || '');
           var pr = C.num(x.price);
-          return '<button class="btn sm" data-action="use-price" data-id="' + p.id + '" data-price="' + pr + '" ' +
+          return '<button class="btn sm" data-action="use-price" data-id="' + safeActionId(p.id) + '" data-price="' + pr + '" ' +
             'data-src="' + esc(x.source || '') + '" ' +
             'title="' + esc(tt || String(pr)) + '" style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
             (x.source ? '<span style="color:#8a919e">' + esc(x.source) + '</span> ' : '') +
@@ -2604,8 +2928,8 @@
         '<td class="num">' + C.money(o.costRmb) + '</td>' +
         '<td class="num" style="color:' + (profit < 0 ? '#d92d20' : '#0f9d58') + '">' + C.money(profit) + '</td>' +
         '<td class="actions" style="white-space:nowrap">' +
-        '<button class="btn sm ghost" data-action="refund-order" data-id="' + o.id + '">退款</button> ' +
-        '<button class="btn sm ghost" data-action="delete-order" data-id="' + o.id + '">删</button></td>' +
+        '<button class="btn sm ghost" data-action="refund-order" data-id="' + safeActionId(o.id) + '">退款</button> ' +
+        '<button class="btn sm ghost" data-action="delete-order" data-id="' + safeActionId(o.id) + '">删</button></td>' +
         '</tr>';
     }).join('');
 
@@ -2678,7 +3002,7 @@
     var s = st();
     prefill = prefill || {};
     var opts = s.products.map(function (p) {
-      return '<option value="' + p.id + '"' + (prefill.productId === p.id ? ' selected' : '') + '>' +
+      return '<option value="' + safeActionId(p.id) + '"' + (prefill.productId === p.id ? ' selected' : '') + '>' +
         esc(p.title.slice(0, 46)) + ' · ' + esc(p.sku) + '</option>';
     }).join('');
 
@@ -2993,7 +3317,22 @@
     if (root && root.innerHTML) closeModal();
   });
 
+  /* P1-23-R7-R2-R2 修复 C（统一守卫）：任何一次用户操作期间只要发生落盘失败，
+     Core 已把内存回滚到上次落盘状态；这里统一给出失败提示并重渲染，
+     避免各业务路径自己的"已保存/已合并"提示与实际持久化结果不一致。 */
+  function watchPersistFailure() {
+    if (!C.persistFailureCount) return;
+    var before = C.persistFailureCount();
+    setTimeout(function () {
+      if (C.persistFailureCount() > before) {
+        toast('保存失败：本次修改未能写入，已自动回滚到上次保存的状态');
+        invalidate(); render();
+      }
+    }, 0);
+  }
+
   document.addEventListener('click', function (e) {
+    watchPersistFailure();
     if (e.target && e.target.classList && e.target.classList.contains('modal-mask')) {
       closeModal();
       return;
@@ -3003,6 +3342,35 @@
 
     var act = btn.getAttribute('data-action');
     var id = btn.getAttribute('data-id');
+    /* R4 第七项中央守卫：凡携带 data-id / data-rid 的动作入口，ID 必须通过
+       严格校验才允许分发。渲染层已用 safeActionId 收口属性拼接，此处再拦
+       一道，防止任何遗漏入口或 DOM 被外部篡改时把非法 ID 带入业务逻辑。
+       （save-product 的空 id 表示新建商品，是合法形态，单独放行。） */
+    var rid = btn.getAttribute('data-rid');
+    /* sales-edit 豁免：openSalesEdit 内部已有 safeActionId 分支，非法 ID 时
+       打开只读提示弹窗（R3-06 既定交互），不进入任何写操作。 */
+    if (id && !safeActionId(id) && act !== 'sales-edit' && !(act === 'save-product' && id === '')) { toast('ID 异常，操作已阻止'); return; }
+    if (rid && !safeActionId(rid)) { toast('ID 异常，操作已阻止'); return; }
+    /* R5 5.6：data-id 属性存在但为空串，只可能来自 safeActionId 对
+       不合规 ID 的收口（合法实体的按钮恒带真实 ID）。此类点击一律
+       拒绝分发：save-opp 空 id 会走「新建商机」分支生成重复商机、
+       edit-product 空 id 会误开新建表单、delete 类空 id 会弹无意义
+       确认框。getAttribute 对「属性缺失」返回 null、对「属性存在
+       但为空」返回空串，二者可区分：新建商机按钮没有 data-id
+       （null，放行走新建）；save-product 的空 id 是新建商品的合法
+       形态（单独放行）；sales-edit 沿用 R3-06 豁免（其内部对空 id
+       打开只读提示）。data-rid 同理：存在但为空即收口结果，拒绝。 */
+    if (id === '' && act !== 'save-product' && act !== 'sales-edit') { toast('ID 异常，操作已阻止'); return; }
+    if (rid === '') { toast('ID 异常，操作已阻止'); return; }
+    /* R6 第六项：data-opp / data-prod 纳入中央守卫。此前点击路径只有
+       select-product 等 case 内部靠 oppById 查无此人兜底，守卫层不
+       校验这两个属性。渲染层已全部经 safeActionId 收口（合法值恒
+       有效、非法值恒为空串），故属性存在但为空串或不合规即拦截，
+       与 data-id 同规则；属性缺失（null）不拦截。 */
+    var oidAttr = btn.getAttribute('data-opp');
+    if (oidAttr != null && !safeActionId(oidAttr)) { toast('ID 异常，操作已阻止'); return; }
+    var pidAttr = btn.getAttribute('data-prod');
+    if (pidAttr != null && !safeActionId(pidAttr)) { toast('ID 异常，操作已阻止'); return; }
 
     switch (act) {
       case 'close-modal': closeModal(); break;
@@ -3060,6 +3428,8 @@
       }
       case 'toggle-overdue': S.oppOverdueOnly = !S.oppOverdueOnly; render(); break;
       case 'save-parsed': saveParsed(id); break;
+      case 'sales-edit': openSalesEdit(id); break;
+      case 'sales-save': saveSalesEdit(id); break;
       case 'copy-questions': {
         var oq = oppById(id);
         if (oq) {
@@ -3104,8 +3474,22 @@
         if (quoteBlock(o3p)) { openQuoteBlock(o3p); return; }
         var ctx = ctxFor(o3p);
         o3.drafts = o3.drafts || {};
-        o3.drafts[lang] = lang === 'en' ? R.replyEn(ctx) : R.replyZh(ctx);
-        C.addLog(o3, '生成' + (lang === 'en' ? '英文' : '中文') + '回复草稿');
+        /* P1-FIX-02（批次二）：与全站统一护栏一致——不可报价（缺成本/
+           零价/低于保本/低于登记底价等）时禁止走 replyEn/replyZh 的
+           无条件价格行（曾生成 Unit price: USD 0.00），改用回复助手
+           的无价谈判草稿（强制 price=null，与详情助手卡同一引擎）。
+           草稿只写 o3.drafts，不触碰 o3.quote 正式报价字段。 */
+        var quotable = ctx.unity ? !!ctx.unity.quotable
+          : !!(ctx.pricing && ctx.pricing.flags && ctx.pricing.flags.canQuote);
+        if (!quotable) {
+          var genNp = replyGenFor(o3p, ctx, true);
+          if (!genNp) { toast('当前不可报价，且回复助手未加载，无法生成草稿'); return; }
+          o3.drafts[lang] = lang === 'en' ? genNp.en : genNp.zh;
+          C.addLog(o3, '生成' + (lang === 'en' ? '英文' : '中文') + '无价谈判草稿（未通过报价护栏）');
+        } else {
+          o3.drafts[lang] = lang === 'en' ? R.replyEn(ctx) : R.replyZh(ctx);
+          C.addLog(o3, '生成' + (lang === 'en' ? '英文' : '中文') + '回复草稿');
+        }
         S.tab = lang;
         invalidate(); C.persist(); render();
         toast('草稿已生成，可编辑后复制');
@@ -3395,10 +3779,54 @@
         break;
       }
 
-      case 'export-json': C.exportJson(); break;
+      case 'export-json': {
+        /* P1-23-R7-R2：正式备份改为 ic-backup v2 整包（业务状态 + 身份注册表 + 校验和）。
+           事务层不可用时回退旧导出并明示（旧导出不含注册表）。 */
+        if (window.IdentityTxn) {
+          /* R6 第七项：buildBackup 在注册表读取失败/损坏时抛错拒绝
+             生成备份，此处必须接住并明示，不得让异常冒泡打断页面、
+             更不得回退成一份看似完整的残缺备份。 */
+          var bundle;
+          try { bundle = window.IdentityTxn.buildBackup(C, window.localStorage); }
+          catch (e) { toast('备份失败：身份注册表读取异常（' + String(e && e.message || e) + '），未生成备份'); break; }
+          var blob = new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' });
+          var url = URL.createObjectURL(blob);
+          var a = document.createElement('a');
+          a.href = url; a.download = 'inquiry-copilot-backup-v2.json';
+          document.body.appendChild(a); a.click();
+          setTimeout(function () { URL.revokeObjectURL(url); a.remove(); }, 400);
+          C.audit('导出完整备份', 'ic-backup v2（含身份注册表）');
+        } else { C.exportJson(); }
+        break;
+      }
       case 'import-json': document.getElementById('file-input').click(); break;
+      case 'identity-recover': {
+        if (!window.IdentityTxn) break;
+        var rc = window.IdentityTxn.recover({ storage: window.localStorage, core: C, bizKey: C.STORE_KEY });
+        if (rc.recovered) { toast('恢复完成：未完成批次已回滚并通过校验，写入阻断解除'); invalidate(); render(); }
+        else toast('恢复未完成（' + rc.reason + '），写入继续保持阻断');
+        break;
+      }
       case 'import-merge': {
         if (!pendingImport) break;
+        if (pendingImport.identityBatch === true && window.IdentityMigration) {
+          /* P1-23-R7-R2：身份导入改走事务层（journal + 锁 + 读回校验）。
+             事务层不可用时拒绝执行，绝不回退到无事务的旧落盘方式。 */
+          if (!window.IdentityTxn) { toast('身份事务层未加载，已拒绝导入（不回退旧路径）'); break; }
+          var ib = window.IdentityTxn.commitImport({ storage: window.localStorage, core: C, batch: pendingImport, opts: {
+            buildEntity: function (type, content, internalId, rec) { return rec.entity || null; },
+            applyContent: function (ent, content) { if (content && typeof content === 'object') Object.keys(content).forEach(function (k) { ent[k] = content[k]; }); }
+          } });
+          if (!ib.applied) {
+            toast(ib.locked ? '存在未恢复的身份事务，已阻断导入，请先在同步与设置页处理恢复' : '身份层导入未完成' + (ib.stage ? '（阶段：' + ib.stage + '）' : '') + '，数据未标记为成功' + (ib.batchId ? '，批次 ' + ib.batchId : ''));
+            break;
+          }
+          C.audit('身份层合并导入', JSON.stringify(ib.counts));
+          pendingImport = null;
+          closeModal(); invalidate(); render();
+          toast('身份层导入完成：' + Object.keys(ib.counts).map(function (k) { return k + ' ' + ib.counts[k]; }).join(' · '));
+          break;
+        }
         var added = C.mergeAll(pendingImport);
         C.audit('合并导入', '商品 +' + added.products + ' / 商机 +' + added.opportunities + ' / 订单 +' + added.orders);
         pendingImport = null;
@@ -3406,11 +3834,23 @@
         toast('已合并：商品 +' + added.products + '，商机 +' + added.opportunities + '，订单 +' + added.orders);
         break;
       }
+      case 'import-restore-bundle': {
+        if (!pendingImport || !window.IdentityTxn) break;
+        var rb = window.IdentityTxn.restoreBundle({ storage: window.localStorage, core: C, bundle: pendingImport });
+        if (!rb.restored) { toast('完整备份恢复失败（' + rb.reason + '），写入保持阻断状态'); break; }
+        C.audit('完整备份恢复', rb.legacyPending ? 'ic-backup v2（无注册表，已标记旧格式待迁移）' : 'ic-backup v2');
+        pendingImport = null;
+        closeModal(); invalidate(); render();
+        toast(rb.legacyPending ? '已恢复业务数据；该备份不含身份注册表，已标记为旧格式待迁移' : '完整备份恢复完成');
+        break;
+      }
       case 'import-replace': {
         if (!pendingImport) break;
         if (!confirm('确定用这份备份覆盖现在的全部数据？覆盖后无法撤销。')) break;
         var snap = C.validateBackup(pendingImport);
         C.replaceAll(pendingImport);
+        /* R7-R2：旧格式备份不含身份注册表，覆盖后标记待迁移（不伪造新注册表） */
+        if (window.IdentityTxn) window.IdentityTxn.setLegacyPending(window.localStorage);
         C.audit('覆盖导入', '商品 ' + snap.counts.products + ' / 商机 ' + snap.counts.opportunities + ' / 订单 ' + snap.counts.orders);
         pendingImport = null;
         closeModal(); invalidate(); render();
@@ -3525,7 +3965,7 @@
           unitPriceUsd: null
         }).recommendUsd;
         opp.quote.unitPriceUsd = rec;
-        var priceInput = document.querySelector('[data-opp="' + oppId + '"][data-field="unitPriceUsd"]');
+        var priceInput = safeActionId(oppId) ? document.querySelector('[data-opp="' + oppId + '"][data-field="unitPriceUsd"]') : null;
         if (priceInput) priceInput.value = C.round(rec, 2);
       }
       refreshPricing(oppId);
@@ -3534,6 +3974,7 @@
   });
 
   document.addEventListener('change', function (e) {
+    watchPersistFailure();
     var el = e.target;
 
     /* 改完价或数量（失焦时）记一版，便于回看这一单改过几次价 */
@@ -3656,6 +4097,33 @@
         obj = JSON.parse(String(reader.result));
       } catch (e) {
         toast('不是有效的 JSON：' + String(e.message).slice(0, 60));
+        return;
+      }
+
+      /* P1-23-R7-R2：ic-backup v2 完整备份（含身份注册表）先验校验和，再走整包恢复。 */
+      if (obj && obj.format === 'ic-backup' && obj.version === 2 && window.IdentityTxn) {
+        var vb = window.IdentityTxn.validateBundle(obj);
+        if (!vb.ok) { toast('完整备份校验失败（' + vb.reason + '），未恢复任何数据'); return; }
+        pendingImport = obj;
+        openModal(modalHead('确认恢复完整备份') +
+          '<div class="modal-bd"><div class="alert warn"><span class="ic">!</span><div>这份备份包含<strong>业务数据与身份注册表</strong>，恢复将整包替换当前两类数据，恢复期间写入被阻断，失败不会标记为成功。</div></div>' +
+          '<div class="hint">导出于 ' + esc(String(obj.exportedAt || '')) + (obj.identityRegistry ? ' · 含身份注册表' : ' · 不含身份注册表（恢复后将标记为旧格式待迁移）') + '</div></div>' +
+          '<div class="modal-ft"><button class="btn ghost" data-action="close-modal">取消</button>' +
+          '<button class="btn danger" data-action="import-restore-bundle">整包恢复</button></div>', true);
+        return;
+      }
+
+      /* P1-23-R7：带 identityBatch 标记的文件走身份映射层（单入口接管）。
+         这类文件不是整表备份，不经 validateBackup；处理结果在预览弹窗明示，
+         失败时不落盘、也绝不自动改走旧合并路径。 */
+      if (obj && obj.identityBatch === true && Array.isArray(obj.records) && window.IdentityMigration) {
+        pendingImport = obj;
+        openModal(modalHead('确认导入（身份映射层）') +
+          '<div class="modal-bd">' +
+          '<div class="hint">来源系统：' + esc(String(obj.source_system || '')) + ' · 来源账号：' + esc(String(obj.source_account || '')) + ' · 记录 ' + obj.records.length + ' 条</div>' +
+          '<div class="alert warn" style="margin-top:10px"><span class="ic">!</span><div>本文件将通过<strong>身份映射层</strong>合并：重复身份命中原记录不重复建档；版本不明或内容冲突的记录进入冲突待处理，不会静默覆盖。处理失败时整批不落盘，也不会改走旧合并路径。</div></div>' +
+          '</div><div class="modal-ft"><button class="btn ghost" data-action="close-modal">取消</button>' +
+          '<button class="btn" data-action="import-merge">通过身份层合并导入</button></div>', true);
         return;
       }
 
@@ -3806,7 +4274,7 @@
     if (!opp) return;
     var html = modalHead('编辑商机') +
       '<div class="modal-bd">' +
-      '<input type="hidden" id="opp-id" value="' + opp.id + '">' +
+      '<input type="hidden" id="opp-id" value="' + safeActionId(opp.id) + '">' +
       '<div class="form-grid">' +
       '<div class="field"><label>买家称呼</label><input type="text" id="opp-name" value="' + esc(opp.buyer.name) + '"></div>' +
       '<div class="field"><label>公司</label><input type="text" id="opp-company" value="' + esc(opp.buyer.company) + '"></div>' +
@@ -3820,7 +4288,7 @@
       '</div></div>' +
       '<div class="modal-ft">' +
       '<button class="btn ghost" data-action="close-modal">取消</button>' +
-      '<button class="btn primary" data-action="save-opp" data-id="' + opp.id + '">保存并重新解析</button>' +
+      '<button class="btn primary" data-action="save-opp" data-id="' + safeActionId(opp.id) + '">保存并重新解析</button>' +
       '</div>';
     openModal(html, true);
   }
@@ -3900,7 +4368,7 @@
       '</div>' +
       '<div class="modal-ft">' +
       '<button class="btn ghost" data-action="close-modal">取消</button>' +
-      '<button class="btn primary" data-action="confirm-settle" data-id="' + id + '">确认成交</button>' +
+      '<button class="btn primary" data-action="confirm-settle" data-id="' + safeActionId(id) + '">确认成交</button>' +
       '</div>';
     openModal(html);
   }
@@ -3966,7 +4434,7 @@
       '</div>' +
       '<div class="modal-ft">' +
       '<button class="btn ghost" data-action="close-modal">取消</button>' +
-      '<button class="btn danger" data-action="confirm-lose" data-id="' + id + '">确认丢单</button>' +
+      '<button class="btn danger" data-action="confirm-lose" data-id="' + safeActionId(id) + '">确认丢单</button>' +
       '</div>';
     openModal(html);
   }
@@ -4016,7 +4484,7 @@
       '</div></div>' +
       '<div class="modal-ft">' +
       '<button class="btn ghost" data-action="close-modal">取消</button>' +
-      '<button class="btn primary" data-action="save-product" data-id="' + (id || '') + '">保存</button>' +
+      '<button class="btn primary" data-action="save-product" data-id="' + safeActionId(id || '') + '">保存</button>' +
       '</div>';
     openModal(html, true);
   }
@@ -4367,6 +4835,19 @@
 
   function boot() {
     window.addEventListener('hashchange', render);
+    /* P1-23-R7-R2：启动时先检查身份事务状态，未完成批次立即进入恢复阻断并明示 */
+    if (window.IdentityTxn) {
+      window.IdentityTxn.init(window.localStorage);
+      var txnChk = window.IdentityTxn.checkOnLoad(window.localStorage, C);
+      if (txnChk.locked) setTimeout(function () { toast('检测到未完成的身份导入事务，写入已阻断。请到「同步与设置」执行恢复后再继续使用。'); }, 600);
+      /* 多标签页仅做检测（不支持协调）：其他标签页改动事务键时立即内存阻断本页写入 */
+      window.addEventListener('storage', function (ev) {
+        if (ev.key === window.IdentityTxn.JOURNAL_KEY || ev.key === window.IdentityTxn.LOCK_KEY || ev.key === 'ic_identity_registry_v1') {
+          window.IdentityTxn.noteExternalChange();
+          toast('检测到其他标签页修改了身份数据，本页写入已阻断。请只保留一个标签页并刷新。');
+        }
+      });
+    }
     if (!location.hash) location.hash = '#/dashboard';
     render();
 
@@ -4420,8 +4901,8 @@
           (x.feedback ? '<div style="margin-top:2px">客户反馈：' + esc(x.feedback) + '</div>' : '') +
           (x.nextAction ? '<div style="margin-top:2px">下一步：' + esc(x.nextAction) + '</div>' : '') +
           (x.plannedAt ? '<div style="margin-top:2px;color:#8a919e">计划跟进：' + esc(C.fmtDate(x.plannedAt)) + '</div>' : '') +
-          (editable ? '<div style="margin-top:3px"><button class="btn sm ghost" data-action="follow-edit" data-id="' + opp.id + '" data-rid="' + x.id + '">编辑</button> ' +
-            '<button class="btn sm ghost" data-action="follow-del" data-id="' + opp.id + '" data-rid="' + x.id + '">删除</button></div>' : '') +
+          (editable ? '<div style="margin-top:3px"><button class="btn sm ghost" data-action="follow-edit" data-id="' + safeActionId(opp.id) + '" data-rid="' + safeActionId(x.id) + '">编辑</button> ' +
+            '<button class="btn sm ghost" data-action="follow-del" data-id="' + safeActionId(opp.id) + '" data-rid="' + safeActionId(x.id) + '">删除</button></div>' : '') +
           '</div>';
       }
       return '<div style="font-size:11.5px;color:#6b7280;padding:4px 0;border-bottom:1px dashed #f0f1f4">' + head +
@@ -4461,12 +4942,12 @@
       '<span>上次联系 ' + esc(last) + '</span>' +
       (f.at ? '<span>下次跟进 ' + C.fmtDate(f.at) + '</span>' : '') + statusSel + '</div>' +
       '<div class="row" style="gap:6px;flex-wrap:wrap">' +
-      '<button class="btn sm primary" data-action="open-follow" data-id="' + opp.id + '">记录这次跟进</button>' +
-      '<button class="btn sm ghost" data-action="copy-follow" data-kind="nudge" data-lang="zh" data-id="' + opp.id + '">催单（中）</button>' +
-      '<button class="btn sm ghost" data-action="copy-follow" data-kind="nudge" data-lang="en" data-id="' + opp.id + '">催单（EN）</button>' +
-      '<button class="btn sm ghost" data-action="copy-follow" data-kind="counter" data-lang="zh" data-id="' + opp.id + '">还价（中）</button>' +
-      '<button class="btn sm ghost" data-action="copy-follow" data-kind="sample" data-lang="zh" data-id="' + opp.id + '">要样品（中）</button>' +
-      '<button class="btn sm ghost" data-action="copy-follow" data-kind="close" data-lang="zh" data-id="' + opp.id + '">逼成交（中）</button>' +
+      '<button class="btn sm primary" data-action="open-follow" data-id="' + safeActionId(opp.id) + '">记录这次跟进</button>' +
+      '<button class="btn sm ghost" data-action="copy-follow" data-kind="nudge" data-lang="zh" data-id="' + safeActionId(opp.id) + '">催单（中）</button>' +
+      '<button class="btn sm ghost" data-action="copy-follow" data-kind="nudge" data-lang="en" data-id="' + safeActionId(opp.id) + '">催单（EN）</button>' +
+      '<button class="btn sm ghost" data-action="copy-follow" data-kind="counter" data-lang="zh" data-id="' + safeActionId(opp.id) + '">还价（中）</button>' +
+      '<button class="btn sm ghost" data-action="copy-follow" data-kind="sample" data-lang="zh" data-id="' + safeActionId(opp.id) + '">要样品（中）</button>' +
+      '<button class="btn sm ghost" data-action="copy-follow" data-kind="close" data-lang="zh" data-id="' + safeActionId(opp.id) + '">逼成交（中）</button>' +
       '</div>' + followTimelineHtml(opp, true) + '</div></section>';
   }
 
@@ -4578,7 +5059,7 @@
         '<td class="num" style="color:' + (neg ? '#d92d20' : '#0f9d58') + '">' +
         (z.netRmb ? C.money(z.netRmb) : '—') + '<br>' +
         '<span style="font-size:10.5px;color:#8a919e">毛利 ' + C.pct(z.marginOnCost) + '</span></td>' +
-        '<td class="actions"><button class="btn sm ghost" data-action="copy-nego" data-id="' + opp.id +
+        '<td class="actions"><button class="btn sm ghost" data-action="copy-nego" data-id="' + safeActionId(opp.id) +
         '" data-zone="' + i + '">复制话术</button></td></tr>';
     }).join('');
 
@@ -4649,7 +5130,7 @@
       '<input type="date" id="fu-date"></div>' +
       '</div>' +
       '<div class="modal-ft"><button class="btn ghost" data-action="close-modal">取消</button>' +
-      '<button class="btn primary" data-action="save-follow" data-id="' + o.id + '">保存</button></div>';
+      '<button class="btn primary" data-action="save-follow" data-id="' + safeActionId(o.id) + '">保存</button></div>';
     openModal(html);
   }
 
@@ -4722,8 +5203,8 @@
       '<input type="date" id="fe-date" value="' + dateVal + '"></div>' +
       '</div>' +
       '<div class="modal-ft"><button class="btn ghost" data-action="close-modal">取消</button>' +
-      '<button class="btn" data-action="follow-del" data-id="' + o.id + '" data-rid="' + rid + '">删除此记录</button>' +
-      '<button class="btn primary" data-action="follow-edit-save" data-id="' + o.id + '" data-rid="' + rid + '">保存</button></div>';
+      '<button class="btn" data-action="follow-del" data-id="' + safeActionId(o.id) + '" data-rid="' + safeActionId(rid) + '">删除此记录</button>' +
+      '<button class="btn primary" data-action="follow-edit-save" data-id="' + safeActionId(o.id) + '" data-rid="' + safeActionId(rid) + '">保存</button></div>';
     openModal(html);
   }
 
@@ -4750,7 +5231,7 @@
     var html = modalHead('删除跟进记录') +
       '<div class="card-bd"><p style="font-size:13px;line-height:1.7">确定要删除这条跟进记录吗？删除后无法恢复（商机本身和其它记录不受影响）。</p></div>' +
       '<div class="modal-ft"><button class="btn ghost" data-action="close-modal">取消</button>' +
-      '<button class="btn danger" data-action="follow-del-confirm" data-id="' + oppId + '" data-rid="' + rid + '">确认删除</button></div>';
+      '<button class="btn danger" data-action="follow-del-confirm" data-id="' + safeActionId(oppId) + '" data-rid="' + safeActionId(rid) + '">确认删除</button></div>';
     openModal(html);
   }
 
@@ -4783,7 +5264,7 @@
       '<div class="field"><label>下次跟进日期（留空按设置自动算）</label><input type="date" id="ms-date"></div>' +
       '</div>' +
       '<div class="modal-ft"><button class="btn ghost" data-action="close-modal">取消</button>' +
-      '<button class="btn primary" data-action="ra-sent-confirm" data-id="' + o.id + '">确认并记录</button></div>';
+      '<button class="btn primary" data-action="ra-sent-confirm" data-id="' + safeActionId(o.id) + '">确认并记录</button></div>';
     openModal(html);
   }
 

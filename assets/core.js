@@ -678,6 +678,47 @@
     return out;
   }
 
+  /* P1-22 员工销售判断修正层：只保留白名单结构，脏数据整层丢弃返回 null，
+     保证人工修正能过 normalizeOpp/migrate/mergeAll 而不丢失、也不带毒 */
+  function sanitizeSalesReview(r) {
+    if (!r || typeof r !== 'object' || Array.isArray(r)) return null;
+    var NEED_KEYS = ['product', 'specs', 'qty', 'purpose', 'certs', 'delivery', 'destination', 'targetPrice'];
+    var STAGES = ['初步了解', '明确需求', '商品比较', '供应商筛选', '价格谈判', '样品或订单推进', '暂时无法判断'];
+    var TOPICS = ['价格', '认证', '交货时间', '产品质量', 'MOQ', '售后', '供应商可靠性', '定制能力'];
+    var out = {};
+    if (r.needFix && typeof r.needFix === 'object' && !Array.isArray(r.needFix)) {
+      var nf = {};
+      NEED_KEYS.forEach(function (k) {
+        var v = r.needFix[k];
+        if (v && typeof v === 'object' && !Array.isArray(v) && typeof v.value === 'string' && v.value.trim()) {
+          nf[k] = { value: v.value.trim().slice(0, 200), at: typeof v.at === 'string' ? v.at.slice(0, 20) : null };
+        }
+      });
+      if (Object.keys(nf).length) out.needFix = nf;
+    }
+    if (typeof r.stageFix === 'string' && STAGES.indexOf(r.stageFix) >= 0) out.stageFix = r.stageFix;
+    if (r.concernFix && typeof r.concernFix === 'object' && !Array.isArray(r.concernFix)) {
+      var cf = {};
+      TOPICS.forEach(function (t) {
+        if (r.concernFix[t] === 'confirmed' || r.concernFix[t] === 'dismissed') cf[t] = r.concernFix[t];
+      });
+      if (Object.keys(cf).length) out.concernFix = cf;
+    }
+    if (Array.isArray(r.flagged)) {
+      var fl = [];
+      r.flagged.forEach(function (f) {
+        if (typeof f !== 'string') return;
+        if (f === 'stage' || (f.indexOf('need:') === 0 && NEED_KEYS.indexOf(f.slice(5)) >= 0)) {
+          if (fl.indexOf(f) < 0 && fl.length < 16) fl.push(f);
+        }
+      });
+      if (fl.length) out.flagged = fl;
+    }
+    if (!Object.keys(out).length) return null;
+    out.at = typeof r.at === 'string' ? r.at.slice(0, 20) : null;
+    return out;
+  }
+
   function normalizeOpp(o) {
     o = o || {};
     var buyer = o.buyer || {};
@@ -709,6 +750,8 @@
       /* 型号不符拦截的人工放行标记：销售核对后显式放行才为 true，换商品时重置 */
       matchOverride: !!o.matchOverride,
       parseEdits: sanitizeParseEdits(o.parseEdits),
+      /* P1-22 员工销售判断修正：与 AI 分析分开保存，白名单清洗后保留 */
+      salesReview: sanitizeSalesReview(o.salesReview),
       /* 阶段四回复草稿：按场景存中英正文，只认白名单场景键，防脏数据膨胀 */
       replyDrafts: sanitizeReplyDrafts(o.replyDrafts),
       /* 人工价值判断记录：卖家自己的结论（重点/正常/搁置）+ 备注，只认白名单值 */
@@ -797,10 +840,14 @@
     }
     if (!raw) {
       state = freshState();
+      /* R3-02：首次空存储也要建立内存回滚基准（只在内存中序列化，
+         不为建基准而写磁盘）；否则第一次落盘失败时无处可回滚。 */
+      establishBaseline();
       return state;
     }
     try {
       state = migrate(JSON.parse(raw));
+      lastGoodRaw = raw;
     } catch (e) {
       /* 以前这里直接换演示数据，下一次 persist 就把用户几个月的商品和商机全覆盖了。
          先试图从自动备份恢复；恢复不了，也把坏数据原样留一份在 _broken 里。 */
@@ -826,6 +873,9 @@
         loadIssue = '原数据损坏、无法读取，已换成演示数据' +
           (kept ? '。坏数据存在浏览器里（键名 ' + BROKEN_KEY + '），别再导入新数据覆盖之前先找我们' : '');
       }
+      /* R3-02：损坏 fallback 的回滚基准是"经 migrate 验证后的恢复/初始状态"
+         本身，绝不使用未经验证的损坏原文（上方 lastGoodRaw=raw 只适用于解析成功路径）。 */
+      establishBaseline();
     }
     return state;
   }
@@ -834,15 +884,49 @@
   var lastSnapAt = 0;
   var storageError = '';
 
+  var lastPersistOk = true;
+  var lastGoodRaw = null;      /* 最近一次确认落盘成功（或加载时）的状态原文 */
+  var persistFailureCount = 0; /* 累计落盘失败次数，供上层统一守卫判断本次操作是否失败 */
+  /* P1-23-R7-R2-R2：落盘失败时把内存状态回滚到最近一次已落盘状态，
+     避免界面继续显示未保存的修改（等价于一次重新加载的语义）。 */
+  function rollbackMemoryToLastGood() {
+    if (!lastGoodRaw) return false;
+    try { state = migrate(JSON.parse(lastGoodRaw)); return true; } catch (e) { return false; }
+  }
+  /* R3-02：把当前内存状态序列化为回滚基准（不写磁盘）。
+     用于 load 的空存储/损坏 fallback 路径——这些路径没有"上次落盘原文"，
+     但状态本身已经过 freshState/migrate 验证，可以作为失败回滚目标。 */
+  function establishBaseline() {
+    try { lastGoodRaw = JSON.stringify(state); } catch (e) { lastGoodRaw = null; }
+  }
+  /* 落盘失败的统一收尾：回滚内存；回滚本身失败必须显式体现在 storageError 中
+     （fail-closed：不假装已回滚），上层据 persistOk()=false 与失败计数感知。 */
+  function rollbackOrNote() {
+    if (!rollbackMemoryToLastGood()) storageError = (storageError || '保存失败') + '；内存回滚失败，请刷新页面';
+  }
   function persist() {
-    if (!state) return;
+    if (!state) { lastPersistOk = false; return false; }
+    /* P1-23-R7-R2 写入屏障：身份事务处于待恢复锁定状态时，拒绝一切业务落盘。
+       persist 是业务状态的唯一落盘漏斗，故在此一处设防即覆盖全部写入入口；
+       恢复通道由 IdentityTxn 置内部旁路标记后放行。返回值 true/false 为附加语义，
+       旧调用者忽略返回值、行为不变；新调用者必须检查返回值或 persistOk()。 */
+    if (typeof window !== 'undefined' && window.IdentityTxn && window.IdentityTxn.isLocked && window.IdentityTxn.isLocked() && !window.IdentityTxn._bypass) {
+      storageError = '身份数据待恢复，写入已阻断';
+      lastPersistOk = false;
+      persistFailureCount++;
+      rollbackOrNote();
+      return false;
+    }
     var raw;
     try {
       raw = JSON.stringify(state);
     } catch (e) {
+      lastPersistOk = false;
+      persistFailureCount++;
       storageError = '数据序列化失败';
       console.warn('保存失败', e);
-      return;
+      rollbackOrNote();
+      return false;
     }
     try {
       var prev = null;
@@ -854,12 +938,42 @@
         } catch (e3) { /* 快照写不进就算了，不能拖累主保存 */ }
       }
       localStorage.setItem(STORE_KEY, raw);
+      /* 写后读回校验：setItem 不抛错不等于写成功（R7-R2 成功判定标准） */
+      var readBack = null;
+      try { readBack = localStorage.getItem(STORE_KEY); } catch (e4) { readBack = null; }
+      if (readBack !== raw) { lastPersistOk = false; persistFailureCount++; storageError = '保存后校验失败'; rollbackOrNote(); return false; }
       storageError = '';
+      lastPersistOk = true;
+      lastGoodRaw = raw;
+      return true;
     } catch (e) {
       var full = e && (e.name === 'QuotaExceededError' || e.code === 22 || e.code === 1014);
       storageError = full ? '浏览器存储满了' : '浏览器拒绝了本地保存';
       console.warn('保存失败', e);
+      lastPersistOk = false;
+      persistFailureCount++;
+      rollbackOrNote();
+      return false;
     }
+  }
+
+  function persistOk() { return lastPersistOk; }
+  function getPersistFailureCount() { return persistFailureCount; }
+  /* 与 replaceAll 相同，但向调用者报告落盘是否成功（供事务通道使用） */
+  function replaceAllChecked(obj) { replaceAll(obj); return lastPersistOk; }
+
+  /* 事务回滚专用：把恢复前快照原样写回（不经 migrate/规范化）。
+     与 replaceAll 的区别：replaceAll 面向外部备份导入，必须规范化并
+     处理本机设置；本入口只供身份事务回滚写回本机自己的恢复前快照
+     （快照来自事务日志保存的磁盘原文解析对象）。任何规范化改写都会
+     让回滚后的整包哈希与恢复前不一致、令 abortRestore 的核验永远
+     失败（C9 缺陷），故此处只做深拷贝置换后走 persist()——persist
+     本身不做规范化，锁屏障、写后读回校验与 _bak 轮换语义与其它
+     写入口完全一致。禁止把未经验证的外部备份直接传入本入口。 */
+  function replaceAllRaw(obj) {
+    state = clone(obj);
+    persist();
+    return lastPersistOk;
   }
 
   /* 设置页用：存储健康 + 能不能回滚 */
@@ -1103,7 +1217,7 @@
     TYPE_KEYS: TYPE_KEYS,
     fmtDate: fmtDate, relTime: relTime, roundUpTo: roundUpTo, splitList: splitList,
     // 状态
-    get: get, persist: persist, reset: reset, replaceAll: replaceAll,
+    get: get, persist: persist, persistOk: persistOk, persistFailureCount: getPersistFailureCount, reset: reset, replaceAll: replaceAll, replaceAllChecked: replaceAllChecked, replaceAllRaw: replaceAllRaw, STORE_KEY: STORE_KEY,
     storageHealth: storageHealth, restoreBackup: restoreBackup,
     validateBackup: validateBackup, mergeAll: mergeAll, BACKUP_VERSION: BACKUP_VERSION,
     addLog: addLog, stats: stats,

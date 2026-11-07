@@ -165,7 +165,12 @@ select:focus-visible, textarea:focus-visible, .tab:focus-visible,
   border-bottom: 1px solid var(--line);
   position: sticky;
   top: 0;
-  z-index: 20;
+  /* P1-FIX-03：顶栏是应用外壳，必须压过随时翻译悬浮球/面板（900/901）。
+     悬浮球可自由拖动并持久化位置，停在顶栏区域时会遮挡「数据与安全」
+     等顶栏入口且无任何提示；顶栏提到 950 后悬浮球从顶栏下方滑过，
+     入口恒可达。弹窗遮罩（100）仍只盖内容区，顶栏入口点击时由
+     goto-settings 动作先关弹窗再跳转，不会把遮罩留在新页面上。 */
+  z-index: 950;
 }
 
 .crumb { font-weight: 650; font-size: 14.5px; }
@@ -309,6 +314,28 @@ select:focus-visible, textarea:focus-visible, .tab:focus-visible,
 .table tbody tr:hover { background: #fbfbfc; }
 .table .num { text-align: right; font-family: var(--mono); white-space: nowrap; }
 .table .actions { text-align: right; white-space: nowrap; }
+
+/* P1-FIX-04：.tbl（同步与设置/客户中心/销售分析/跟进管理用）此前没有任何
+   样式规则，窄屏下被浏览器压成逐字竖排。与 .table 同一视觉口径补齐。 */
+.tbl { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.tbl th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--ink-3);
+  font-size: 11px;
+  letter-spacing: .3px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-2);
+  white-space: nowrap;
+}
+.tbl td {
+  padding: 10px 12px;
+  border-bottom: 1px solid #f0f1f4;
+  vertical-align: middle;
+}
+.tbl tr:last-child td { border-bottom: none; }
+.tbl tbody tr:hover { background: #fbfbfc; }
 
 .table-wrap { overflow-x: auto; }
 
@@ -609,7 +636,10 @@ input[type="number"] { font-family: var(--mono); }
   display: grid;
   place-items: center;
   padding: 24px;
-  z-index: 100;
+  /* P1-FIX-02：模态层级必须高于顶栏（950）与悬浮球/面板（900/901），
+     弹窗打开时恢复标准模态隔离；toast（1010）与 boot-error（1020）
+     仍在其上，保证提示与错误横幅在弹窗之上可见。 */
+  z-index: 1000;
 }
 
 .modal {
@@ -670,7 +700,7 @@ input[type="number"] { font-family: var(--mono); }
   font-size: 12.5px;
   font-weight: 550;
   box-shadow: var(--shadow-lg);
-  z-index: 200;
+  z-index: 1010; /* P1-FIX-02：保持在模态遮罩（1000）之上 */
   max-width: 80vw;
 }
 
@@ -687,7 +717,7 @@ input[type="number"] { font-family: var(--mono); }
   border-radius: 8px;
   font-size: 12px;
   font-family: var(--mono);
-  z-index: 999;
+  z-index: 1020; /* P1-FIX-02：保持全站最高层级 */
   max-width: 70vw;
 }
 
@@ -814,6 +844,8 @@ tr.clickable { cursor: pointer; }
      详情页里直接放的窄表（阶梯/敏感度/记录）不再被撑出卡片外 */
   .table-wrap .table { min-width: 620px; }
   .table-wrap .table.wide { min-width: 920px; }
+  /* P1-FIX-04：.tbl 同享最小宽度，靠 .table-wrap 横向滚动而不是压窄列 */
+  .table-wrap .tbl { min-width: 560px; }
   .btn.sm { min-height: 32px; }
   .tab { min-height: 40px; }
   .modal-mask { padding: 10px; }
@@ -830,7 +862,8 @@ tr.clickable { cursor: pointer; }
 /* ---------- 随时翻译悬浮面板 ---------- */
 #tr-fab{position:fixed;right:22px;bottom:86px;width:52px;height:52px;border-radius:50%;
   background:#ff6a00;color:#fff;font-size:20px;font-weight:700;border:none;cursor:pointer;
-  box-shadow:0 8px 24px rgba(255,106,0,.35);z-index:900;transition:transform .15s}
+  box-shadow:0 8px 24px rgba(255,106,0,.35);z-index:900;transition:transform .15s;touch-action:none}
+#tr-fab.dragging{cursor:grabbing;transition:none;opacity:.92}
 #tr-fab:hover{transform:scale(1.05)}
 #tr-fab.active{background:#111;box-shadow:0 8px 24px rgba(0,0,0,.3)}
 #tr-panel{position:fixed;right:22px;bottom:150px;width:370px;max-height:72vh;background:#fff;
@@ -958,3 +991,12 @@ tr.clickable { cursor: pointer; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; }
 }
+
+/* 决策台（P1-1） */
+.dd-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}
+.dd-field{display:flex;flex-direction:column;gap:4px;font-size:13px}
+.dd-field input{height:34px}
+.dd-unknown{color:#b45309;font-style:normal;font-weight:600}
+.dd-cand{border:1px solid #e5e7eb;border-radius:10px;padding:10px 12px;margin-bottom:8px}
+.dd-top{border-color:#2563eb;background:#eff6ff}
+.dd-steps{margin:0;padding-left:20px;line-height:1.9}

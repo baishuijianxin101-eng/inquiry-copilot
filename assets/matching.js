@@ -112,7 +112,8 @@
     for: 1, the: 1, in: 1, of: 1, and: 1, with: 1, per: 1, set: 1, pack: 1,
     box: 1, size: 1, color: 1, model: 1, need: 1, want: 1, about: 1, from: 1,
     our: 1, you: 1, are: 1, can: 1, will: 1, we: 1, is: 1, to: 1, at: 1,
-    on: 1, by: 1, us: 1, it: 1, as: 1, or: 1, if: 1, each: 1, only: 1
+    on: 1, by: 1, us: 1, it: 1, as: 1, or: 1, if: 1, each: 1, only: 1,
+    within: 1, usd: 1, eur: 1, gbp: 1, cny: 1, rmb: 1, days: 1, day: 1, total: 1
   };
 
   function modelsOf(text) {
@@ -137,6 +138,8 @@
       if (!/\d/.test(t)) return;
       if (UNIT_RE.test(t)) return;
       if (/^\d+x\d+/.test(t)) return;
+      var alpha = t.match(/^[a-z]+/);
+      if (alpha && MODEL_STOP[alpha[0]]) return;
       var norm = t.replace(/[.\-]/g, '');
       if (norm.length < 3) return;
       if (out.indexOf(norm) < 0) out.push(norm);

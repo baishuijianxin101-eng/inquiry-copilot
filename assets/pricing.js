@@ -160,6 +160,7 @@
 
       flags: {
         noCost: !hasCost,
+        noPrice: !(unit > 0),
         belowCost: belowCost,
         listTooLow: listTooLow,
         aboveMarket: aboveMarket,

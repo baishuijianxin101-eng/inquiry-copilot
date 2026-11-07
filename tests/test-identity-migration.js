@@ -128,7 +128,7 @@ ok(r30.applied && r30.results.every(function (x) { return x.status === 'CREATED'
   var fs = require('fs'), vm = require('vm'), path = require('path');
   var ROOT = path.join(__dirname, '..');
   var html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
-  var srcs = [...html.matchAll(/<script src="([^"]+)"/g)].map(function (m) { return m[1].split('?')[0]; });
+  var srcs = [...html.matchAll(/<script[^>]* src="([^"]+)"/g)].map(function (m) { return m[1].split('?')[0]; });
   function El() { this.children = []; this.style = {}; this.dataset = {}; this.value = ''; this._html = ''; this.files = []; this.textContent = ''; this.parentNode = { removeChild: function () {}, appendChild: function (c) { return c; }, insertBefore: function (c) { return c; } }; this.classList = { add: function () {}, remove: function () {}, toggle: function () {}, contains: function () { return false; } }; }
   El.prototype = { set innerHTML(v) { this._html = v; }, get innerHTML() { return this._html; }, appendChild: function (c) { this.children.push(c); return c; }, insertBefore: function (c) { this.children.push(c); return c; }, get firstChild() { return this.children[0] || null; }, remove: function () {}, addEventListener: function () {}, removeEventListener: function () {}, querySelector: function () { return new El(); }, querySelectorAll: function () { return []; }, setAttribute: function () {}, getAttribute: function () { return null; }, focus: function () {}, click: function () {} };
   var els = new Map(), store = new Map();

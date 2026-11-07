@@ -85,12 +85,24 @@
   var drag = null;          /* {sx, sy, ox, oy, moved} */
   var suppressNextClick = false;
 
+  /* 顶栏在视口顶部实际占用的高度：顶栏 z-index（950）高于球（900），
+     球拖进顶栏区域就会被遮住。按实测高度算上界，不写死数值，
+     适配不同屏幕、缩放与顶栏内容变化；找不到顶栏时退回 EDGE。 */
+  function topReserve() {
+    if (typeof document.querySelector !== 'function') return EDGE;
+    var tb = document.querySelector('.topbar');
+    if (!tb) return EDGE;
+    var b = tb.getBoundingClientRect().bottom;
+    return (isFinite(b) && b > EDGE) ? Math.ceil(b) : EDGE;
+  }
+
   function clampPos(x, y) {
     var r = fab.getBoundingClientRect();
     var w = r.width || 52, h = r.height || 52;
     var maxX = Math.max(EDGE, window.innerWidth - w - EDGE);
     var maxY = Math.max(EDGE, window.innerHeight - h - EDGE);
-    return { x: Math.min(Math.max(x, EDGE), maxX), y: Math.min(Math.max(y, EDGE), maxY) };
+    var minY = Math.min(topReserve(), maxY);
+    return { x: Math.min(Math.max(x, EDGE), maxX), y: Math.min(Math.max(y, minY), maxY) };
   }
   function applyPos(x, y) {
     var p = clampPos(x, y);

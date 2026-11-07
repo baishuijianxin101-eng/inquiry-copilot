@@ -138,7 +138,7 @@ sb2.history = { pushState: function () {}, replaceState: function () {} };
 sb2.scrollTo = function () {}; sb2.requestAnimationFrame = function () { return 0; };
 sb2.alert = function () {}; sb2.confirm = function () { return true; };
 vm.createContext(sb2);
-['seed-state.js', 'core.js', 'pricing.js', 'pricing-unity.js', 'workflow.js', 'tr-endpoint.js', 'translate.js', 'judge.js', 'matching.js', 'smart-match.js', 'opp-score.js', 'reply-assistant.js', 'followup.js', 'reply.js', 'importer.js', 'market-ref.js', 'price-candidates.js', 'p0-parse.js', 'p0-match.js', 'p0-quote.js', 'p0-cost.js', 'p0-cockpit.js', 'p0-api.js', 'app.js', 'p0-ui.js', 'tr-panel.js'].forEach(function (f) {
+['seed-state.js', 'core.js', 'pricing.js', 'pricing-unity.js', 'workflow.js', 'tr-endpoint.js', 'translate.js', 'judge.js', 'matching.js', 'smart-match.js', 'opp-score.js', 'reply-assistant.js', 'followup.js', 'reply.js', 'importer.js', 'market-ref.js', 'price-candidates.js', 'p0-parse.js', 'p0-match.js', 'p0-quote.js', 'p0-cost.js', 'p0-cockpit.js', 'p0-api.js', 'identity.js', 'identity-migration.js', 'identity-txn.js', 'app.js', 'p0-ui.js', 'tr-panel.js'].forEach(function (f) {
   /* R3-09：核心脚本加载异常不得吞掉。只有 p0-ui.js 的已知非致命异常
      （fetch 兜底）允许单独忽略；其余任何脚本加载失败都使本测试失败。 */
   try { vm.runInContext(read(f), sb2, { filename: f }); }

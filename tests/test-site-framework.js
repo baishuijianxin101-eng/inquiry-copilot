@@ -4,7 +4,7 @@
 var fs = require('fs'), vm = require('vm'), path = require('path');
 var ROOT = path.join(__dirname, '..');
 var html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
-var srcs = [...html.matchAll(/<script src="([^"]+)"/g)].map(function (m) { return m[1].split('?')[0]; });
+var srcs = [...html.matchAll(/<script[^>]* src="([^"]+)"/g)].map(function (m) { return m[1].split('?')[0]; });
 var pass = 0, fail = 0;
 function ok(cond, name) { if (cond) { pass++; console.log('PASS ' + name); } else { fail++; console.log('FAIL ' + name); } }
 function El() { this.children = []; this.style = {}; this.dataset = {}; this.value = ''; this._html = ''; this.files = [];

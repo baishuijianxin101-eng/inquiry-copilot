@@ -231,6 +231,12 @@
     var qty = r.qty;
     var unit = r.unitPriceUsd;
     var total = unit * qty;
+    /* 无有效报价时报价单不得出现任何金额（线上冒烟发现无价时印出
+       USD 0.00）：判定与全站统一护栏一致——优先 ctx.unity.quotable，
+       回退 pricing.flags.canQuote；不通过时单价、金额、总额全部
+       改为待定文案，本函数只渲染、不写任何状态。 */
+    var priceOk = (unit > 0) && (ctx.unity ? !!ctx.unity.quotable : !!(r.flags && r.flags.canQuote));
+    var TBD = 'To be confirmed';
     var no = 'Q' + String(o.id).replace(/[^a-zA-Z0-9]/g, '').slice(-6).toUpperCase();
     var date = C.fmtDate(C.nowIso());
     /* validDays 来自本地数据，导入的备份里可能是任意字符串，直接拼进报价单就等于开了注入口 */
@@ -245,8 +251,8 @@
       '<th style="width:90px;text-align:right">Unit Price</th><th style="width:100px;text-align:right">Amount</th></tr>' +
       '<tr><td>1</td><td>' + desc + '</td>' +
       '<td style="text-align:right">' + fmtQty(qty) + '</td>' +
-      '<td style="text-align:right">' + um(unit) + '</td>' +
-      '<td style="text-align:right">' + um(total) + '</td></tr>';
+      '<td style="text-align:right">' + (priceOk ? um(unit) : TBD) + '</td>' +
+      '<td style="text-align:right">' + (priceOk ? um(total) : TBD) + '</td></tr>';
 
     var terms = [
       ['Trade Term', incoterm],
@@ -296,11 +302,15 @@
       '  <div><div class="lbl">From</div><strong>' + C.esc(s.sellerName) + '</strong><br>Sales Department<br>' + C.esc(incoterm) + '</div>',
       '</div>',
       '<table class="items">' + body + '</table>',
-      '<div class="total">TOTAL: <span>' + um(total) + '</span> ' + C.esc(incoterm) + '</div>',
+      priceOk
+        ? '<div class="total">TOTAL: <span>' + um(total) + '</span> ' + C.esc(incoterm) + '</div>'
+        : '<div class="total">TOTAL: <span>价格待定 (Price to be confirmed)</span></div>',
       '<table class="terms">' + terms + '</table>',
       '<div class="note">',
       '  <strong>Remarks</strong><br>',
-      '  1. Prices are quoted in USD and valid for ' + valid + ' days from the date above.<br>',
+      priceOk
+        ? '  1. Prices are quoted in USD and valid for ' + valid + ' days from the date above.<br>'
+        : '  1. Prices are to be confirmed; the validity period applies from the date a formal quotation is issued.<br>',
       '  2. Lead time starts from the date the deposit is received and the artwork is confirmed.<br>',
       '  3. Any customization (logo, color, packaging) may affect the price and the lead time.<br>',
       '  4. Bank charges outside the seller\'s bank are for the buyer\'s account.',

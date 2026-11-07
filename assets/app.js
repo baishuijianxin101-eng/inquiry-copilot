@@ -4834,6 +4834,16 @@
      ========================================================= */
 
   function boot() {
+    /* P1-PERF-FIX-01 附带修正（fail-closed，与 defer 性能变更无关）：
+       身份事务模块缺失（脚本加载失败）时绝不静默跳过恢复门禁——
+       抛出启动错误由 boot-error 横幅明示，并中止 boot（不 render、
+       不启动任何后台流程）。此前是可选守卫，缺失即无门禁启动。
+       守卫必须位于 hashchange 监听注册之前：否则 boot 中止后监听
+       仍存活，后续 hash 变化会绕过未完成的 boot 直接触发 render
+       （第二阶段独立审查已复现该绕过，见 REVIEW-phase2b）。 */
+    if (!window.IdentityTxn) {
+      throw new Error('启动失败：身份事务模块（identity-txn.js）未能加载，恢复门禁无法执行，已中止启动。请检查网络后刷新页面。');
+    }
     window.addEventListener('hashchange', render);
     /* P1-23-R7-R2：启动时先检查身份事务状态，未完成批次立即进入恢复阻断并明示 */
     if (window.IdentityTxn) {
@@ -5339,7 +5349,14 @@
       getDraft: function () { return importDraft; }
     };
   }
-  if (document.readyState === 'loading') {
+  /* P1-PERF-FIX-01（B1）：脚本已全部改为 defer（boot-error 除外）。
+     启动时机按 readyState 区分：'loading' 是经典解析期、'interactive'
+     是 defer 执行期——这两种状态下 DOMContentLoaded 都尚未触发，
+     注册监听可保证 boot 在全部 defer 脚本按序执行完后才启动（这正是
+     本次修正的关键：旧代码在 'interactive' 下会立即 boot，此时排在
+     app.js 之后的 p0-ui 尚未执行）；其余状态（'complete' 或无此属性
+     的嵌入环境）文档已就绪，直接启动。 */
+  if (document.readyState === 'loading' || document.readyState === 'interactive') {
     document.addEventListener('DOMContentLoaded', boot);
   } else {
     boot();

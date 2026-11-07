@@ -5,7 +5,7 @@
 var fs = require('fs'), vm = require('vm'), path = require('path');
 var ROOT = path.join(__dirname, '..');
 var html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
-var srcs = [...html.matchAll(/<script src="([^"]+)"/g)].map(function (m) { return m[1].split('?')[0]; });
+var srcs = [...html.matchAll(/<script[^>]* src="([^"]+)"/g)].map(function (m) { return m[1].split('?')[0]; });
 function El() { this.children = []; this.style = {}; this.dataset = {}; this.value = ''; this._html = ''; this.files = []; this.textContent = '';
   this.parentNode = { removeChild: function () {}, appendChild: function (c) { return c; }, insertBefore: function (c) { return c; } };
   this.classList = { add: function () {}, remove: function () {}, toggle: function () {}, contains: function () { return false; } }; }

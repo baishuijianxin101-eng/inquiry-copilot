@@ -95,7 +95,7 @@ function makeApp(preset) {
   g.Blob = function () {}; g.URL = { createObjectURL: function () { return ''; }, revokeObjectURL: function () {} };
   g.FileReader = function () {};
   vm.createContext(g);
-  var files = ['assets/boot-error.js', 'assets/seed-state.js', 'assets/core.js', 'assets/pricing.js', 'assets/pricing-unity.js', 'assets/workflow.js', 'assets/translate.js', 'assets/judge.js', 'assets/matching.js', 'assets/smart-match.js', 'assets/opp-score.js', 'assets/reply-assistant.js', 'assets/followup.js', 'assets/reply.js', 'assets/importer.js', 'assets/market-ref.js', 'assets/price-candidates.js', 'assets/p0-parse.js', 'assets/p0-match.js', 'assets/p0-quote.js', 'assets/p0-cost.js', 'assets/p0-cockpit.js', 'assets/p0-api.js', 'assets/app.js', 'assets/p0-ui.js'];
+  var files = ['assets/boot-error.js', 'assets/seed-state.js', 'assets/core.js', 'assets/pricing.js', 'assets/pricing-unity.js', 'assets/workflow.js', 'assets/translate.js', 'assets/judge.js', 'assets/matching.js', 'assets/smart-match.js', 'assets/opp-score.js', 'assets/reply-assistant.js', 'assets/followup.js', 'assets/reply.js', 'assets/importer.js', 'assets/market-ref.js', 'assets/price-candidates.js', 'assets/p0-parse.js', 'assets/p0-match.js', 'assets/p0-quote.js', 'assets/p0-cost.js', 'assets/p0-cockpit.js', 'assets/p0-api.js', 'assets/identity.js', 'assets/identity-migration.js', 'assets/identity-txn.js', 'assets/app.js', 'assets/p0-ui.js'];
   files.forEach(function (f) { vm.runInContext(fs.readFileSync(path.join(ROOT, f), 'utf8'), g, { filename: f }); });
   if (listeners.DOMContentLoaded) listeners.DOMContentLoaded();
   return {

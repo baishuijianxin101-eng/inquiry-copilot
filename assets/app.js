@@ -508,6 +508,139 @@
     return { level: res.level, label: res.levelLabel, manual: false };
   }
 
+  /* =========================================================
+     P1-8 今日优先队列：只组合现有信号——最新买家意向（ReplyAssistant
+     .detectScenario 同一判定）、跟进到期（FollowUp.dueState）、价值
+     档位（scoreForOpp + effLevelOf）、报价沉寂（FollowUp.staleQuotes）。
+     不新增字段与存储；全部为现有字段的纯函数，卖家处理并记录发送后，
+     下一次渲染自然出队或降组。
+     发送口径：系统只能看见「系统内记录」——时间线 seller 条目与
+     followLog 里 source='draft' 的已发送确认。阿里后台直接回复而未
+     在系统记录的，队列无从知晓，文案统一按系统内记录表述。 */
+  function latestBuyerInfo(o) {
+    var ms = Array.isArray(o.messages) ? o.messages : [];
+    for (var i = ms.length - 1; i >= 0; i--) {
+      if (ms[i] && ms[i].dir === 'buyer' && ms[i].text) {
+        return { text: ms[i].text, at: ms[i].at || o.createdAt || null, index: i };
+      }
+    }
+    return { text: String(o.rawText || ''), at: o.createdAt || null, index: -1 };
+  }
+
+  function hasSendRecord(o) {
+    var ms = Array.isArray(o.messages) ? o.messages : [];
+    for (var i = 0; i < ms.length; i++) if (ms[i] && ms[i].dir === 'seller') return true;
+    var fl = Array.isArray(o.followLog) ? o.followLog : [];
+    for (var j = 0; j < fl.length; j++) if (fl[j] && fl[j].source === 'draft') return true;
+    return false;
+  }
+
+  /* 最新买家消息之后是否已有系统内回复：时间线顺序（seller 条目位于
+     最新 buyer 条目之后）或更晚的已发送确认记录。 */
+  function repliedAfterLatest(o, info) {
+    var ms = Array.isArray(o.messages) ? o.messages : [];
+    for (var i = info.index + 1; i < ms.length; i++) if (ms[i] && ms[i].dir === 'seller') return true;
+    var t = info.at ? Date.parse(info.at) : NaN;
+    if (isFinite(t)) {
+      var fl = Array.isArray(o.followLog) ? o.followLog : [];
+      for (var j = 0; j < fl.length; j++) {
+        if (fl[j] && fl[j].source === 'draft' && Date.parse(fl[j].at || '') > t) return true;
+      }
+    }
+    return false;
+  }
+
+  function waitTextOf(fromIso, nowMs) {
+    var t = fromIso ? Date.parse(fromIso) : NaN;
+    if (!isFinite(t)) return '已等待一段时间';
+    var hrs = Math.max(0, Math.floor((nowMs - t) / 3600000));
+    if (hrs < 24) return '已等待 ' + hrs + ' 小时';
+    return '已等待 ' + Math.floor(hrs / 24) + ' 天';
+  }
+
+  /* 四组优先级：①成交推进未回复 ②跟进超期/今天到期 ③高价值未回复
+     ④报价沉寂。同商机只取最高组；won/lost、人工 done、演示商机排除；
+     人工搁置（defer）只压第③组，不屏蔽买家事件组。最多 8 条。 */
+  function buildPriorityQueue(opps, nowMs) {
+    var staleMap = {};
+    if (window.FollowUp && window.FollowUp.staleQuotes) {
+      try {
+        window.FollowUp.staleQuotes(opps, nowMs).forEach(function (s) { staleMap[s.opp.id] = s; });
+      } catch (e) { staleMap = {}; }
+    }
+    var items = [];
+    (opps || []).forEach(function (o) {
+      if (!o || C.isDemoOpp(o)) return;
+      if (window.FollowUp && window.FollowUp.deriveStatus(o) === 'done') return;
+      var info = latestBuyerInfo(o);
+      var res = null;
+      try { res = scoreForOpp(o); } catch (e) { res = null; }
+      var item = null;
+      /* ① 成交推进未回复：与详情页草稿同一判定入口与口径 */
+      if (window.ReplyAssistant && window.ReplyAssistant.detectScenario && res) {
+        var ltT = null;
+        try {
+          var lf = ((window.P0Parse && window.P0Parse.extract(info.text)) || {}).fields || {};
+          if (lf.targetPriceUsd > 0) ltT = Math.round(lf.targetPriceUsd * 100) / 100;
+        } catch (e) { ltT = null; }
+        var sc = null;
+        try {
+          sc = window.ReplyAssistant.detectScenario({
+            opp: o, eff: res.eff,
+            product: res.pick ? res.pick.product : null,
+            match: res.pick ? { score: res.pick.result.score, keyConflict: res.pick.result.keyConflict, conflicts: res.pick.result.conflicts } : null,
+            latestText: info.text, latestTargetPriceUsd: ltT
+          });
+        } catch (e) { sc = null; }
+        if (sc === 'closing' && !repliedAfterLatest(o, info)) {
+          item = { opp: o, group: 1, reason: '买家最新消息已要求推进订单（PI / 定金 / 下单），系统内未记录回复', sortAt: (info.at && Date.parse(info.at)) || Date.parse(o.createdAt || '') || nowMs };
+        }
+      }
+      /* ② 跟进超期 / 今天到期：到期时间越早越优先（超期在前、今天在后） */
+      if (!item && window.FollowUp && window.FollowUp.dueState) {
+        var due = window.FollowUp.dueState(o, nowMs);
+        if (due.state === 'overdue') item = { opp: o, group: 2, reason: '跟进已超期 ' + due.days + ' 天', sortAt: Date.parse(o.followUpAt || '') || 0 };
+        else if (due.state === 'today') item = { opp: o, group: 2, reason: '跟进今天到期', sortAt: Date.parse(o.followUpAt || '') || 0 };
+      }
+      /* ③ 高价值且系统内未记录回复：只针对尚未报价的商机（new/matched）——
+         已报价商机的无动作由 ② 到期与 ④ 沉寂表述，避免「未记录回复」
+         与已发报价的事实冲突。不设时间门槛，等待时长只作展示 */
+      if (!item && res && (o.status === 'new' || o.status === 'matched') && !(o.valueNote && o.valueNote.verdict === 'defer')) {
+        if (effLevelOf(o, res).level === 'high' && !hasSendRecord(o)) {
+          item = { opp: o, group: 3, reason: '高价值商机，系统内未记录回复，' + waitTextOf(o.createdAt, nowMs), sortAt: Date.parse(o.createdAt || '') || nowMs };
+        }
+      }
+      /* ④ 报价沉寂：沿用 staleQuotes 的 7 天口径，沉寂越久越前 */
+      if (!item && staleMap[o.id]) {
+        item = { opp: o, group: 4, reason: '报价已发出 ' + staleMap[o.id].days + ' 天，暂无新跟进记录', sortAt: -staleMap[o.id].days };
+      }
+      if (item) items.push(item);
+    });
+    items.sort(function (a, b) {
+      if (a.group !== b.group) return a.group - b.group;
+      return a.sortAt - b.sortAt;
+    });
+    return items.slice(0, 8);
+  }
+
+  function priorityQueueCard() {
+    var items = [];
+    try { items = buildPriorityQueue(st().opportunities, Date.now()); } catch (e) { items = []; }
+    if (!items.length) return '';
+    var rows = items.map(function (it) {
+      var o = it.opp;
+      return '<div class="row" style="gap:12px;padding:10px 0;border-bottom:1px solid #f0f1f4;align-items:center">' +
+        '<span class="badge ' + (it.group === 1 ? 'red' : it.group === 2 ? 'amber' : 'gray') + '" style="min-width:52px;justify-content:center">优先 ' + it.group + '</span>' +
+        '<div style="flex:1;min-width:0"><div style="font-weight:600;font-size:13.5px">' +
+        esc(o.buyer.name) + (o.buyer.company ? ' <span style="color:#8a919e;font-weight:400;font-size:12px">· ' + esc(o.buyer.company) + '</span>' : '') +
+        '</div><div style="font-size:12.5px;color:#5b6472">' + esc(it.reason) + '</div></div>' +
+        '<a class="btn sm" href="#/opp/' + esc(o.id) + '">去处理</a></div>';
+    }).join('');
+    return '<section class="card"><div class="card-hd"><div class="card-title">今日优先' +
+      '<span class="card-sub">按买家最新意向、跟进到期与价值排序，最多 8 条；回复以系统内记录为准</span></div></div>' +
+      '<div class="card-bd" style="padding-top:4px;padding-bottom:4px">' + rows + '</div></section>';
+  }
+
   function oppScoreCard(opp) {
     var res = scoreForOpp(opp);
     if (!res) return '';
@@ -1386,7 +1519,13 @@
     var open = s.opportunities.filter(function (o) {
       /* 工作台只推真实待办，演示商机不混进来 */
       return !C.isDemoOpp(o) && (o.status === 'new' || o.status === 'matched');
-    }).sort(function (a, b) { return new Date(b.createdAt) - new Date(a.createdAt); });
+    }).sort(function (a, b) {
+      /* P1-8：成员集合不变，只改顺序——系统内未记录回复的在前
+         （等待越久越优先），已记录回复的在后，组内按创建时间从早到晚 */
+      var ta = hasSendRecord(a) ? 1 : 0, tb = hasSendRecord(b) ? 1 : 0;
+      if (ta !== tb) return ta - tb;
+      return new Date(a.createdAt) - new Date(b.createdAt);
+    });
 
     /* ---- 最顶上：进阿里卖家后台 ---- */
     var sellerBar = '<section class="card" style="border-left:3px solid var(--brand)">' +
@@ -1504,7 +1643,7 @@
     var demoOppHint = kpi.demoOppCount > 0
       ? '<div class="alert info"><span class="ic">i</span><div>另有 <strong>' + kpi.demoOppCount + ' 条演示商机</strong>未计入上面的真实待办与统计，在「商机」页切到「演示数据」查看。</div></div>'
       : '';
-    return '<div class="stack">' + sellerBar + demoBanner + demoOppHint + hero + todoCard() + bossStrip() + steps + queue + moneyLine + '</div>';
+    return '<div class="stack">' + sellerBar + demoBanner + demoOppHint + hero + priorityQueueCard() + todoCard() + bossStrip() + steps + queue + moneyLine + '</div>';
   }
 
 

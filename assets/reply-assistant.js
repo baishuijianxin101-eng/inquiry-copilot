@@ -494,6 +494,9 @@
   }
 
   RA.generate = generate;
+  /* P1-8：今日优先队列复用同一场景判定（不另造关键词规则），
+     只导出函数、判定逻辑零改动。 */
+  RA.detectScenario = detectScenario;
   RA.detectScenario = detectScenario;
   RA.hasOrderIntent = hasOrderIntent;
   RA.missingOf = missingOf;

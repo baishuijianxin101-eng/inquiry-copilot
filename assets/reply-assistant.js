@@ -98,9 +98,18 @@
   }
 
   function detectScenario(x) {
-    var eff = x.eff || {}, opp = x.opp || {}, raw = String(opp.rawText || '');
+    /* P1-7：意向只读最新一条买家消息（x.latestText，调用方由
+       Core.latestBuyerText 提供）；缺省回落 opp.rawText，旧路径行为不变。
+       卖家消息与旧买家消息永不参与当前意向判定。 */
+    var eff = x.eff || {}, opp = x.opp || {}, raw = String(x.latestText || opp.rawText || '');
     if (x.match && x.match.keyConflict) return 'clarify';
-    if (eff.targetPriceUsd > 0) return 'negotiation';
+    /* P1-7：议价意向只认最新一条买家消息里的目标价——调用方传入
+       latestTargetPriceUsd 时以它为准（null = 最新消息没有提价）；
+       未传时回落 eff.targetPriceUsd（单条分析场景两者等价，旧行为
+       不变）。历史目标价仍留在 eff 里供草稿引用，但不劫持当前意向：
+       买家已转到要 PI 时，旧询价里的目标价不能把场景永远钉在谈判。 */
+    var tgtNow = ('latestTargetPriceUsd' in x) ? x.latestTargetPriceUsd : eff.targetPriceUsd;
+    if (tgtNow > 0) return 'negotiation';
     if (hasOrderIntent(raw)) return 'closing';
     if (eff.qty > 0 && x.product && x.product.moq && eff.qty < x.product.moq) return 'moq';
     if (/\bsamples?\b|样品/i.test(raw)) return 'sample';

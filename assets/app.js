@@ -604,7 +604,9 @@
        detect 兜底 + CJK 占比补判中文）；人工切换只在决策台提供。 */
     var rLang = 'en';
     try {
-      var rawT = String((opp && opp.rawText) || '');
+      /* P1-7：语言识别与意向判定同源——都只看最新一条买家消息
+         （无消息时即第一封询盘原文，旧商机行为不变）。 */
+      var rawT = C.latestBuyerText ? C.latestBuyerText(opp) : String((opp && opp.rawText) || '');
       rLang = (window.Translate && window.Translate.detect(rawT)) || 'en';
       if (rLang === 'en') {
         var cjkN = (rawT.match(/[\u4e00-\u9fff]/g) || []).length;
@@ -612,6 +614,13 @@
         if (cjkN > 0 && cjkN >= latN) rLang = 'zh';
       }
     } catch (e) { rLang = 'en'; }
+    /* P1-7：最新一条买家消息里的目标价（议价意向的唯一触发源）；
+       解析失败或未提价时为 null——历史目标价不触发当前议价意向。 */
+    var ltTarget = null;
+    try {
+      var lpF = ((window.P0Parse && window.P0Parse.extract(rawT)) || {}).fields || {};
+      if (lpF.targetPriceUsd > 0) ltTarget = Math.round(lpF.targetPriceUsd * 100) / 100;
+    } catch (e) { ltTarget = null; }
     return window.ReplyAssistant.generate({
       opp: opp,
       eff: res ? res.eff : effectiveParsed(opp, ctx),
@@ -620,7 +629,9 @@
       price: price,
       sellerName: st().settings.sellerName || '',
       scenario: S.replyScenario,
-      lang: rLang
+      lang: rLang,
+      latestText: rawT,
+      latestTargetPriceUsd: ltTarget
     });
   }
 
@@ -2228,7 +2239,7 @@
       '<div class="grid grid-2 top">' + left + right + '</div>' +
       parseCard(opp, a, effP) +
       salesCard(opp, a, effP) +
-      buyerCard(opp) + followCard(opp) + sandboxCard(ctx) + matchCard + extra + replyAssistantCard(opp, ctx) + tabs + '</div>';
+      buyerCard(opp) + messagesCard(opp) + followCard(opp) + sandboxCard(ctx) + matchCard + extra + replyAssistantCard(opp, ctx) + tabs + '</div>';
   }
 
   /* 详情页第一眼：能不能报、报多少、赚多少 */
@@ -3482,6 +3493,7 @@
       case 'ra-generate': raGenerate(id); break;
       case 'ra-save': raSave(id); break;
       case 'ra-copy': { var raEl = document.getElementById('ra-en'); if (raEl) copyText(raEl.value); break; }
+      case 'msg-append': appendBuyerMsg(id); break;
       case 'ra-sent-open': openSentConfirm(id); break;
       case 'ra-sent-confirm': doSentConfirm(id); break;
       case 'follow-edit': openFollowEdit(id, btn.getAttribute('data-rid')); break;
@@ -5028,6 +5040,81 @@
     }).join('') + '</div>';
   }
 
+  /* P1-7 消息时间线：旧商机没有 messages 时，把 rawText 作为第一条
+     买家消息展示（只展示、不写入）；有时间线后逐条按方向展示。
+     追加框只收买家消息；卖家消息只来自「记为已发送跟进」确认动作。 */
+  function messagesCard(opp) {
+    var ms = Array.isArray(opp.messages) ? opp.messages : [];
+    var rows = '';
+    if (!ms.length) {
+      rows = '<div style="border-left:3px solid #2f7d4f;padding:6px 10px;margin-bottom:8px">' +
+        '<div style="font-size:12px;color:#5b6472">买家 · 第一封询盘</div>' +
+        '<div style="white-space:pre-wrap;font-size:13px;line-height:1.65">' + esc(opp.rawText || '') + '</div></div>';
+    } else {
+      if (opp.rawText) {
+        rows += '<div style="border-left:3px solid #2f7d4f;padding:6px 10px;margin-bottom:8px">' +
+          '<div style="font-size:12px;color:#5b6472">买家 · 第一封询盘</div>' +
+          '<div style="white-space:pre-wrap;font-size:13px;line-height:1.65">' + esc(opp.rawText) + '</div></div>';
+      }
+      rows += ms.map(function (m) {
+        var isB = m.dir === 'buyer';
+        return '<div style="border-left:3px solid ' + (isB ? '#2f7d4f' : '#8a919e') + ';padding:6px 10px;margin-bottom:8px">' +
+          '<div style="font-size:12px;color:#5b6472">' + (isB ? '买家' : '卖家（已发送）') + ' · ' + esc(C.fmtDate(m.at, true)) + '</div>' +
+          '<div style="white-space:pre-wrap;font-size:13px;line-height:1.65">' + esc(m.text) + '</div>' +
+          (m.chg ? '<div style="font-size:12px;color:#a35b00;margin-top:2px">本条带来的变更：' + esc(m.chg) + '</div>' : '') +
+          '</div>';
+      }).join('');
+    }
+    return card('消息时间线', '按对话顺序；意向与回复只依据最新一条买家消息',
+      rows +
+      '<div class="field"><label>追加买家新消息（从阿里后台复制买家原话粘贴到这里）</label>' +
+      '<textarea id="msg-new" rows="3" placeholder="粘贴买家最新一条消息…"></textarea></div>' +
+      '<div class="row"><button class="btn sm primary" data-action="msg-append" data-id="' + safeActionId(opp.id) + '">追加并重新分析</button>' +
+      '<span style="font-size:12px;color:#8a919e">追加后数量、目的地等字段会按新消息更新；卖家已发送内容请用回复区的「记为已发送跟进」记录。</span></div>');
+  }
+
+  /* 详情页追加买家消息：解析新消息并把非空字段并入 parseEdits（与
+     决策台保存同一口径：买家最新提及即现行值；协商条件只记提及，
+     不自动视为已确认），再追加进时间线并生成变更注记。 */
+  function appendBuyerMsg(id) {
+    var o = oppById(id);
+    if (!o) return;
+    var ta = document.getElementById('msg-new');
+    var text = ta ? String(ta.value || '').trim() : '';
+    if (!text) { toast('先粘贴买家的新消息'); return; }
+    var before = C.effSnapshotOf ? C.effSnapshotOf(o) : null;
+    var parsed = null;
+    try { parsed = window.P0Parse ? window.P0Parse.extract(text) : null; } catch (e) { parsed = null; }
+    var pf = (parsed && parsed.fields) || null;
+    if (pf) {
+      /* P1-7-FIX：本轮字段先组装成 parseEdits 形状，再与既有字段走
+         Core.mergeParseEdits 同一合并规则（与决策台保存入口一致）：
+         新值非空胜、未提及保留旧值。 */
+      var ne = {};
+      if (pf.productName) ne.productName = String(pf.productName).slice(0, 160);
+      if (pf.models && pf.models.length) ne.modelsText = pf.models.join(', ').slice(0, 160);
+      if (pf.qty > 0) ne.qty = Math.round(pf.qty);
+      /* 歧义金额在 parse 层不会写进 targetPriceUsd（恒为 0），直接判 >0 */
+      if (pf.targetPriceUsd > 0) ne.targetPriceUsd = Math.round(pf.targetPriceUsd * 100) / 100;
+      if (pf.country) ne.country = String(pf.country).slice(0, 160);
+      if (pf.destination) ne.destination = String(pf.destination).slice(0, 160);
+      if (pf.incoterm) ne.incoterm = String(pf.incoterm).slice(0, 160);
+      if (pf.certs && pf.certs.length) ne.certsText = pf.certs.join(', ').slice(0, 160);
+      if (pf.deadlineDays > 0) ne.leadTimeDays = Math.round(pf.deadlineDays);
+      if (pf.purpose) ne.purpose = String(pf.purpose).slice(0, 160);
+      o.parseEdits = C.mergeParseEdits ? C.mergeParseEdits(o.parseEdits, ne) : Object.assign({}, o.parseEdits || {}, ne);
+    }
+    var after = C.effSnapshotOf ? C.effSnapshotOf(o) : null;
+    var chg = (before && after && C.chgNote) ? C.chgNote(before, after, false) : '';
+    var ap = C.appendBuyerMessage ? C.appendBuyerMessage(o, text, chg) : { added: false, reason: 'no-core' };
+    if (!ap.added && ap.reason === 'dup') { toast('这条买家消息已经在时间线里了，没有重复追加'); return; }
+    if (!ap.added && ap.reason === 'seed') { toast('这就是第一封询盘原文，已经在时间线里了'); return; }
+    invalidate();
+    if (!C.persist()) { toast('保存失败：本地写入被阻断，追加未保存，请重试'); return; }
+    render();
+    toast(ap.added ? '已追加买家消息，回复与字段已按最新消息更新' : '字段已按新消息更新');
+  }
+
   function followCard(opp) {
     var closed = opp.status === 'won' || opp.status === 'lost';
     var n = C.num(opp.followCount, 0);
@@ -5434,6 +5521,11 @@
     fields.plannedAt = plannedIso;
     var rec = window.FollowUp.addRecord(o, fields, C.nowIso(), C.uid('fu'));
     if (!rec) { toast('记录失败'); return; }
+    /* P1-7：已实际发送的草稿原文进入时间线（卖家方向）——这是 seller
+       消息的唯一来源；上文的防重复确认闸保证同一份草稿不会重复入线。
+       带入的是最终发送稿：人工编辑过时以 drafts.en 为准（与复制口径一致）。 */
+    var sentText = (saved.edited && o.drafts && o.drafts.en) ? o.drafts.en : saved.en;
+    if (sentText && C.appendSellerMessage) C.appendSellerMessage(o, sentText);
     o.lastContactAt = C.nowIso();
     o.lastTouchAt = o.lastContactAt;
     o.followCount = C.num(o.followCount, 0) + 1;

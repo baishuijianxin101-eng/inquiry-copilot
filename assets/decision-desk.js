@@ -175,7 +175,8 @@
         price: safePrice,
         sellerName: (settings && settings.sellerName) || '',
         scenario: 'auto',
-        lang: effLangOf(text)
+        lang: effLangOf(text),
+        latestTargetPriceUsd: eff.targetPriceUsd > 0 ? eff.targetPriceUsd : null
       }) : null;
       /* 工作报价展示门控（方案 1）：只有草稿的完整报价行确实采用了
          safePrice.unit 时，才允许在第 3 区标注「工作报价（草稿采用）」。
@@ -344,7 +345,8 @@
           opp: { rawText: S.text, buyer: { country: r.eff.country || '' }, quote: { qty: r.eff.qty || 0 }, status: 'new', followCount: 0 },
           eff: r.eff, product: cand.product,
           match: { score: cand.score, keyConflict: cand.keyConflict, conflicts: (cand.assess && cand.assess.conflicts) || [] },
-          price: null, sellerName: settings.sellerName || '', scenario: 'auto', lang: effLangOf(S.text)
+          price: null, sellerName: settings.sellerName || '', scenario: 'auto', lang: effLangOf(S.text),
+          latestTargetPriceUsd: r.eff.targetPriceUsd > 0 ? r.eff.targetPriceUsd : null
         }) : null;
       } catch (e) { r.reply = null; }
     }
@@ -604,7 +606,25 @@
         S.targetOppId = opp.id;
         targetId = opp.id;
       }
+      /* P1-7：保存到已有商机时，本次粘贴文本就是买家最新一条消息——
+         先取合并前有效字段快照，再写入成果，最后把消息追加进时间线
+         并生成关键字段变更注记。新建商机的文本即 rawText 本身，
+         由 Core 的 seed 规则跳过，绝不重复入线。 */
+      var msgBefore = (!created && C.effSnapshotOf) ? C.effSnapshotOf(opp) : null;
+      var oldEdits = !created ? opp.parseEdits : null;
       var written = applySavePayload(opp, payload);
+      /* P1-7-FIX：applySavePayload 的整体替换会丢掉中间轮次补充、本轮
+         未提及的字段——保存到已有商机时按 Core.mergeParseEdits 把旧值
+         并回（新值非空恒胜、留空 = 本轮未提供）。applySavePayload 本身
+         与新建商机路径均不改变。 */
+      if (!created && C.mergeParseEdits) opp.parseEdits = C.mergeParseEdits(oldEdits, opp.parseEdits);
+      if (!created && C.appendBuyerMessage) {
+        var msgAfter = C.effSnapshotOf ? C.effSnapshotOf(opp) : null;
+        var mChg = (msgBefore && msgAfter && C.chgNote)
+          ? C.chgNote(msgBefore, msgAfter, false) : '';
+        var mAp = C.appendBuyerMessage(opp, S.text, mChg);
+        if (mAp && mAp.added) written.push('买家新消息');
+      }
       if (C.addLog) C.addLog(opp, '决策台保存分析成果：' + written.join('、'));
       if (!C.persist()) {
         if (created) {

@@ -691,6 +691,130 @@
      修正只影响解析展示与待确认问题；有真实落点的字段（数量/市场/交期/术语）
      由保存动作同步写回 quote/buyer，不在这里处理。 */
   var REPLY_SCENARIOS = ['first', 'prequote', 'spec', 'moq', 'negotiation', 'sample', 'closing', 'clarify'];
+  /* P1-7：时间线清洗——结构不对、方向非法、空文本整条丢弃；单条文本
+     截断 2000 字，chg 截断 120 字，总量保留最近 100 条（追加顺序即
+     对话顺序，不按 at 重排，避免本机时钟误差打乱次序）。 */
+  function sanitizeMessages(list) {
+    if (!Array.isArray(list)) return [];
+    var out = [];
+    list.forEach(function (m) {
+      if (!m || typeof m !== 'object' || Array.isArray(m)) return;
+      if (m.dir !== 'buyer' && m.dir !== 'seller') return;
+      var text = String(m.text || '').trim().slice(0, 2000);
+      if (!text) return;
+      var at = (typeof m.at === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(m.at)) ? m.at : nowIso();
+      var e = { at: at, dir: m.dir, text: text };
+      if (typeof m.chg === 'string' && m.chg.trim()) e.chg = m.chg.trim().slice(0, 120);
+      out.push(e);
+    });
+    return out.slice(-100);
+  }
+
+  function msgNorm(s) { return String(s || '').replace(/\s+/g, ' ').trim(); }
+
+  /* 最新一条买家消息原文；没有买家消息时回落第一封询盘 rawText——
+     意向判定与发送稿语言只认这个来源，卖家消息永不参与。 */
+  function latestBuyerText(opp) {
+    var ms = (opp && opp.messages) || [];
+    for (var i = ms.length - 1; i >= 0; i--) {
+      if (ms[i] && ms[i].dir === 'buyer' && ms[i].text) return ms[i].text;
+    }
+    return String((opp && opp.rawText) || '');
+  }
+
+  /* 追加买家消息（幂等）：与 rawText 相同（第一封询盘本身）或与最新
+     一条买家消息规范化后相同，都不重复入线。chg 为关键字段变更注记。 */
+  function appendBuyerMessage(opp, text, chg) {
+    if (!opp) return { added: false, reason: 'no-opp' };
+    var t = String(text || '').trim().slice(0, 2000);
+    if (!t) return { added: false, reason: 'empty' };
+    if (msgNorm(t) === msgNorm(opp.rawText)) return { added: false, reason: 'seed' };
+    var ms = Array.isArray(opp.messages) ? opp.messages : (opp.messages = []);
+    for (var i = ms.length - 1; i >= 0; i--) {
+      if (ms[i] && ms[i].dir === 'buyer') {
+        if (msgNorm(ms[i].text) === msgNorm(t)) return { added: false, reason: 'dup' };
+        break;
+      }
+    }
+    var e = { at: nowIso(), dir: 'buyer', text: t };
+    if (typeof chg === 'string' && chg.trim()) e.chg = chg.trim().slice(0, 120);
+    ms.push(e);
+    if (ms.length > 100) opp.messages = ms.slice(-100);
+    opp.updatedAt = nowIso();
+    return { added: true, entry: e };
+  }
+
+  /* 追加卖家消息：唯一调用方是 app 的「确认已发送」成功路径（该路径
+     已有同一草稿防重复确认闸），此处只负责落盘与容量。 */
+  function appendSellerMessage(opp, text) {
+    if (!opp) return { added: false, reason: 'no-opp' };
+    var t = String(text || '').trim().slice(0, 2000);
+    if (!t) return { added: false, reason: 'empty' };
+    var ms = Array.isArray(opp.messages) ? opp.messages : (opp.messages = []);
+    var e = { at: nowIso(), dir: 'seller', text: t };
+    ms.push(e);
+    if (ms.length > 100) opp.messages = ms.slice(-100);
+    opp.updatedAt = nowIso();
+    return { added: true, entry: e };
+  }
+
+  /* 商机当前有效字段快照（原始询盘解析 + parseEdits 覆盖），只取多轮
+     变更注记关心的四项：数量、目的地、贸易术语、目标价。parseEdits 的
+     语义是「买家最新提及」，不代表双方已确认。 */
+  function effSnapshotOf(opp) {
+    var snap = { qty: null, destination: '', incoterm: '', targetPriceUsd: null };
+    if (!opp) return snap;
+    try {
+      var P = window.P0Parse;
+      if (P && P.extract) {
+        /* extract 返回 {fields:{...}}；歧义金额在 parse 层就不会写进
+           targetPriceUsd（恒为 0），快照直接读 fields 即可。 */
+        var res = P.extract(String(opp.rawText || '')) || {};
+        var f = res.fields || {};
+        if (f.qty > 0) snap.qty = Math.round(f.qty);
+        if (f.destination) snap.destination = String(f.destination);
+        if (f.incoterm) snap.incoterm = String(f.incoterm);
+        if (f.targetPriceUsd > 0) snap.targetPriceUsd = Math.round(f.targetPriceUsd * 100) / 100;
+      }
+    } catch (e) {}
+    var pe = opp.parseEdits || {};
+    if (num(pe.qty, 0) > 0) snap.qty = Math.round(num(pe.qty, 0));
+    if (pe.destination) snap.destination = String(pe.destination);
+    if (pe.incoterm) snap.incoterm = String(pe.incoterm);
+    if (num(pe.targetPriceUsd, 0) > 0) snap.targetPriceUsd = Math.round(num(pe.targetPriceUsd, 0) * 100) / 100;
+    return snap;
+  }
+
+  /* 变更注记：只记「旧值与新值都明确且不同」的字段；首次补充不算变更；
+     新目标价带解析歧义（afterAmbiguous）时不生成确定变更。 */
+  function chgNote(before, after, afterAmbiguous) {
+    if (!before || !after) return '';
+    var parts = [];
+    if (before.qty != null && after.qty != null && before.qty !== after.qty)
+      parts.push('数量 ' + before.qty + ' → ' + after.qty);
+    if (before.destination && after.destination && before.destination !== after.destination)
+      parts.push('目的地 ' + before.destination + ' → ' + after.destination);
+    if (before.incoterm && after.incoterm && before.incoterm !== after.incoterm)
+      parts.push('贸易术语 ' + before.incoterm + ' → ' + after.incoterm);
+    if (!afterAmbiguous && before.targetPriceUsd != null && after.targetPriceUsd != null && before.targetPriceUsd !== after.targetPriceUsd)
+      parts.push('目标价 $' + before.targetPriceUsd.toFixed(2) + ' → $' + after.targetPriceUsd.toFixed(2));
+    return parts.join('；').slice(0, 120);
+  }
+
+  /* P1-7-FIX：多轮字段合并的唯一规则——两侧先过 sanitizeParseEdits
+     白名单清洗，再逐键合并：新值非空则新值胜，新值缺失或为空则保留
+     旧值（决策台字段框留空 = 本轮未提供新值）。显式清空不走这里：
+     详情页解析修正编辑器直接写 parseEdits（留空 = 恢复自动识别），
+     其结果就是下一次合并读取的「旧值」，被清掉的字段不会复活。 */
+  function mergeParseEdits(oldEdits, newEdits) {
+    var o = sanitizeParseEdits(oldEdits);
+    var n = sanitizeParseEdits(newEdits);
+    var out = {};
+    Object.keys(o).forEach(function (k) { out[k] = o[k]; });
+    Object.keys(n).forEach(function (k) { out[k] = n[k]; });
+    return out;
+  }
+
   function sanitizeReplyDrafts(rd) {
     if (!rd || typeof rd !== 'object' || Array.isArray(rd)) return {};
     var out = {};
@@ -832,6 +956,10 @@
       followLog: Array.isArray(o.followLog) ? o.followLog.filter(function (x) {
         return x && typeof x === 'object' && !Array.isArray(x);
       }).slice(-100) : [],
+      /* P1-7 多轮消息时间线：[{at, dir, text, chg?}]——dir 只认 buyer/seller，
+         旧商机无此字段时为空数组，详情页以 rawText 充当第一条买家消息展示，
+         绝不把 rawText 重复写进时间线。卖家消息只来自「确认已发送」动作。 */
+      messages: sanitizeMessages(o.messages),
       log: Array.isArray(o.log) ? o.log.filter(function (x) {
         return x && typeof x === 'object' && !Array.isArray(x);
       }).slice(0, 200).map(function (x) {
@@ -1270,6 +1398,9 @@
     isDemoOpp: isDemoOpp, isDemoProduct: isDemoProduct, isDemoOrder: isDemoOrder,
     visibleOpps: visibleOpps, purgeDemo: purgeDemo,
     buyerKeyOf: buyerKeyOf, inquiryFingerprint: inquiryFingerprint, findDuplicateOpps: findDuplicateOpps,
+    sanitizeMessages: sanitizeMessages, latestBuyerText: latestBuyerText, mergeParseEdits: mergeParseEdits,
+    appendBuyerMessage: appendBuyerMessage, appendSellerMessage: appendSellerMessage,
+    effSnapshotOf: effSnapshotOf, chgNote: chgNote,
     // 规范化
     normalizeProduct: normalizeProduct, normalizeOpp: normalizeOpp, normalizeOrder: normalizeOrder,
     normalizeSettings: normalizeSettings, normalizeQuote: normalizeQuote, normalizeEndpoint: normalizeEndpoint,

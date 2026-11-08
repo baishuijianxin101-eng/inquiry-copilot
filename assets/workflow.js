@@ -260,7 +260,45 @@
       });
     }
 
+    /* P1-10 备份健康：从未导出过完整备份，或上次导出距今超过 7 天。
+       时间由 app 层在备份文件成功生成后记录（见 backupHealth）。 */
+    var bk = backupHealth();
+    if (bk.state === 'never') {
+      list.push({
+        key: 'backup', label: '数据还没有备份', count: 1,
+        desc: '商机、成本与跟进记录只存在这台设备的浏览器里，先导出一份完整备份文件留档', severity: 'high',
+        hash: '#/settings'
+      });
+    } else if (bk.state === 'stale') {
+      list.push({
+        key: 'backup', label: '备份已过期', count: 1,
+        desc: '上次导出完整备份是 ' + bk.ageDays + ' 天前，之后的新数据还没进备份', severity: 'mid',
+        hash: '#/settings'
+      });
+    }
+
     return list;
+  }
+
+  /* P1-10：最近一次成功生成完整备份文件的时间。业务状态的 migrate
+     只保留固定切片、settings 为白名单，业务状态内没有可扩展的元信息
+     位，因此该时间记录在 app/workflow 共用的独立 localStorage 键
+     （ic_backup_health，与 ic_data_view 同属界面级偏好键，不进业务
+     数据、不参与备份导入导出）。读取失败一律按未备份处理，不抛错。
+     state: never（从未）/ fresh（7 天内）/ stale（超过 7 天）。 */
+  function backupHealth(nowMs) {
+    var at = null;
+    try {
+      var raw = window.localStorage.getItem('ic_backup_health');
+      if (raw) {
+        var obj = JSON.parse(raw);
+        if (obj && obj.lastExportAt && isFinite(Date.parse(obj.lastExportAt))) at = obj.lastExportAt;
+      }
+    } catch (e) { at = null; }
+    if (!at) return { lastExportAt: null, ageDays: null, state: 'never' };
+    var age = Math.floor(((nowMs || Date.now()) - Date.parse(at)) / DAY);
+    if (age < 0) age = 0;
+    return { lastExportAt: at, ageDays: age, state: age > 7 ? 'stale' : 'fresh' };
   }
 
   /* 老板看的一行数：本周询盘 / 报价 / 成交 / 成交率 / 平均毛利 */
@@ -307,6 +345,7 @@
     startFollow: startFollow,
     followDraft: followDraft,
     todos: todos,
-    weekSummary: weekSummary
+    weekSummary: weekSummary,
+    backupHealth: backupHealth
   };
 })();

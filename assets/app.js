@@ -1643,7 +1643,7 @@
     var demoOppHint = kpi.demoOppCount > 0
       ? '<div class="alert info"><span class="ic">i</span><div>另有 <strong>' + kpi.demoOppCount + ' 条演示商机</strong>未计入上面的真实待办与统计，在「商机」页切到「演示数据」查看。</div></div>'
       : '';
-    return '<div class="stack">' + sellerBar + demoBanner + demoOppHint + hero + priorityQueueCard() + todoCard() + bossStrip() + steps + queue + moneyLine + '</div>';
+    return '<div class="stack">' + sellerBar + demoBanner + demoOppHint + hero + priorityQueueCard() + todoCard() + bossStrip() + steps + queue + moneyLine + backupStrip() + '</div>';
   }
 
 
@@ -3433,6 +3433,7 @@
         '<div class="stack" style="gap:10px">' +
         '<div class="alert warn"><span class="ic">!</span><div><strong>没有云同步。</strong>' +
         '数据存在浏览器 localStorage，换浏览器 / 清缓存会丢。养成导出备份的习惯。</div></div>' +
+        backupStatusLine() +
         '<div class="row">' +
         '<button class="btn" data-action="export-json">导出备份 JSON</button>' +
         '<button class="btn" data-action="import-json">导入备份</button>' +
@@ -4018,7 +4019,11 @@
           document.body.appendChild(a); a.click();
           setTimeout(function () { URL.revokeObjectURL(url); a.remove(); }, 400);
           C.audit('导出完整备份', 'ic-backup v2（含身份注册表）');
-        } else { C.exportJson(); }
+          /* P1-10：走到这里说明备份文件已完整生成并触发下载，
+             才记录备份时间；上面的失败分支已 break，不会刷新。 */
+          recordBackupExport();
+        } else { C.exportJson(); recordBackupExport(); }
+        render();
         break;
       }
       case 'import-json': document.getElementById('file-input').click(); break;
@@ -5414,6 +5419,43 @@
       C.pct(ng.minMarginPct) + '」算，在设置里改。点「复制话术」直接发客户。</div>';
 
     return '<div style="' + box + '">' + head + line + facts + table + '</div>';
+  }
+
+  /* P1-10 备份健康：只有完整备份文件成功生成（buildBackup 未抛错、
+     下载已触发）后才由导出动作调用本函数记录时间；失败、取消、异常
+     都不会走到。与 Workflow.backupHealth 共用 ic_backup_health 键
+     （界面级偏好键，不进业务数据）。文案只说「备份文件已生成」，
+     不声称云端同步或异地保护——文件被另存到哪里，系统无法感知。 */
+  function recordBackupExport() {
+    try {
+      localStorage.setItem('ic_backup_health', JSON.stringify({ lastExportAt: new Date().toISOString() }));
+    } catch (e) {}
+  }
+  function backupHealthOf() {
+    if (window.Workflow && window.Workflow.backupHealth) return window.Workflow.backupHealth();
+    return { lastExportAt: null, ageDays: null, state: 'never' };
+  }
+  function backupStatusLine() {
+    var bk = backupHealthOf();
+    var t;
+    if (bk.state === 'never') t = '<strong style="color:#d92d20">尚未导出过完整备份</strong>——请先导出一份 JSON 文件，另存到电脑、邮箱或网盘上。';
+    else if (bk.state === 'stale') t = '上次导出完整备份：<strong style="color:#b54708">' + bk.ageDays + ' 天前</strong>（已过期，建议重新导出）。';
+    else t = '上次导出完整备份：' + (bk.ageDays === 0 ? '今天（0 天前）' : bk.ageDays + ' 天前') + '，状态正常。';
+    return '<div style="font-size:12.5px;color:#5b6472">数据备份状态：' + t + '</div>';
+  }
+  function backupStrip() {
+    var bk = backupHealthOf();
+    var txt, cls;
+    if (bk.state === 'never') { txt = '完整备份：<strong>尚未导出过</strong>。数据只存在这台设备的浏览器里，清缓存或换设备会丢失。'; cls = 'red'; }
+    else if (bk.state === 'stale') { txt = '完整备份：上次导出是 <strong>' + bk.ageDays + ' 天前</strong>（已过期），之后的新数据还没进备份。'; cls = 'amber'; }
+    else { txt = '完整备份：上次导出是 ' + (bk.ageDays === 0 ? '今天' : bk.ageDays + ' 天前') + '，状态正常。'; cls = 'gray'; }
+    return '<section class="card"><div class="card-bd row" style="gap:10px">' +
+      '<span class="badge ' + cls + '">备份</span>' +
+      '<span style="font-size:12.5px;color:var(--ink-2)">' + txt + '</span>' +
+      '<span class="spacer"></span>' +
+      '<button class="btn sm primary" data-action="export-json">一键导出备份</button>' +
+      '<a href="#/settings" style="font-size:12px;color:var(--ink-3)">数据与安全 →</a>' +
+      '</div></section>';
   }
 
   /* 设置页：本地存储健康 + 一键回滚 */

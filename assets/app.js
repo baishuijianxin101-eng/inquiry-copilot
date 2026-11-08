@@ -600,6 +600,18 @@
       ? ctx.unity.quoteFloorUsd : (pr ? pr.floorUsd : 0);
     var price = (!forceNoPrice && quotable && pr && pr.unitPriceUsd > 0 && quoteFloor > 0 && pr.unitPriceUsd >= quoteFloor)
       ? { unit: pr.unitPriceUsd, floor: quoteFloor } : null;
+    /* P1-5-REPLY：发送稿语言按买家原文自动识别（与决策台同口径：
+       detect 兜底 + CJK 占比补判中文）；人工切换只在决策台提供。 */
+    var rLang = 'en';
+    try {
+      var rawT = String((opp && opp.rawText) || '');
+      rLang = (window.Translate && window.Translate.detect(rawT)) || 'en';
+      if (rLang === 'en') {
+        var cjkN = (rawT.match(/[\u4e00-\u9fff]/g) || []).length;
+        var latN = (rawT.match(/[a-zA-Z]/g) || []).length;
+        if (cjkN > 0 && cjkN >= latN) rLang = 'zh';
+      }
+    } catch (e) { rLang = 'en'; }
     return window.ReplyAssistant.generate({
       opp: opp,
       eff: res ? res.eff : effectiveParsed(opp, ctx),
@@ -607,7 +619,8 @@
       match: pick ? { score: pick.result.score, keyConflict: pick.result.keyConflict, conflicts: pick.result.conflicts } : null,
       price: price,
       sellerName: st().settings.sellerName || '',
-      scenario: S.replyScenario
+      scenario: S.replyScenario,
+      lang: rLang
     });
   }
 
@@ -615,8 +628,18 @@
     var gen = replyGenFor(opp, ctx);
     if (!gen) return '';
     var saved = (opp.replyDrafts || {})[gen.scenario] || null;
-    var en = saved ? saved.en : gen.en;
+    /* replyDrafts.en 槽位存「最终发送稿」（英文买家即英文稿，与历史一致）；
+       未保存时用本次实时生成的发送稿（可能是买家原语言）。 */
+    var en = saved ? saved.en : (gen.send || gen.en);
     var zh = saved ? saved.zh : gen.zh;
+    var sendLangName = { es: '西班牙语', pt: '葡萄牙语', ru: '俄语', zh: '中文' }[gen.sendLang] || '';
+    /* P1-5 FIX-01：有已保存草稿时，主文本框显示的是 saved.en，其语言可能
+       与 fresh gen 的自动识别不同（决策台人工切语言后保存）——标签不得
+       用 gen.sendLang 冒充已保存稿的语言，改用中性标签；无 saved 时
+       保持按自动识别标注。 */
+    var primaryLabel = saved
+      ? '已保存发送稿（发给买家的就是这份）'
+      : (sendLangName ? '发送稿（' + sendLangName + '，发给买家的就是这份）' : '英文正文（发给买家的就是这份）');
     var stale = saved && opp.updatedAt && saved.at && new Date(opp.updatedAt) > new Date(saved.at);
     var warnHtml = gen.warnings.length
       ? gen.warnings.map(function (w) {
@@ -642,14 +665,17 @@
         ? '已保存草稿 · ' + C.fmtDate(saved.at, true) + (saved.edited ? ' · 已人工编辑' : '') + (stale ? ' · <b style="color:#8a5209">询盘信息在此之后有更新，建议重新生成</b>' : '')
         : '当前是实时生成的预览，编辑后点「保存编辑」才会存下来') +
       '</div>' +
-      '<label style="margin-top:10px">英文正文（发给买家的就是这份）</label>' +
+      (gen.degraded ? '<div class="sm-list" style="margin-bottom:8px;color:#b45309"><span class="sm-list-t">降级提示：</span>买家语言暂无回复模板，发送稿为英文。</div>' : '') +
+      '<label style="margin-top:10px">' + primaryLabel + '</label>' +
       '<textarea id="ra-en" style="min-height:170px">' + esc(en) + '</textarea>' +
+      (sendLangName && gen.en && gen.send !== gen.en
+        ? '<label style="margin-top:10px">英文参考稿（不发送）</label><textarea readonly style="min-height:120px">' + esc(gen.en) + '</textarea>' : '') +
       '<label style="margin-top:10px">中文对照（只给你看，不发送）</label>' +
       '<textarea id="ra-zh" style="min-height:150px">' + esc(zh) + '</textarea>' +
       '<div class="row" style="gap:8px;margin-top:12px">' +
       '<button class="btn primary" data-action="ra-generate" data-id="' + safeActionId(opp.id) + '">' + (saved ? '重新生成' : '生成并保存') + '</button>' +
       '<button class="btn" data-action="ra-save" data-id="' + safeActionId(opp.id) + '">保存编辑</button>' +
-      '<button class="btn" data-action="ra-copy" data-id="' + safeActionId(opp.id) + '">复制英文</button>' +
+      '<button class="btn" data-action="ra-copy" data-id="' + safeActionId(opp.id) + '">' + (saved || sendLangName ? '复制发送稿' : '复制英文') + '</button>' +
       (saved ? '<button class="btn" data-action="ra-sent-open" data-id="' + safeActionId(opp.id) + '">记为已发送跟进</button>' : '') +
       '<span style="font-size:11.5px;color:var(--ink-3)">复制后到阿里后台粘贴发送，发送动作始终由你完成；发完回来点「记为已发送跟进」留痕</span>' +
       '</div></div></section>';
@@ -662,7 +688,7 @@
     var gen = replyGenFor(opp, ctx);
     if (!gen) return;
     opp.replyDrafts = opp.replyDrafts || {};
-    opp.replyDrafts[gen.scenario] = { en: gen.en, zh: gen.zh, edited: false, at: C.nowIso() };
+    opp.replyDrafts[gen.scenario] = { en: gen.send || gen.en, zh: gen.zh, edited: false, at: C.nowIso() };
     C.addLog(opp, 'AI 回复助手生成草稿：' + gen.scenarioLabel + '（策略：' + gen.strategyLabel + '，未发送）');
     S.scoreCache = {};
     C.persist();
@@ -681,7 +707,17 @@
     if (!enEl) return;
     var en = enEl.value, zh = zhEl ? zhEl.value : '';
     opp.replyDrafts = opp.replyDrafts || {};
-    opp.replyDrafts[gen.scenario] = { en: en, zh: zh, edited: en !== gen.en || zh !== gen.zh, at: C.nowIso() };
+    /* P1-5 FIX-01：edited 比较基线优先用已保存草稿——文本框里就是 saved
+       的内容，未改动再保存不得误标 edited；已保存稿原本的 edited 标记
+       在无改动时保留。无 saved 时沿用与 fresh 生成稿比较的原行为。 */
+    var savedCur = opp.replyDrafts[gen.scenario] || null;
+    var editedNow;
+    if (savedCur) {
+      editedNow = (en !== savedCur.en || zh !== (savedCur.zh || '')) ? true : !!savedCur.edited;
+    } else {
+      editedNow = en !== (gen.send || gen.en) || zh !== gen.zh;
+    }
+    opp.replyDrafts[gen.scenario] = { en: en, zh: zh, edited: editedNow, at: C.nowIso() };
     C.addLog(opp, '保存回复草稿编辑：' + gen.scenarioLabel);
     C.persist();
     render();

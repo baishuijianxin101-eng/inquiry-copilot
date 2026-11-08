@@ -174,7 +174,8 @@
         match: entry ? { score: entry.result.score, keyConflict: entry.result.keyConflict, conflicts: entry.result.conflicts } : null,
         price: safePrice,
         sellerName: (settings && settings.sellerName) || '',
-        scenario: 'auto'
+        scenario: 'auto',
+        lang: effLangOf(text)
       }) : null;
       /* 工作报价展示门控（方案 1）：只有草稿的完整报价行确实采用了
          safePrice.unit 时，才允许在第 3 区标注「工作报价（草稿采用）」。
@@ -342,7 +343,7 @@
           opp: { rawText: S.text, buyer: { country: r.eff.country || '' }, quote: { qty: r.eff.qty || 0 }, status: 'new', followCount: 0 },
           eff: r.eff, product: cand.product,
           match: { score: cand.score, keyConflict: cand.keyConflict, conflicts: (cand.assess && cand.assess.conflicts) || [] },
-          price: null, sellerName: settings.sellerName || '', scenario: 'auto'
+          price: null, sellerName: settings.sellerName || '', scenario: 'auto', lang: effLangOf(S.text)
         }) : null;
       } catch (e) { r.reply = null; }
     }
@@ -350,7 +351,7 @@
     r.selectionSource = isTop ? 'auto' : 'manual';
     r.selectionAt = isTop ? null : ((root.Core && root.Core.nowIso) ? root.Core.nowIso() : null);
     r.steps = nextSteps(r);
-    S.draft = r.reply ? (r.reply.en || '') : '';
+    S.draft = r.reply ? (r.reply.send || r.reply.en || '') : '';
     S.baseDraft = S.draft;
     S.lastSavedOppId = '';
     return true;
@@ -631,7 +632,28 @@
   }
 
   /* ---------- 3. 页面 ---------- */
-  var S = { text: '', result: null, draft: '', baseDraft: '', targetOppId: '', saving: false, dupForce: false, dupCandidates: [], poolError: null, buyerName: '', buyerCompany: '', lastSavedOppId: '' };
+  var S = { text: '', result: null, draft: '', baseDraft: '', targetOppId: '', saving: false, dupForce: false, dupCandidates: [], poolError: null, buyerName: '', buyerCompany: '', lastSavedOppId: '', replyLang: 'auto', detectedLang: '' };
+
+  /* P1-5-REPLY：买家语言识别与发送稿语言决议。
+     自动 = Translate.detect（拉丁语系走 LangPack 启发式）；detect 对中文
+     返回 en，这里按 CJK 占比补判 zh。人工选择优先于自动识别。 */
+  var LANG_NAMES = { en: '英语', zh: '中文', es: '西班牙语', fr: '法语', de: '德语', ar: '阿拉伯语', hi: '印地语', pt: '葡萄牙语', ru: '俄语', tr: '土耳其语', id: '印尼语', ko: '韩语', ja: '日语', he: '希伯来语', th: '泰语' };
+  function langName(code) { return LANG_NAMES[code] || code || '未知'; }
+  function buyerLangOf(text) {
+    var det = 'en';
+    try { det = (root.Translate && root.Translate.detect(text)) || 'en'; } catch (e) { det = 'en'; }
+    if (det === 'en') {
+      var s = String(text || '');
+      var cjk = (s.match(/[\u4e00-\u9fff]/g) || []).length;
+      var lat = (s.match(/[a-zA-Z]/g) || []).length;
+      if (cjk > 0 && cjk >= lat) det = 'zh';
+    }
+    return det;
+  }
+  function effLangOf(text) {
+    var c = S.replyLang || 'auto';
+    return c === 'auto' ? buyerLangOf(text) : c;
+  }
 
   /* 人工修改检测：当前草稿与最近一次 AI 生成的原稿内容不一致即视为已人工修改。
      按内容比较：删空、改字算修改；改回与原稿完全一致则不再算修改。 */
@@ -811,11 +833,24 @@
     /* ④ 回复草稿 */
     h += '<section class="card"><div class="card-hd"><div class="card-title">4 · 回复草稿（人工确认后自行复制发送）</div></div>';
     if (r.reply) {
+      var detL = S.detectedLang || buyerLangOf(S.text);
+      var sendL = r.reply.sendLang || 'en';
+      var langOpts = [['auto', '自动识别（当前：' + langName(detL) + '）'], ['en', '英语'], ['zh', '中文'], ['es', '西班牙语'], ['pt', '葡萄牙语'], ['ru', '俄语']];
       h += '<div class="mute">场景：' + esc(r.reply.scenarioLabel || '') + '</div>' +
+        '<div style="margin-top:4px">买家语言：<b>' + esc(langName(detL)) + '</b>（自动识别） · 发送稿语言：<b>' + esc(langName(sendL)) + '</b>' +
+        ' <label style="margin-left:8px">发送稿语言 <select id="dd-lang" style="width:auto;height:30px">' +
+        langOpts.map(function (o) { return '<option value="' + o[0] + '"' + ((S.replyLang || 'auto') === o[0] ? ' selected' : '') + '>' + o[1] + '</option>'; }).join('') +
+        '</select></label></div>' +
+        (r.reply.degraded
+          ? '<div class="sm-list" style="margin-top:6px;color:#b45309"><span class="sm-list-t">降级提示：</span>买家语言为' + esc(langName(r.reply.wantLang)) + '，暂无该语言回复模板，发送稿已降级为英文，发送前请留意。</div>' : '') +
         (r.reply.unconfirmed && r.reply.unconfirmed.length
           ? '<div class="sm-list mute"><span class="sm-list-t">尚未确认（草稿中不会编造）：</span>' + r.reply.unconfirmed.map(esc).join('；') + '</div>' : '') +
-        '<textarea id="dd-draft" rows="9" style="width:100%">' + esc(S.draft || r.reply.en || '') + '</textarea>' +
-        '<div style="margin-top:8px"><button class="btn" id="dd-copy">复制草稿</button></div>';
+        '<textarea id="dd-draft" rows="9" style="width:100%">' + esc(S.draft || r.reply.send || r.reply.en || '') + '</textarea>' +
+        '<div style="margin-top:8px"><button class="btn" id="dd-copy">复制草稿</button></div>' +
+        '<label style="margin-top:10px">中文对照（只给你看，不发送）</label>' +
+        '<textarea id="dd-draft-zh" rows="7" readonly style="width:100%">' + esc(r.reply.zh || '') + '</textarea>' +
+        (sendL !== 'en' && r.reply.en
+          ? '<details style="margin-top:8px"><summary class="mute" style="cursor:pointer">英文参考稿（不发送）</summary><textarea rows="7" readonly style="width:100%;margin-top:6px">' + esc(r.reply.en) + '</textarea></details>' : '');
     } else {
       h += '<div class="mute">回复模块未返回草稿。</div>';
     }
@@ -884,7 +919,8 @@
     S.result.poolView = poolView;
     S.result.poolEmpty = products.length === 0;
     S.lastSavedOppId = '';
-    S.draft = S.result.reply ? (S.result.reply.en || '') : '';
+    S.detectedLang = buyerLangOf(S.text);
+    S.draft = S.result.reply ? (S.result.reply.send || S.result.reply.en || '') : '';
     S.baseDraft = S.draft;
     var v = document.getElementById('view');
     if (v) { v.innerHTML = view(); mount(); }
@@ -911,6 +947,13 @@
     });
     var re = document.getElementById('dd-reanalyze');
     if (re) re.addEventListener('click', function () { runAnalysis(collectEdits()); });
+    var lg = document.getElementById('dd-lang');
+    if (lg) lg.addEventListener('change', function () {
+      S.replyLang = lg.value || 'auto';
+      /* 语言切换只影响回复生成，但为保证结论/报价/草稿同源，沿用
+         重新分析路径整体重算（已含草稿人工修改确认机制） */
+      runAnalysis(collectEdits());
+    });
     var cp = document.getElementById('dd-copy');
     if (cp) cp.addEventListener('click', function () {
       var d = document.getElementById('dd-draft');

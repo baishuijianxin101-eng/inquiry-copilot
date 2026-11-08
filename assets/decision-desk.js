@@ -272,6 +272,7 @@
     }
     if (a.noMatch) add('人工确认商品', '没有可靠匹配，先确认买家到底要什么，不要报价');
     if (a.ambiguous) add('在候选商品中人工确认一款', '前两名匹配分接近，自动推荐不可靠');
+    if (a.reply && a.reply.scenario === 'closing') add('推动下单：确认订单信息后起草形式发票', '买家已表购买意向，先确认贸易术语、目的港、付款与交期，不要重复介绍产品');
     a.missing.forEach(function (m) {
       if (m.field === 'qty') add('先确认数量', '数量未知，无法核算报价与运费');
       if (m.field === 'spec') add('先确认规格/型号', '规格型号未知，匹配与报价都可能出错');
@@ -300,7 +301,7 @@
        草稿为空不写；人工改过草稿时保留商机上原有的中文稿，不拿空值覆盖。
      parseEdits 的数量/交期同步写回 quote（与 saveParsed 相同，避免解析
      口径与报价口径各说各话）；quoteVersions、followLog、deal 等一律不碰。 */
-  var REPLY_SCENARIOS = ['first', 'prequote', 'spec', 'moq', 'negotiation', 'sample', 'clarify'];
+  var REPLY_SCENARIOS = ['first', 'prequote', 'spec', 'moq', 'negotiation', 'sample', 'closing', 'clarify'];
 
   /* 人工选品（P1-3B-2）：在前二候选内切换最终商品，并以所选候选重新
      执行正式 conclude。第一名恒可选；第二名须满足 B-1 可信条件且自身

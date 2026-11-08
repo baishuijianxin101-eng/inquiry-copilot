@@ -690,7 +690,7 @@
   /* 解析结果的人工修正：只收白名单字段、限长限值，脏数据进不来。
      修正只影响解析展示与待确认问题；有真实落点的字段（数量/市场/交期/术语）
      由保存动作同步写回 quote/buyer，不在这里处理。 */
-  var REPLY_SCENARIOS = ['first', 'prequote', 'spec', 'moq', 'negotiation', 'sample', 'clarify'];
+  var REPLY_SCENARIOS = ['first', 'prequote', 'spec', 'moq', 'negotiation', 'sample', 'closing', 'clarify'];
   function sanitizeReplyDrafts(rd) {
     if (!rd || typeof rd !== 'object' || Array.isArray(rd)) return {};
     var out = {};

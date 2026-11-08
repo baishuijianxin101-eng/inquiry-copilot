@@ -27,6 +27,7 @@
     { key: 'moq', label: 'MOQ 及数量沟通' },
     { key: 'negotiation', label: '价格谈判回复' },
     { key: 'sample', label: '样品 / 后续沟通' },
+    { key: 'closing', label: '成交推进（确认订单信息）' },
     { key: 'clarify', label: '匹配冲突先核实' }
   ];
 
@@ -48,10 +49,59 @@
     return m;
   }
 
+  /* P1-6 购买推进信号：只认明确表态（PI/形式发票、下单确认、带承诺
+     线索的定金安排、合同文件），不认普通询价措辞；条件式议价由
+     negotiation 优先拦截（detectScenario 中目标价判定在本函数之前）。
+     信号只决定用哪种稿，不构成订单已确认的事实。
+     FIX-01 否定守卫（小句级）：原文先按句读/逗号切成小句，逐小句判定；
+     否定线索只管辖「同一小句内、位于信号之前」的信号——其他小句的
+     否定、信号之后的否定都不否决本信号，避免「不要样品，请发 PI」
+     这类前否定后肯定被一票否决。裸词 deposit 不再单独触发，须带
+     承诺线索（will/arrange/比例/付款通道/怎么付等）。俄语词组用
+     [а-яё] 字符类匹配词尾（\w 不覆盖西里尔字母）。 */
+  var INTENT_PATTERNS = [
+    /\bproforma\b|pro-?forma invoice|\bfactura proforma\b|\bfatura proforma\b|проформ/i,
+    /\b(send|issue|prepare|draft)\b[^.;\n]{0,24}\b(P\.?I\.?|proforma)\b/i,
+    /\b(place|confirm|close|book|proceed with|go ahead with|move forward with|ready to place)\b[^.;\n]{0,30}\borders?\b/i,
+    /\bmove to order\b|\border confirmation\b|\bconfirm(ed)? (the |this |my )?order\b/i,
+    /\b(send|sign|prepare|draft)\b[^.;\n]{0,24}\bcontract\b/i,
+    /形式发票|下单|确认订单|签订合同|签合同|预付款/,
+    /\bcerrar el pedido\b|\bconfirmar el pedido\b|\bhacer el pedido\b|\bfechar o pedido\b|\bconfirmar o pedido\b|\bfazer o pedido\b/i,
+    /подтвержда[а-яё]* заказ|готов[а-яё]* заказать|оформ[а-яё]* заказ|предоплат/i
+  ];
+  var INTENT_NEG = /\bnot\b|\bno\b|\bnever\b|n't\b|\btodavía no\b|\baún no\b|\bainda não\b|\bnão\b|(^|\s)не(?=\s|$)|还没|尚未|不要|暂不|先不/i;
+  function depositSignal(seg) {
+    var dm = /\bdeposit\b|\bdown payment\b|定金|订金/i.exec(seg);
+    if (!dm) return -1;
+    var cue = /\bwill\b|\bshall\b|\barrange\b|\d\s?%|by t\/t|\bvia\b|怎么|如何|付定金|支付|安排|\bhow\b[^.;]{0,30}\b(pay|paid|payment)\b/i.test(seg);
+    return cue ? dm.index : -1;
+  }
+  function segmentIntent(seg) {
+    var best = -1;
+    for (var i = 0; i < INTENT_PATTERNS.length; i++) {
+      var m = INTENT_PATTERNS[i].exec(seg);
+      if (m && (best < 0 || m.index < best)) best = m.index;
+    }
+    var di = depositSignal(seg);
+    if (di >= 0 && (best < 0 || di < best)) best = di;
+    if (best < 0) return false;
+    if (INTENT_NEG.test(seg.slice(0, best))) return false;
+    return true;
+  }
+  function hasOrderIntent(raw) {
+    var t = String(raw || '');
+    var segs = t.split(/[.!?;:\n,，。！？；：、—–]+/);
+    for (var i = 0; i < segs.length; i++) {
+      if (segmentIntent(segs[i])) return true;
+    }
+    return false;
+  }
+
   function detectScenario(x) {
     var eff = x.eff || {}, opp = x.opp || {}, raw = String(opp.rawText || '');
     if (x.match && x.match.keyConflict) return 'clarify';
     if (eff.targetPriceUsd > 0) return 'negotiation';
+    if (hasOrderIntent(raw)) return 'closing';
     if (eff.qty > 0 && x.product && x.product.moq && eff.qty < x.product.moq) return 'moq';
     if (/\bsamples?\b|样品/i.test(raw)) return 'sample';
     if ((opp.followCount || 0) > 0 && opp.status === 'quoted') return 'sample';
@@ -287,6 +337,62 @@
       en.push('If you need any specific parameter confirmed (for example a test report or a dimension drawing), tell me which one and I will check it for you.');
       LP('specAsk');
       zh.push('如果您需要确认某个具体参数（比如检测报告或尺寸图），告诉我哪一项，我帮您核实。');
+    } else if (scenario === 'closing') {
+      /* 成交推进：买家已表购买意向。只复述已可信的商品/数量/安全报价，
+         交易条件（术语/目的港/付款/交期）逐项提问确认；不编造付款、
+         定金比例、银行信息，不把意向写成已付款或已成交。 */
+      purpose = '买家已表购买意向，复述已定项并确认交易条件，推进订单';
+      strategyLabel = '成交推进：清单确认，不重复介绍产品';
+      strategy = '复述已确认的商品、数量与安全报价；贸易术语、目的港、付款方式、期望交期逐项请买家确认，确认后由卖家起草形式发票。';
+      en.push(greetEn, '', 'Thank you — let\'s move this order forward' + (product ? ' for the ' + pRefEn : '') + '.');
+      if (RP) loc.push(greetLoc, '', L('cIntro', { about: product ? L('cAbout', { ref: pRefEn }) : '' }));
+      zh.push(greetZh, '', '谢谢您，我们来推进这笔订单' + (product ? '（' + pRefEn + '）' : '') + '。');
+      var cFacts = [], cFactsZh = [], cFactsLoc = [];
+      if (product) { cFacts.push(pRefEn); cFactsZh.push(pRefEn); if (RP) cFactsLoc.push(pRefEn); }
+      if (eff.qty > 0) {
+        var qTxt = eff.qty + ' ' + (eff.qtyUnit || 'pcs');
+        cFacts.push('quantity ' + qTxt); cFactsZh.push('数量 ' + qTxt);
+        if (RP) cFactsLoc.push(L('cFactQty', { qty: qTxt }));
+      }
+      if (price) {
+        cFacts.push('unit price ' + money(price.unit) + '/pc (as quoted)'); cFactsZh.push('单价 ' + money(price.unit) + '/件（按已报价）');
+        if (RP) cFactsLoc.push(L('cFactPrice', { price: money(price.unit) }));
+      }
+      if (cFacts.length) {
+        en.push('What we have so far: ' + cFacts.join('; ') + '.');
+        zh.push('目前已明确的：' + cFactsZh.join('；') + '。');
+        if (RP) loc.push(L('cFacts', { list: cFactsLoc.join('; ') }));
+      }
+      if (!price) {
+        en.push('The final unit price is still being confirmed on our side; I will state it clearly in the proforma invoice rather than give you an estimate now.');
+        zh.push('最终单价仍在内部确认中，我会在形式发票中明确写出，不先给估算价。');
+        if (RP) loc.push(L('cNoPrice'));
+        unconfirmed.push('正式报价尚未形成（缺成本或未过报价护栏），回复未写任何价格');
+      }
+      en.push('To prepare the proforma invoice, could you please confirm:');
+      en.push('- Trade term (FOB, CIF, EXW, etc.) and the named place;');
+      en.push('- Destination port;');
+      en.push('- Your preferred payment method and terms;');
+      en.push('- Your expected delivery schedule.');
+      en.push('Once these are confirmed, I will draft the proforma invoice for your review.');
+      if (RP) {
+        loc.push(L('cAsk'));
+        loc.push(L('cTerm'));
+        loc.push(L('cPort'));
+        loc.push(L('cPay'));
+        loc.push(L('cLead'));
+        loc.push(L('cOutro'));
+      }
+      zh.push('为准备形式发票，请您确认：');
+      zh.push('- 贸易术语（FOB、CIF、EXW 等）及指定地点；');
+      zh.push('- 目的港；');
+      zh.push('- 您倾向的付款方式与账期；');
+      zh.push('- 您期望的交期安排。');
+      zh.push('这些确认后，我就起草形式发票供您核对。');
+      unconfirmed.push('贸易术语待买家确认');
+      unconfirmed.push('目的港待买家确认');
+      unconfirmed.push('付款方式与账期待买家确认');
+      unconfirmed.push('期望交期待买家确认');
     } else if (scenario === 'prequote') {
       purpose = '报价前先把关键信息问清，避免报错价';
       strategyLabel = '先确认，后报价';
@@ -380,6 +486,7 @@
 
   RA.generate = generate;
   RA.detectScenario = detectScenario;
+  RA.hasOrderIntent = hasOrderIntent;
   RA.missingOf = missingOf;
   RA.VERSION = '1.0.0';
   root.ReplyAssistant = RA;
